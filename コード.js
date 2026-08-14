@@ -165,7 +165,7 @@ function processQueue() {
         console.error("キュー処理エラー: " + error.message);
         queueSheet.getRange(rowNum, 6).setValue("Error: " + error.message);
         try {
-          sendPushReply(spaceName, "⚠️ 申し訳ありません。処理中にエラーが発生しました。\n詳細: " + error.message);
+          sendPushReply(spaceName, "⚠️ 申し訳ありません。処理中にエラーが発生しました。少し時間をおいて再度お試しください。");
         } catch (notifyError) {
           console.error("エラー通知の送信にも失敗: " + notifyError.message);
         }
@@ -277,14 +277,16 @@ function handleUserIntent(userInput, userName) {
         return resultData.replyMessage;
 
       } catch (parseError) {
-        return "⚠️ 解析エラー: AIの応答をデータ化できませんでした。\n" + aiResponse;
+        console.error("AI応答のJSON解析に失敗しました: " + parseError.message + " / 応答内容: " + aiResponse);
+        return "⚠️ 申し訳ありません。AIからの応答をうまく読み取れませんでした。お手数ですが、もう一度お試しください。";
       }
     } else {
-      // 💡 エラーの原因をチャット画面に直接あぶり出すよう修正！
-      return "⚠️ 申し訳ありません。Geminiの応答をうまく解析できませんでした。\n詳細: " + JSON.stringify(json);
+      console.error("Geminiの応答に想定した内容が含まれていませんでした: " + JSON.stringify(json));
+      return "⚠️ 申し訳ありません。ただいまAIとの通信で問題が発生しております。少し時間をおいて再度お試しください。";
     }
   } catch (e) {
-    return "⚠️ 通信エラー: " + e.toString();
+    console.error("Gemini API呼び出しでエラーが発生しました: " + e.toString());
+    return "⚠️ 申し訳ありません。ただいまシステムに問題が発生しております。少し時間をおいて再度お試しください。";
   }
 }
 
