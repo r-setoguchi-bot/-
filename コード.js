@@ -153,7 +153,7 @@ function processQueue() {
 
       try {
         // AI解析メインエンジンを呼び出し、処理結果のテキストを得る
-        const replyText = handleUserIntent(userInput, userName);
+        const replyText = handleUserIntent(userInput, userName, spaceName);
 
         // サービスアカウントを使ってチャットスペースへ非同期プッシュ送信（返信）
         sendPushReply(spaceName, replyText);
@@ -179,9 +179,95 @@ function processQueue() {
 }
 
 /**
+ * 期限が本日・明日・または超過しているタスクについて、Google Chatへリマインドを送信する関数
+ * 時間主導型トリガー（1日1回）での実行を想定
+ */
+function sendTaskReminders() {
+  const sheetUrl = PropertiesService.getScriptProperties().getProperty("SPREADSHEET_URL");
+  const spreadsheet = SpreadsheetApp.openByUrl(sheetUrl);
+  const taskSheet = getRequiredSheet(spreadsheet, "タスク一覧");
+  const data = taskSheet.getDataRange().getValues();
+
+  const now = new Date();
+  const todayStr = Utilities.formatDate(now, "Asia/Tokyo", "yyyy/MM/dd");
+  const tomorrowStr = Utilities.formatDate(new Date(now.getTime() + 24 * 60 * 60 * 1000), "Asia/Tokyo", "yyyy/MM/dd");
+
+  // スペース（送信先）ごとにリマインド内容をまとめるためのバケツ
+  const remindersBySpace = {};
+
+  for (let i = 1; i < data.length; i++) {
+    const status = data[i][5];         // F列: ステータス
+    const deadlineDate = data[i][3];   // D列: 期限日付
+    const lastRemindedAt = data[i][6]; // G列: 最終リマインド日時
+    const spaceName = data[i][9];      // J列: スペース名
+
+    if (status === "完了" || !deadlineDate || !spaceName) continue;
+
+    // 同じ日に既にリマインド済みならスキップ（重複送信防止）
+    const lastRemindedDateStr = lastRemindedAt
+      ? Utilities.formatDate(new Date(lastRemindedAt), "Asia/Tokyo", "yyyy/MM/dd")
+      : "";
+    if (lastRemindedDateStr === todayStr) continue;
+
+    let label = "";
+    if (deadlineDate < todayStr) {
+      label = "⚠️ 期限超過";
+    } else if (deadlineDate === todayStr) {
+      label = "⏰ 本日期限";
+    } else if (deadlineDate === tomorrowStr) {
+      label = "📅 明日期限";
+    } else {
+      continue; // まだ期限に余裕があるタスクは対象外
+    }
+
+    const taskContent = data[i][2];    // C列: タスク内容
+    const assignedPerson = data[i][7]; // H列: 担当者
+
+    if (!remindersBySpace[spaceName]) remindersBySpace[spaceName] = [];
+    remindersBySpace[spaceName].push({
+      rowNum: i + 1,
+      line: `${label}：「${taskContent}」（期限 ${deadlineDate}／担当：${assignedPerson}）`
+    });
+  }
+
+  for (const spaceName in remindersBySpace) {
+    const items = remindersBySpace[spaceName];
+    const message = "🤖 秘書より、本日のタスクリマインドです。\n\n" + items.map(item => item.line).join("\n");
+
+    try {
+      sendPushReply(spaceName, message);
+      // 送信に成功したタスクのみ、最終リマインド日時を更新する
+      const timestamp = Utilities.formatDate(now, "Asia/Tokyo", "yyyy/MM/dd HH:mm:ss");
+      items.forEach(item => taskSheet.getRange(item.rowNum, 7).setValue(timestamp));
+    } catch (e) {
+      console.error("リマインド送信に失敗しました（" + spaceName + "）: " + e.message);
+    }
+  }
+}
+
+/**
+ * sendTaskRemindersを1日1回（午前9時）自動実行するトリガーを設定する関数
+ * GASエディタでこの関数を1回だけ手動実行してください
+ */
+function setupReminderTrigger() {
+  // 重複登録を防ぐため、既存の同名トリガーを削除してから作り直す
+  ScriptApp.getProjectTriggers().forEach(trigger => {
+    if (trigger.getHandlerFunction() === "sendTaskReminders") {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+
+  ScriptApp.newTrigger("sendTaskReminders")
+    .timeBased()
+    .atHour(9)
+    .everyDays(1)
+    .create();
+}
+
+/**
  * Gemini APIを呼び出してユーザーの意図（新規タスク・進捗更新・要約・会話）を判断し、適切に処理する関数
  */
-function handleUserIntent(userInput, userName) {
+function handleUserIntent(userInput, userName, spaceName) {
   const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
   if (!apiKey) return "⚠️ エラー: APIキーが設定されていません。";
 
@@ -264,7 +350,7 @@ function handleUserIntent(userInput, userName) {
 
         // 新規タスク登録の処理
         if (resultData.action === "task") {
-          writeTaskToSheet(resultData, userName);
+          writeTaskToSheet(resultData, userName, spaceName);
           return resultData.replyMessage;
         }
         
@@ -293,7 +379,7 @@ function handleUserIntent(userInput, userName) {
 /**
  * スプレッドシートに新規タスクを書き込む関数
  */
-function writeTaskToSheet(taskData, userName) {
+function writeTaskToSheet(taskData, userName, spaceName) {
   const sheetUrl = PropertiesService.getScriptProperties().getProperty("SPREADSHEET_URL");
   const spreadsheet = SpreadsheetApp.openByUrl(sheetUrl);
   const sheet = getRequiredSheet(spreadsheet, "タスク一覧");
@@ -304,7 +390,7 @@ function writeTaskToSheet(taskData, userName) {
   // タスクID（T + 年月日時間 + 乱数 で自動生成）
   const taskId = generateUniqueId("T", now);
 
-  // スプレッドシートの各列（A〜I列）に合わせてデータを追加
+  // スプレッドシートの各列（A〜J列）に合わせてデータを追加
   sheet.appendRow([
     taskId,                              // A: タスクID
     timestamp,                           // B: 登録日時
@@ -314,7 +400,8 @@ function writeTaskToSheet(taskData, userName) {
     "未完了",                            // F: ステータス
     "",                                  // G: 最終リマインド日時
     taskData.assignedPerson || userName, // H: 担当者（ボール保持者）
-    taskData.statusSummary || "新規登録" // I: 最新の状況サマリー
+    taskData.statusSummary || "新規登録",// I: 最新の状況サマリー
+    spaceName || ""                      // J: スペース名（リマインド送信先）
   ]);
 }
 
