@@ -317,21 +317,22 @@ function writeTaskToSheet(taskData, userName) {
 }
 
 /**
- * タスク一覧のデータからキーワードに一致する行を探す（配列インデックスを返す）。
+ * タスク一覧のデータからキーワードに一致する行を全て探す（配列インデックスの配列を返す）。
  * 最新のタスクを優先するため下の行から逆順に検索する。
  * onlyIncomplete=true の場合は「完了」ステータスの行を除外して検索する（誤爆防止）。
  */
-function findTaskRowIndexByKeyword(taskDataRange, keyword, onlyIncomplete) {
+function findMatchingTaskRowIndexes(taskDataRange, keyword, onlyIncomplete) {
+  const matches = [];
   for (let i = taskDataRange.length - 1; i >= 1; i--) {
     const status = String(taskDataRange[i][5]); // F列: ステータス
     if (onlyIncomplete && status === "完了") continue;
 
     const taskContent = String(taskDataRange[i][2]).toLowerCase(); // C列: タスク内容
     if (taskContent.indexOf(keyword) !== -1) {
-      return i;
+      matches.push(i);
     }
   }
-  return -1;
+  return matches;
 }
 
 /**
@@ -346,47 +347,55 @@ function updateTaskInSheets(updateData, userName) {
   const taskDataRange = taskSheet.getDataRange().getValues();
   const keyword = updateData.targetTaskKeyword.toLowerCase();
 
-  // 誤爆防止のため、まず「未完了」タスクの中から最新のものを優先して探し、
+  // 誤爆防止のため、まず「未完了」タスクの中から探し、
   // 見つからなかった場合のみ完了済みタスクも含めて再検索する
-  let matchedIndex = findTaskRowIndexByKeyword(taskDataRange, keyword, true);
-  if (matchedIndex === -1) {
-    matchedIndex = findTaskRowIndexByKeyword(taskDataRange, keyword, false);
+  let matches = findMatchingTaskRowIndexes(taskDataRange, keyword, true);
+  if (matches.length === 0) {
+    matches = findMatchingTaskRowIndexes(taskDataRange, keyword, false);
   }
 
-  const foundRowIndex = matchedIndex === -1 ? -1 : matchedIndex + 1; // 行番号（1始まり）
-  const taskId = matchedIndex === -1 ? "" : taskDataRange[matchedIndex][0]; // A列: タスクID
+  if (matches.length === 0) {
+    // 検索キーワードに一致するタスクがなかった場合
+    return `⚠️ 秘書より報告です。「${updateData.targetTaskKeyword}」に該当するタスクが一覧から見つけられませんでした。お手数ですが、正確な名前でご指示いただくか、新規タスクとしてご登録ください。`;
+  }
+
+  if (matches.length > 1) {
+    // 候補が複数ある場合は誤爆を避けるため、自動で決めつけずユーザーに確認を求める
+    const candidateList = matches.slice(0, 5)
+      .map(i => `・${taskDataRange[i][0]}: ${taskDataRange[i][2]}`)
+      .join("\n");
+    return `⚠️ 秘書より確認です。「${updateData.targetTaskKeyword}」に該当するタスクが複数見つかりました。誤って別のタスクを更新しないよう、より具体的なキーワードで改めてご指示いただけますか。\n\n候補:\n${candidateList}`;
+  }
+
+  const matchedIndex = matches[0];
+  const foundRowIndex = matchedIndex + 1; // 行番号（1始まり）
+  const taskId = taskDataRange[matchedIndex][0]; // A列: タスクID
 
   const now = new Date();
   const timestamp = Utilities.formatDate(now, "Asia/Tokyo", "yyyy/MM/dd HH:mm:ss");
 
-  // 対象のタスクが見つかった場合の処理
-  if (foundRowIndex !== -1) {
-    // 1. 1枚目の「タスク一覧」シートの最新情報を上書き更新
-    if (updateData.taskStatus) {
-      taskSheet.getRange(foundRowIndex, 6).setValue(updateData.taskStatus);     // F列: ステータス
-    }
-    if (updateData.assignedPerson) {
-      taskSheet.getRange(foundRowIndex, 8).setValue(updateData.assignedPerson); // H列: 担当者（ボール保持者）
-    }
-    if (updateData.statusSummary) {
-      taskSheet.getRange(foundRowIndex, 9).setValue(updateData.statusSummary);  // I列: 最新の状況サマリー
-    }
-
-    // 2. 2枚目の「対応履歴ログ」シートに歴史（タイムライン）を1行追記
-    const logId = generateUniqueId("L", now);
-    logSheet.appendRow([
-      logId,                     // A: 履歴ID
-      taskId,                    // B: タスクID（紐付け用）
-      timestamp,                 // C: 記録日時
-      updateData.progressDetail, // D: 対応内容・経緯
-      updateData.assignedPerson  // E: 担当者（ボール保持者）
-    ]);
-
-    return updateData.replyMessage;
-  } else {
-    // 検索キーワードに一致するタスクがなかった場合
-    return `⚠️ 秘書より報告です。「${updateData.targetTaskKeyword}」に該当するタスクが一覧から見つけられませんでした。お手数ですが、正確な名前でご指示いただくか、新規タスクとしてご登録ください。`;
+  // 1. 1枚目の「タスク一覧」シートの最新情報を上書き更新
+  if (updateData.taskStatus) {
+    taskSheet.getRange(foundRowIndex, 6).setValue(updateData.taskStatus);     // F列: ステータス
   }
+  if (updateData.assignedPerson) {
+    taskSheet.getRange(foundRowIndex, 8).setValue(updateData.assignedPerson); // H列: 担当者（ボール保持者）
+  }
+  if (updateData.statusSummary) {
+    taskSheet.getRange(foundRowIndex, 9).setValue(updateData.statusSummary);  // I列: 最新の状況サマリー
+  }
+
+  // 2. 2枚目の「対応履歴ログ」シートに歴史（タイムライン）を1行追記
+  const logId = generateUniqueId("L", now);
+  logSheet.appendRow([
+    logId,                     // A: 履歴ID
+    taskId,                    // B: タスクID（紐付け用）
+    timestamp,                 // C: 記録日時
+    updateData.progressDetail, // D: 対応内容・経緯
+    updateData.assignedPerson  // E: 担当者（ボール保持者）
+  ]);
+
+  return updateData.replyMessage;
 }
 
 /**
