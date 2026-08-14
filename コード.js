@@ -5,21 +5,29 @@ function onMessage(event) {
   // デバッグ用：届いたデータの形をログに記録する
   console.log("受信イベントデータ: " + JSON.stringify(event));
 
+  // 0. メッセージ以外のイベント（Botのスペース追加・削除、ボタン操作等）は
+  //    処理対象外として何もせず終える（"MESSAGE"以外と判明した場合のみスキップ）
+  const eventType = event.chat?.type || event.type || "";
+  if (eventType && eventType !== "MESSAGE") {
+    console.log("非メッセージイベントのためスキップ: " + eventType);
+    return createChatResponse("");
+  }
+
   // 1. ユーザー名を取得（アドオン形式の深い階層から確実に抽出）
-  const userName = event.chat?.messagePayload?.message?.sender?.displayName || 
-                   event.chat?.user?.displayName || 
+  const userName = event.chat?.messagePayload?.message?.sender?.displayName ||
+                   event.chat?.user?.displayName ||
                    "瀬戸口さん";
-  
+
   // 2. メッセージ本文を取得（アドオン形式の深い階層から確実に抽出）
-  const userInput = event.chat?.messagePayload?.message?.text || 
-                    event.message?.text || 
-                    "";
-                    
+  const userInput = (event.chat?.messagePayload?.message?.text ||
+                    event.message?.text ||
+                    "").trim();
+
   // 3. 非同期プッシュ返信用にスペース名（住所）を取得
-  const spaceName = event.chat?.messagePayload?.space?.name || 
-                    event.chat?.messagePayload?.message?.space?.name || 
-                    event.space?.name || 
-                    event.message?.space?.name || 
+  const spaceName = event.chat?.messagePayload?.space?.name ||
+                    event.chat?.messagePayload?.message?.space?.name ||
+                    event.space?.name ||
+                    event.message?.space?.name ||
                     "";
 
   if (!userInput) {
@@ -29,12 +37,12 @@ function onMessage(event) {
   // 4. 【30秒制限回避の核心】メッセージを一旦「処理キュー」シートに保存する
   const sheetUrl = PropertiesService.getScriptProperties().getProperty("SPREADSHEET_URL");
   const spreadsheet = SpreadsheetApp.openByUrl(sheetUrl);
-  const queueSheet = spreadsheet.getSheetByName("処理キュー") || spreadsheet.getSheets()[2]; // 3枚目のシートを取得
-  
+  const queueSheet = getRequiredSheet(spreadsheet, "処理キュー");
+
   const now = new Date();
   const timestamp = Utilities.formatDate(now, "Asia/Tokyo", "yyyy/MM/dd HH:mm:ss");
-  const queueId = "Q" + Utilities.formatDate(now, "Asia/Tokyo", "yyyyMMddHHmmss");
-  
+  const queueId = generateUniqueId("Q", now);
+
   // 処理キューシートに「Pending（未処理）」状態でタスクを預ける
   queueSheet.appendRow([
     queueId,     // A: キューID
@@ -67,6 +75,45 @@ function createChatResponse(text) {
 }
 
 /**
+ * 指定したシート名でシートを取得する。見つからない場合は例外を投げる
+ * （シートの並び替え・削除に対する耐性のため、インデックス指定は使わない）
+ */
+function getRequiredSheet(spreadsheet, sheetName) {
+  const sheet = spreadsheet.getSheetByName(sheetName);
+  if (!sheet) throw new Error(`シート「${sheetName}」が見つかりません。`);
+  return sheet;
+}
+
+/**
+ * プレフィックス＋タイムスタンプ＋乱数でID文字列を生成する（同一秒内の衝突防止）
+ */
+function generateUniqueId(prefix, now) {
+  const timestamp = Utilities.formatDate(now, "Asia/Tokyo", "yyyyMMddHHmmss");
+  const randomSuffix = Math.floor(Math.random() * 900) + 100; // 100〜999の3桁乱数
+  return prefix + timestamp + randomSuffix;
+}
+
+/**
+ * 処理が「Processing」のまま一定時間放置されたキューを「Pending」に戻し、再試行対象にする
+ * （GASの実行時間上限などで処理が中断され、行が取り残されるケースの救済）
+ */
+function recoverStuckQueueRows(queueSheet, data, now) {
+  const STUCK_THRESHOLD_MS = 10 * 60 * 1000; // 10分
+
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][5] !== "Processing") continue;
+
+    const enqueuedAt = new Date(data[i][1]); // B列: 受付日時
+    if (now.getTime() - enqueuedAt.getTime() > STUCK_THRESHOLD_MS) {
+      const rowNum = i + 1;
+      console.error(`スタックしたキューをPendingに戻して再試行します: 行${rowNum}`);
+      queueSheet.getRange(rowNum, 6).setValue("Pending");
+      data[i][5] = "Pending"; // 同一ループ内ですぐ処理対象にするためメモリ上のデータも更新
+    }
+  }
+}
+
+/**
  * ⏰ 1分ごとに定期実行され、「処理キュー」シートを巡回するバッチ関数
  */
 function processQueue() {
@@ -77,17 +124,21 @@ function processQueue() {
   try {
     const sheetUrl = PropertiesService.getScriptProperties().getProperty("SPREADSHEET_URL");
     const spreadsheet = SpreadsheetApp.openByUrl(sheetUrl);
-    const queueSheet = spreadsheet.getSheetByName("処理キュー") || spreadsheet.getSheets()[2];
+    const queueSheet = getRequiredSheet(spreadsheet, "処理キュー");
     const lastRow = queueSheet.getLastRow();
-    
+
     if (lastRow < 2) return; // データがなければ終了
 
     const data = queueSheet.getDataRange().getValues();
+    const now = new Date();
+
+    // 前回実行が中断されて「Processing」のまま止まっている行を再試行対象に戻す
+    recoverStuckQueueRows(queueSheet, data, now);
 
     // 溜まっている Pending 状態のキューを処理する
     for (let i = 1; i < data.length; i++) {
       const status = data[i][5]; // F列: ステータス
-      
+
       if (status !== "Pending") continue;
 
       const rowNum = i + 1;
@@ -112,7 +163,11 @@ function processQueue() {
       } catch (error) {
         console.error("キュー処理エラー: " + error.message);
         queueSheet.getRange(rowNum, 6).setValue("Error: " + error.message);
-        sendPushReply(spaceName, "⚠️ 申し訳ありません。処理中にエラーが発生しました。\n詳細: " + error.message);
+        try {
+          sendPushReply(spaceName, "⚠️ 申し訳ありません。処理中にエラーが発生しました。\n詳細: " + error.message);
+        } catch (notifyError) {
+          console.error("エラー通知の送信にも失敗: " + notifyError.message);
+        }
       }
       SpreadsheetApp.flush();
     }
@@ -129,7 +184,7 @@ function handleUserIntent(userInput, userName) {
   const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
   if (!apiKey) return "⚠️ エラー: APIキーが設定されていません。";
 
-  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=" + apiKey;
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=" + apiKey;
 
   // 「明日」「来週」などの言葉を理解できるよう、現在の日時を教える
   const now = new Date();
@@ -181,7 +236,10 @@ function handleUserIntent(userInput, userName) {
 `;
 
   const payload = {
-    "contents": [{ "parts": [{ "text": systemPrompt }] }]
+    "contents": [{ "parts": [{ "text": systemPrompt }] }],
+    "generationConfig": {
+      "responseMimeType": "application/json"
+    }
   };
 
   const options = {
@@ -235,13 +293,13 @@ function handleUserIntent(userInput, userName) {
 function writeTaskToSheet(taskData, userName) {
   const sheetUrl = PropertiesService.getScriptProperties().getProperty("SPREADSHEET_URL");
   const spreadsheet = SpreadsheetApp.openByUrl(sheetUrl);
-  const sheet = spreadsheet.getSheets()[0]; // 1つ目のシート（一番左のシート）を取得
+  const sheet = getRequiredSheet(spreadsheet, "タスク一覧");
 
   const now = new Date();
   const timestamp = Utilities.formatDate(now, "Asia/Tokyo", "yyyy/MM/dd HH:mm:ss");
-  
-  // タスクID（T + 年月日時間 で自動生成）
-  const taskId = "T" + Utilities.formatDate(now, "Asia/Tokyo", "yyyyMMddHHmmss");
+
+  // タスクID（T + 年月日時間 + 乱数 で自動生成）
+  const taskId = generateUniqueId("T", now);
 
   // スプレッドシートの各列（A〜I列）に合わせてデータを追加
   sheet.appendRow([
@@ -258,28 +316,44 @@ function writeTaskToSheet(taskData, userName) {
 }
 
 /**
+ * タスク一覧のデータからキーワードに一致する行を探す（配列インデックスを返す）。
+ * 最新のタスクを優先するため下の行から逆順に検索する。
+ * onlyIncomplete=true の場合は「完了」ステータスの行を除外して検索する（誤爆防止）。
+ */
+function findTaskRowIndexByKeyword(taskDataRange, keyword, onlyIncomplete) {
+  for (let i = taskDataRange.length - 1; i >= 1; i--) {
+    const status = String(taskDataRange[i][5]); // F列: ステータス
+    if (onlyIncomplete && status === "完了") continue;
+
+    const taskContent = String(taskDataRange[i][2]).toLowerCase(); // C列: タスク内容
+    if (taskContent.indexOf(keyword) !== -1) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/**
  * 既存タスクを検索し、進捗の上書きと履歴シートへの追記を行う関数
  */
 function updateTaskInSheets(updateData, userName) {
   const sheetUrl = PropertiesService.getScriptProperties().getProperty("SPREADSHEET_URL");
   const spreadsheet = SpreadsheetApp.openByUrl(sheetUrl);
-  const taskSheet = spreadsheet.getSheets()[0]; // 1枚目：タスク一覧
-  const logSheet = spreadsheet.getSheets()[1];  // 2枚目：対応履歴ログ
+  const taskSheet = getRequiredSheet(spreadsheet, "タスク一覧");
+  const logSheet = getRequiredSheet(spreadsheet, "対応履歴ログ");
 
   const taskDataRange = taskSheet.getDataRange().getValues();
   const keyword = updateData.targetTaskKeyword.toLowerCase();
-  let foundRowIndex = -1;
-  let taskId = "";
 
-  // 最新のタスクから優先して見つけるため、下の行から逆順に検索
-  for (let i = taskDataRange.length - 1; i >= 1; i--) {
-    const taskContent = String(taskDataRange[i][2]).toLowerCase(); // C列: タスク内容
-    if (taskContent.indexOf(keyword) !== -1) {
-      foundRowIndex = i + 1;        // 行番号を取得（1始まり）
-      taskId = taskDataRange[i][0]; // A列: タスクIDを取得
-      break;
-    }
+  // 誤爆防止のため、まず「未完了」タスクの中から最新のものを優先して探し、
+  // 見つからなかった場合のみ完了済みタスクも含めて再検索する
+  let matchedIndex = findTaskRowIndexByKeyword(taskDataRange, keyword, true);
+  if (matchedIndex === -1) {
+    matchedIndex = findTaskRowIndexByKeyword(taskDataRange, keyword, false);
   }
+
+  const foundRowIndex = matchedIndex === -1 ? -1 : matchedIndex + 1; // 行番号（1始まり）
+  const taskId = matchedIndex === -1 ? "" : taskDataRange[matchedIndex][0]; // A列: タスクID
 
   const now = new Date();
   const timestamp = Utilities.formatDate(now, "Asia/Tokyo", "yyyy/MM/dd HH:mm:ss");
@@ -298,7 +372,7 @@ function updateTaskInSheets(updateData, userName) {
     }
 
     // 2. 2枚目の「対応履歴ログ」シートに歴史（タイムライン）を1行追記
-    const logId = "L" + Utilities.formatDate(now, "Asia/Tokyo", "yyyyMMddHHmmss");
+    const logId = generateUniqueId("L", now);
     logSheet.appendRow([
       logId,                     // A: 履歴ID
       taskId,                    // B: タスクID（紐付け用）
@@ -319,20 +393,21 @@ function updateTaskInSheets(updateData, userName) {
  */
 function sendPushReply(spaceName, text) {
   if (!spaceName) return;
-  try {
-    const token = getBotToken(); 
-    const payload = {
-      "text": text
-    };
-    UrlFetchApp.fetch(`https://chat.googleapis.com/v1/${spaceName}/messages`, {
-      method: "post",
-      headers: { "Authorization": "Bearer " + token },
-      contentType: "application/json",
-      payload: JSON.stringify(payload),
-      muteHttpExceptions: true
-    });
-  } catch (e) {
-    console.error("プッシュ送信失敗: " + e.message);
+  const token = getBotToken();
+  const payload = {
+    "text": text
+  };
+  const response = UrlFetchApp.fetch(`https://chat.googleapis.com/v1/${spaceName}/messages`, {
+    method: "post",
+    headers: { "Authorization": "Bearer " + token },
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+
+  const responseCode = response.getResponseCode();
+  if (responseCode >= 300) {
+    throw new Error(`Chat送信失敗 (HTTP ${responseCode}): ${response.getContentText()}`);
   }
 }
 
