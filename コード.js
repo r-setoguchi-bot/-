@@ -265,6 +265,265 @@ function setupReminderTrigger() {
 }
 
 /**
+ * ====================================================================
+ * kintone連携：日報自動生成
+ * 前日と本日のkintoneデータを比較し、差分（＝今日動きがあった内容）を検出して日報を組み立てる
+ * ====================================================================
+ */
+
+// 日報の対象とするkintoneアプリ一覧。それぞれのアプリID・APIトークンはスクリプトプロパティで管理する
+const KINTONE_APPS = [
+  { key: "案件管理",     idProp: "KINTONE_ANKEN_APP_ID",     tokenProp: "KINTONE_ANKEN_API_TOKEN",     snapshotSheet: "kintone_案件管理_前日" },
+  { key: "契約管理",     idProp: "KINTONE_KEIYAKU_APP_ID",   tokenProp: "KINTONE_KEIYAKU_API_TOKEN",   snapshotSheet: "kintone_契約管理_前日" },
+  { key: "粗大ゴミ管理", idProp: "KINTONE_SODAIGOMI_APP_ID", tokenProp: "KINTONE_SODAIGOMI_API_TOKEN", snapshotSheet: "kintone_粗大ゴミ管理_前日" },
+  { key: "解約リスト",   idProp: "KINTONE_KAIYAKU_APP_ID",   tokenProp: "KINTONE_KAIYAKU_API_TOKEN",   snapshotSheet: "kintone_解約リスト_前日" }
+];
+
+/**
+ * kintoneアプリの全レコードをREST APIで取得する（$idベースでページング）
+ */
+function fetchKintoneRecords(subdomain, appId, apiToken) {
+  let allRecords = [];
+  let lastId = 0;
+  const limit = 500;
+
+  while (true) {
+    const query = encodeURIComponent(`$id > ${lastId} order by $id asc limit ${limit}`);
+    const url = `https://${subdomain}.cybozu.com/k/v1/records.json?app=${appId}&query=${query}`;
+    const response = UrlFetchApp.fetch(url, {
+      method: "get",
+      headers: { "X-Cybozu-API-Token": apiToken },
+      muteHttpExceptions: true
+    });
+
+    if (response.getResponseCode() !== 200) {
+      throw new Error(`kintone取得失敗 (app=${appId}, HTTP ${response.getResponseCode()}): ${response.getContentText()}`);
+    }
+
+    const records = JSON.parse(response.getContentText()).records || [];
+    if (records.length === 0) break;
+
+    allRecords = allRecords.concat(records);
+    lastId = Number(records[records.length - 1].$id.value);
+    if (records.length < limit) break;
+  }
+
+  return allRecords;
+}
+
+/**
+ * kintoneレコード1件を「フィールドコード→値（文字列化）」のマップに変換する（差分比較用）
+ */
+function recordToValueMap(record) {
+  const valueMap = {};
+  Object.keys(record).forEach(fieldCode => {
+    if (fieldCode.indexOf("$") === 0) return; // $id, $revisionなどのシステムフィールドは除外
+    const field = record[fieldCode];
+    if (!field || field.value === undefined || field.value === null || field.value === "") return;
+    valueMap[fieldCode] = typeof field.value === "object" ? JSON.stringify(field.value) : String(field.value);
+  });
+  return valueMap;
+}
+
+/**
+ * 前日スナップショットをシートから読み込む。シートが無ければ「初回実行」としてnullを返す
+ */
+function loadKintoneSnapshot(spreadsheet, sheetName) {
+  const sheet = spreadsheet.getSheetByName(sheetName);
+  if (!sheet) return null;
+
+  const data = sheet.getDataRange().getValues();
+  const snapshot = {};
+  for (let i = 1; i < data.length; i++) {
+    const recordId = data[i][0];
+    const fieldCode = data[i][1];
+    const value = data[i][2];
+    if (!recordId) continue;
+    if (!snapshot[recordId]) snapshot[recordId] = {};
+    snapshot[recordId][fieldCode] = value;
+  }
+  return snapshot;
+}
+
+/**
+ * 今回取得したスナップショットをシートへ保存する（次回実行時の比較対象として上書きする）
+ */
+function saveKintoneSnapshot(spreadsheet, sheetName, recordsById) {
+  const sheet = getOrCreateSheet(spreadsheet, sheetName);
+  sheet.clear();
+
+  const rows = [["recordId", "fieldCode", "value"]];
+  Object.keys(recordsById).forEach(recordId => {
+    const valueMap = recordsById[recordId];
+    Object.keys(valueMap).forEach(fieldCode => {
+      rows.push([recordId, fieldCode, valueMap[fieldCode]]);
+    });
+  });
+
+  sheet.getRange(1, 1, rows.length, 3).setValues(rows);
+}
+
+/**
+ * 指定したシート名のシートを取得し、無ければ新規作成する
+ */
+function getOrCreateSheet(spreadsheet, sheetName) {
+  let sheet = spreadsheet.getSheetByName(sheetName);
+  if (!sheet) sheet = spreadsheet.insertSheet(sheetName);
+  return sheet;
+}
+
+/**
+ * 1アプリ分の新旧データを比較し、「新規追加」「フィールド変更」を検出してテキスト行にする
+ */
+function diffKintoneRecords(oldSnapshot, newRecords) {
+  const lines = [];
+  const newRecordsById = {};
+
+  newRecords.forEach(record => {
+    const recordId = record.$id.value;
+    const valueMap = recordToValueMap(record);
+    newRecordsById[recordId] = valueMap;
+
+    const displayName = valueMap["屋号名"] || valueMap["契約店舗名称"] || valueMap["会社名"] || `レコード#${recordId}`;
+    const oldValueMap = oldSnapshot[recordId];
+
+    if (!oldValueMap) {
+      lines.push(`【新規】${displayName}`);
+      return;
+    }
+
+    const changedFields = [];
+    Object.keys(valueMap).forEach(fieldCode => {
+      const oldValue = oldValueMap[fieldCode] || "";
+      const newValue = valueMap[fieldCode];
+      if (oldValue !== newValue) {
+        changedFields.push(`${fieldCode}: ${oldValue || "(空)"} → ${newValue}`);
+      }
+    });
+
+    if (changedFields.length > 0) {
+      lines.push(`【更新】${displayName}\n  ` + changedFields.join("\n  "));
+    }
+  });
+
+  return { lines, newRecordsById };
+}
+
+/**
+ * 処理キューシートから、直近で使われたスペース名（日報の送信先）を取得する
+ */
+function getDefaultSpaceName(spreadsheet) {
+  const queueSheet = getRequiredSheet(spreadsheet, "処理キュー");
+  const lastRow = queueSheet.getLastRow();
+  if (lastRow < 2) return "";
+
+  const data = queueSheet.getRange(2, 5, lastRow - 1, 1).getValues(); // E列: スペース名
+  for (let i = data.length - 1; i >= 0; i--) {
+    if (data[i][0]) return data[i][0];
+  }
+  return "";
+}
+
+/**
+ * kintoneの4アプリ（案件管理・契約管理・粗大ゴミ管理・解約リスト）の前日比差分と、
+ * 秘書bot自身の本日の対応履歴をまとめて日報としてChatへ送信する関数
+ * 時間主導型トリガー（1日1回）での実行を想定
+ */
+function sendDailyReport() {
+  const subdomain = PropertiesService.getScriptProperties().getProperty("KINTONE_SUBDOMAIN");
+  if (!subdomain) {
+    console.error("KINTONE_SUBDOMAINが未設定のため日報生成をスキップしました。");
+    return;
+  }
+
+  const sheetUrl = PropertiesService.getScriptProperties().getProperty("SPREADSHEET_URL");
+  const spreadsheet = SpreadsheetApp.openByUrl(sheetUrl);
+  const sections = [];
+
+  KINTONE_APPS.forEach(app => {
+    const appId = PropertiesService.getScriptProperties().getProperty(app.idProp);
+    const apiToken = PropertiesService.getScriptProperties().getProperty(app.tokenProp);
+    if (!appId || !apiToken) {
+      console.log(`${app.key}: アプリID/APIトークンが未設定のためスキップします。`);
+      return;
+    }
+
+    try {
+      const oldSnapshot = loadKintoneSnapshot(spreadsheet, app.snapshotSheet);
+      const newRecords = fetchKintoneRecords(subdomain, appId, apiToken);
+
+      if (oldSnapshot === null) {
+        // 初回実行：比較対象がまだ無いため、今回はスナップショットの作成のみ行う
+        const initialSnapshot = {};
+        newRecords.forEach(record => {
+          initialSnapshot[record.$id.value] = recordToValueMap(record);
+        });
+        saveKintoneSnapshot(spreadsheet, app.snapshotSheet, initialSnapshot);
+        console.log(`${app.key}: 初回スナップショットを作成しました（${newRecords.length}件）。次回から差分を検出します。`);
+        return;
+      }
+
+      const { lines, newRecordsById } = diffKintoneRecords(oldSnapshot, newRecords);
+      if (lines.length > 0) {
+        sections.push(`■${app.key}\n` + lines.join("\n"));
+      }
+
+      saveKintoneSnapshot(spreadsheet, app.snapshotSheet, newRecordsById);
+    } catch (e) {
+      console.error(`${app.key}の日報生成中にエラーが発生しました: ` + e.message);
+      sections.push(`■${app.key}\n⚠️ データ取得に失敗しました（${e.message}）`);
+    }
+  });
+
+  // 秘書bot経由の本日の対応履歴も日報に追加する
+  const logSheet = getRequiredSheet(spreadsheet, "対応履歴ログ");
+  const logData = logSheet.getDataRange().getValues();
+  const todayStr = Utilities.formatDate(new Date(), "Asia/Tokyo", "yyyy/MM/dd");
+  const todayLogs = [];
+  for (let i = 1; i < logData.length; i++) {
+    const recordedAt = String(logData[i][2]); // C列: 記録日時
+    if (recordedAt.indexOf(todayStr) === 0) {
+      todayLogs.push(`・${logData[i][3]}（担当: ${logData[i][4]}）`); // D列: 対応内容・経緯, E列: 担当者
+    }
+  }
+  if (todayLogs.length > 0) {
+    sections.push("■秘書bot対応履歴\n" + todayLogs.join("\n"));
+  }
+
+  if (sections.length === 0) {
+    console.log("本日は日報に含める動きがありませんでした。");
+    return;
+  }
+
+  const spaceName = getDefaultSpaceName(spreadsheet);
+  if (!spaceName) {
+    console.error("送信先スペースが特定できなかったため日報を送信できませんでした。");
+    return;
+  }
+
+  const message = `🤖 本日（${todayStr}）の日報です。\n\n` + sections.join("\n\n");
+  sendPushReply(spaceName, message);
+}
+
+/**
+ * sendDailyReportを1日1回（午後6時）自動実行するトリガーを設定する関数
+ * GASエディタでこの関数を1回だけ手動実行してください
+ */
+function setupDailyReportTrigger() {
+  ScriptApp.getProjectTriggers().forEach(trigger => {
+    if (trigger.getHandlerFunction() === "sendDailyReport") {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+
+  ScriptApp.newTrigger("sendDailyReport")
+    .timeBased()
+    .atHour(18)
+    .everyDays(1)
+    .create();
+}
+
+/**
  * Gemini APIを呼び出してユーザーの意図（新規タスク・進捗更新・要約・会話）を判断し、適切に処理する関数
  */
 function handleUserIntent(userInput, userName, spaceName) {
