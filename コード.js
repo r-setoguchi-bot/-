@@ -5,10 +5,11 @@ function onMessage(event) {
   // デバッグ用：届いたデータの形をログに記録する
   console.log("受信イベントデータ: " + JSON.stringify(event));
 
-  // 0. メッセージ以外のイベント（Botのスペース追加・削除、ボタン操作等）は
-  //    処理対象外として何もせず終える（"MESSAGE"以外と判明した場合のみスキップ）
+  // 0. メッセージ以外と確実に判明しているイベント（Botのスペース追加・削除、ボタン操作等）のみ
+  //    処理対象外としてスキップする（未知の値は誤検知を避けるため通常処理に進める）
+  const KNOWN_NON_MESSAGE_EVENT_TYPES = ["ADDED_TO_SPACE", "REMOVED_FROM_SPACE", "CARD_CLICKED"];
   const eventType = event.chat?.type || event.type || "";
-  if (eventType && eventType !== "MESSAGE") {
+  if (KNOWN_NON_MESSAGE_EVENT_TYPES.indexOf(eventType) !== -1) {
     console.log("非メッセージイベントのためスキップ: " + eventType);
     return createChatResponse("");
   }
