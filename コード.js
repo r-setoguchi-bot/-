@@ -55,7 +55,7 @@ function onMessage(event) {
   ]);
 
   // 5. チャット画面には「1秒」で受付完了を返し、30秒タイムアウトを完全に回避する
-  return createChatResponse("🤖 瀬戸口部長、ご指示を承りました。ただいま秘書が内容を確認し、手帳の整理と解析を行っております。少々お待ちくださいませ…");
+  return createChatResponse("🤖 瀬戸口さん、ご指示を承りました。ただいま秘書が内容を確認し、手帳の整理と解析を行っております。少々お待ちくださいませ…");
 }
 
 /**
@@ -278,14 +278,14 @@ function handleUserIntent(userInput, userName, spaceName) {
   const todayStr = Utilities.formatDate(now, "Asia/Tokyo", "yyyy年MM月dd日 HH:mm");
 
   const systemPrompt = `
-あなたは瀬戸口部長の優秀な専属秘書botです。
+あなたは瀬戸口さんの優秀な専属秘書botです。
 現在の日時は【${todayStr}】です。
 
-瀬戸口部長（${userName}）からのメッセージ:
+瀬戸口さん（${userName}）からのメッセージ:
 「${userInput}」
 
 【指示】
-瀬戸口部長のメッセージの意図を以下の4つのいずれかに分類し、必ず指定されたJSONフォーマットの文字列のみを出力してください（余計な解説文などは一切含めないでください）。
+瀬戸口さんのメッセージの意図を以下の4つのいずれかに分類し、必ず指定されたJSONフォーマットの文字列のみを出力してください（余計な解説文などは一切含めないでください）。
 
 1. メッセージが「新しいタスクの依頼や追加」である場合（例：「明日までに資料作成」「タスクに追加して」など）
 {
@@ -293,7 +293,7 @@ function handleUserIntent(userInput, userName, spaceName) {
   "taskContent": "タスクの具体的な内容",
   "deadlineDate": "YYYY/MM/DD (期限が不明な場合は空文字)",
   "deadlineTime": "HH:mm (時間が不明な場合は空文字)",
-  "assignedPerson": "このタスクの担当者（部下の名前や瀬戸口部長の名前など。明示がなければ「瀬戸口部長」）",
+  "assignedPerson": "このタスクの担当者（部下の名前や瀬戸口さんの名前など。明示がなければ「瀬戸口さん」）",
   "statusSummary": "新規タスク登録",
   "replyMessage": "タスクを新規登録した旨の、秘書らしい丁寧な返答"
 }
