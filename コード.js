@@ -185,7 +185,7 @@ function handleUserIntent(userInput, userName) {
   const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
   if (!apiKey) return "⚠️ エラー: APIキーが設定されていません。";
 
-  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=" + apiKey;
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + apiKey;
 
   // 「明日」「来週」などの言葉を理解できるよう、現在の日時を教える
   const now = new Date();
