@@ -185,7 +185,7 @@ function processQueue() {
 function sendTaskReminders() {
   const sheetUrl = PropertiesService.getScriptProperties().getProperty("SPREADSHEET_URL");
   const spreadsheet = SpreadsheetApp.openByUrl(sheetUrl);
-  const taskSheet = getRequiredSheet(spreadsheet, "タスク一覧");
+  const taskSheet = getRequiredSheet(spreadsheet, "Task_List");
   const data = taskSheet.getDataRange().getValues();
 
   const now = new Date();
@@ -382,7 +382,7 @@ function handleUserIntent(userInput, userName, spaceName) {
 function writeTaskToSheet(taskData, userName, spaceName) {
   const sheetUrl = PropertiesService.getScriptProperties().getProperty("SPREADSHEET_URL");
   const spreadsheet = SpreadsheetApp.openByUrl(sheetUrl);
-  const sheet = getRequiredSheet(spreadsheet, "タスク一覧");
+  const sheet = getRequiredSheet(spreadsheet, "Task_List");
 
   const now = new Date();
   const timestamp = Utilities.formatDate(now, "Asia/Tokyo", "yyyy/MM/dd HH:mm:ss");
@@ -430,7 +430,7 @@ function findMatchingTaskRowIndexes(taskDataRange, keyword, onlyIncomplete) {
 function updateTaskInSheets(updateData, userName) {
   const sheetUrl = PropertiesService.getScriptProperties().getProperty("SPREADSHEET_URL");
   const spreadsheet = SpreadsheetApp.openByUrl(sheetUrl);
-  const taskSheet = getRequiredSheet(spreadsheet, "タスク一覧");
+  const taskSheet = getRequiredSheet(spreadsheet, "Task_List");
   const logSheet = getRequiredSheet(spreadsheet, "対応履歴ログ");
 
   const taskDataRange = taskSheet.getDataRange().getValues();
