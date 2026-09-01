@@ -8,17 +8,22 @@ const BUDGET_ROW_NEW_COUNT    = 15;
 const BUDGET_ROW_CANCEL_COUNT = 22;
 const BUDGET_ROW_CANCEL_PROFIT = 34;
 
+/**
+ * 「対象月」を1箇所で決める。generateMonthlyReportRequestと
+ * receiveGeminiResponseAndWriteToSheetの両方がここを参照することで、
+ * 返信メールから対象月を読み取れない場合でも「関数①が対象にした月＝先月」
+ * という同じ基準で追従できるようにする。
+ */
+function getTargetYearMonth() {
+  if (IS_TEST) return { year: 2026, month: 4 };
+  const today = new Date();
+  const lastMonth = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+  return { year: lastMonth.getFullYear(), month: lastMonth.getMonth() + 1 };
+}
+
 function generateMonthlyReportRequest() {
   const config = getConfig();
-  const today = new Date();
-  let targetYear, targetMonth;
-
-  if (IS_TEST) {
-    targetYear = 2026; targetMonth = 4;
-  } else {
-    const lastMonth = new Date(today.getFullYear(), today.getMonth() - 1, 1);
-    targetYear = lastMonth.getFullYear(); targetMonth = lastMonth.getMonth() + 1;
-  }
+  const { year: targetYear, month: targetMonth } = getTargetYearMonth();
 
   const baseSubject = targetYear + "年" + targetMonth + "月実績";
   Logger.log("【関数①】本番API連携起動: " + baseSubject);
@@ -149,14 +154,18 @@ function receiveGeminiResponseAndWriteToSheet() {
       if (mailSubject.indexOf("週報") !== -1) return; // 週報スレッドは対象外（未読のまま残し、週報側の処理に委ねる）
       if (!mailBody.includes("[START_OF_MONTHLY_REPORT]") || !mailBody.includes("[END_OF_MONTHLY_REPORT]")) return; // まだAIの返信が来ていない
 
+      // Workspace Flows経由の完成メール（件名「【月報完成】」など）は年月の文字列を含まないため、
+      // その場合は「関数①が対象にした月＝先月」とみなして処理する（generateMonthlyReportRequestと
+      // 同じgetTargetYearMonth()を使うことで基準がずれないようにしている）。
       const dateMatch = mailBody.match(/\d{4}年\d{1,2}月実績/) || mailSubject.match(/\d{4}年\d{1,2}月実績/);
-      if (!dateMatch) {
-        // 対象月を特定できない場合は決め打ちシートへ書き込まず、未読のまま残して手動確認できるようにする
-        Logger.log("【関数②】対象月を特定できないためスキップしました（件名: " + mailSubject + "）。手動でご確認ください。");
-        return;
+      let sheetName;
+      if (dateMatch) {
+        sheetName = dateMatch[0];
+      } else {
+        const { year, month } = getTargetYearMonth();
+        sheetName = year + "年" + month + "月実績";
+        Logger.log("【関数②】件名・本文から対象月を特定できなかったため、直近の対象月（" + sheetName + "）とみなして処理します（件名: " + mailSubject + "）。");
       }
-
-      let sheetName = dateMatch[0];
       if (IS_TEST && sheetName.indexOf("_テスト") === -1) sheetName += "_テスト";
 
       const targetSheet = ss.getSheetByName(sheetName);
