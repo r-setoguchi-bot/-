@@ -532,12 +532,13 @@ function setupDailyReportTrigger() {
  * ====================================================================
  */
 
-// このチェックで参照するスクリプトプロパティ名（kintone管理画面でフィールドコードを確認して設定する）
+// このチェックで参照するスクリプトプロパティ名
+// mitsumoriFieldProp / tankaFieldProp は「自動特定できなかった場合の手動指定用」の任意項目（未設定でもOK）
 const BILLING_RATE_CHECK_CONFIG = {
   appIdProp: "KINTONE_KEIYAKU_APP_ID",
   apiTokenProp: "KINTONE_KEIYAKU_API_TOKEN",
-  mitsumoriFieldProp: "KINTONE_KEIYAKU_MITSUMORI_FIELD", // 見積り添付ファイルのフィールドコード
-  tankaFieldProp: "KINTONE_KEIYAKU_TANKA_FIELD",         // 請求単価のフィールドコード
+  mitsumoriFieldProp: "KINTONE_KEIYAKU_MITSUMORI_FIELD", // 見積り添付ファイルのフィールドコード（任意・手動指定用）
+  tankaFieldProp: "KINTONE_KEIYAKU_TANKA_FIELD",         // 請求単価のフィールドコード（任意・手動指定用）
   resultSheetName: "請求単価チェック結果"
 };
 
@@ -550,16 +551,31 @@ function checkBillingRates() {
   const subdomain = props.getProperty("KINTONE_SUBDOMAIN");
   const appId = props.getProperty(BILLING_RATE_CHECK_CONFIG.appIdProp);
   const apiToken = props.getProperty(BILLING_RATE_CHECK_CONFIG.apiTokenProp);
-  const mitsumoriField = props.getProperty(BILLING_RATE_CHECK_CONFIG.mitsumoriFieldProp);
-  const tankaField = props.getProperty(BILLING_RATE_CHECK_CONFIG.tankaFieldProp);
   const geminiApiKey = props.getProperty("GEMINI_API_KEY");
 
-  if (!subdomain || !appId || !apiToken || !mitsumoriField || !tankaField || !geminiApiKey) {
+  if (!subdomain || !appId || !apiToken || !geminiApiKey) {
     console.error("請求単価チェックに必要なスクリプトプロパティが不足しています（KINTONE_SUBDOMAIN / " +
-      BILLING_RATE_CHECK_CONFIG.appIdProp + " / " + BILLING_RATE_CHECK_CONFIG.apiTokenProp + " / " +
-      BILLING_RATE_CHECK_CONFIG.mitsumoriFieldProp + " / " + BILLING_RATE_CHECK_CONFIG.tankaFieldProp + " / GEMINI_API_KEY）。");
+      BILLING_RATE_CHECK_CONFIG.appIdProp + " / " + BILLING_RATE_CHECK_CONFIG.apiTokenProp + " / GEMINI_API_KEY）。");
     return;
   }
+
+  const sheetUrl = props.getProperty("SPREADSHEET_URL");
+  let fieldCodes;
+  try {
+    fieldCodes = resolveKeiyakuFieldCodes(subdomain, appId, apiToken);
+  } catch (e) {
+    console.error("請求単価チェックを中止しました: " + e.message);
+    try {
+      const spreadsheet = SpreadsheetApp.openByUrl(sheetUrl);
+      const spaceName = getDefaultSpaceName(spreadsheet);
+      if (spaceName) sendPushReply(spaceName, "⚠️ 請求単価チェックを実行できませんでした。\n" + e.message);
+    } catch (notifyError) {
+      console.error("エラー通知の送信にも失敗: " + notifyError.message);
+    }
+    return;
+  }
+  const mitsumoriField = fieldCodes.mitsumoriField;
+  const tankaField = fieldCodes.tankaField;
 
   const records = fetchKintoneRecords(subdomain, appId, apiToken);
   const results = [];
@@ -605,6 +621,63 @@ function checkBillingRates() {
 
   saveBillingRateCheckResults(results);
   sendBillingRateCheckReport(results);
+}
+
+/**
+ * 契約管理アプリのフォーム設定（フィールド一覧）をkintone APIから取得し、
+ * 「見積り添付ファイル」「請求単価」に該当するフィールドコードをラベル名から自動で特定する。
+ * スクリプトプロパティで手動指定されている場合はそちらを優先する。
+ * ラベルから一意に特定できない場合は、フィールド一覧を添えてエラーを投げる。
+ */
+function resolveKeiyakuFieldCodes(subdomain, appId, apiToken) {
+  const props = PropertiesService.getScriptProperties();
+  const overrideMitsumori = props.getProperty(BILLING_RATE_CHECK_CONFIG.mitsumoriFieldProp);
+  const overrideTanka = props.getProperty(BILLING_RATE_CHECK_CONFIG.tankaFieldProp);
+  if (overrideMitsumori && overrideTanka) {
+    return { mitsumoriField: overrideMitsumori, tankaField: overrideTanka };
+  }
+
+  const url = `https://${subdomain}.cybozu.com/k/v1/app/form/fields.json?app=${appId}`;
+  const response = UrlFetchApp.fetch(url, {
+    method: "get",
+    headers: { "X-Cybozu-API-Token": apiToken },
+    muteHttpExceptions: true
+  });
+  if (response.getResponseCode() !== 200) {
+    throw new Error(`kintoneフィールド情報の取得失敗 (HTTP ${response.getResponseCode()}): ${response.getContentText()}`);
+  }
+
+  const properties = JSON.parse(response.getContentText()).properties || {};
+  const fields = Object.keys(properties).map(code => ({
+    code,
+    label: properties[code].label || "",
+    type: properties[code].type
+  }));
+
+  const mitsumoriField = overrideMitsumori ||
+    findUniqueFieldCode(fields, f => f.type === "FILE" && f.label.indexOf("見積") !== -1);
+  const tankaField = overrideTanka ||
+    findUniqueFieldCode(fields, f => f.label.indexOf("請求単価") !== -1 || (f.label.indexOf("請求") !== -1 && f.label.indexOf("単価") !== -1));
+
+  if (!mitsumoriField || !tankaField) {
+    const fieldList = fields.map(f => `${f.code}: ${f.label}（${f.type}）`).join("\n");
+    throw new Error(
+      "見積り添付ファイル/請求単価のフィールドを自動で特定できませんでした。" +
+      "スクリプトプロパティ「" + BILLING_RATE_CHECK_CONFIG.mitsumoriFieldProp + "」「" +
+      BILLING_RATE_CHECK_CONFIG.tankaFieldProp + "」で手動指定してください。\n" +
+      "契約管理アプリのフィールド一覧:\n" + fieldList
+    );
+  }
+
+  return { mitsumoriField, tankaField };
+}
+
+/**
+ * 条件に一致するフィールドが1件だけの場合にそのフィールドコードを返す（0件・複数件はnull＝特定不可）
+ */
+function findUniqueFieldCode(fields, predicate) {
+  const matches = fields.filter(predicate);
+  return matches.length === 1 ? matches[0].code : null;
 }
 
 /**
