@@ -34,8 +34,10 @@ const BILLING_RATE_CHECK_CONFIG = {
   subtableFieldCode: "単価テーブル",                  // 請求単価が入っているサブテーブルのフィールドコード
   itemNameFieldCode: "商品名",                        // サブテーブル内：商品名の列
   tankaFieldCode: "請求単価",                         // サブテーブル内：請求単価の列
+  contractorFieldCode: "収集業者名称",                // レコード内：収集業者名のフィールドコード
   estimateFileNameKeyword: "見積",                    // 添付ファイルのうち、これを名前に含むものを見積書とみなす
   resultSheetName: "請求単価チェック結果",
+  summarySheetName: "要対応店舗一覧",
   resultSpreadsheetUrlProp: "RESULT_SPREADSHEET_URL", // 結果シートのURL（初回実行時に自動作成してここへ保存する）
   progressLastIdProp: "BILLING_CHECK_PROGRESS_LAST_ID",
   progressOkCountProp: "BILLING_CHECK_PROGRESS_OK_COUNT",
@@ -60,7 +62,7 @@ function checkBillingRates() {
   const spreadsheet = getOrCreateResultSpreadsheet();
   const sheet = getOrCreateSheet(spreadsheet, BILLING_RATE_CHECK_CONFIG.resultSheetName);
   sheet.clear();
-  sheet.appendRow(["チェック日時", "レコードID", "契約先", "商品名", "ステータス", "現在の請求単価", "見積りから読み取った金額"]);
+  sheet.appendRow(["チェック日時", "レコードID", "契約先", "収集業者名", "商品名", "ステータス", "現在の請求単価", "見積りから読み取った金額", "差額", "差額率(%)"]);
 
   removeContinuationTrigger();
   runBillingRateCheckBatch();
@@ -134,8 +136,8 @@ function runBillingRateCheckBatch() {
       const rows = buildResultRowsForRecord(record, fileFieldCode, subdomain, apiToken, geminiApiKey);
 
       if (rows.length > 0) {
-        sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, 7).setValues(rows);
-        rows.forEach(r => { if (r[4] === "一致") okCount++; else attentionCount++; });
+        sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, 10).setValues(rows);
+        rows.forEach(r => { if (r[5] === "一致") okCount++; else attentionCount++; });
       }
 
       lastId = Number(record.$id.value);
@@ -152,6 +154,7 @@ function runBillingRateCheckBatch() {
 
   if (finished) {
     removeContinuationTrigger();
+    buildStoreSummarySheet();
     sendBillingRateCheckFinalReport(okCount, attentionCount);
     props.deleteProperty(BILLING_RATE_CHECK_CONFIG.progressLastIdProp);
     props.deleteProperty(BILLING_RATE_CHECK_CONFIG.progressOkCountProp);
@@ -196,19 +199,21 @@ function buildResultRowsForRecord(record, fileFieldCode, subdomain, apiToken, ge
                        (record["契約店舗名称"] && record["契約店舗名称"].value) ||
                        (record["会社名"] && record["会社名"].value) ||
                        `レコード#${recordId}`;
+  const contractorName = (record[BILLING_RATE_CHECK_CONFIG.contractorFieldCode] &&
+                           record[BILLING_RATE_CHECK_CONFIG.contractorFieldCode].value) || "";
 
   const tableRows = (record[BILLING_RATE_CHECK_CONFIG.subtableFieldCode] &&
                       record[BILLING_RATE_CHECK_CONFIG.subtableFieldCode].value) || [];
 
   if (tableRows.length === 0) {
-    return [[now, recordId, displayName, "(全項目)", "単価テーブルなし", "", ""]];
+    return [[now, recordId, displayName, contractorName, "(全項目)", "単価テーブルなし", "", "", "", ""]];
   }
 
   const files = (record[fileFieldCode] && record[fileFieldCode].value) || [];
   const estimateFiles = files.filter(f => f.name.indexOf(BILLING_RATE_CHECK_CONFIG.estimateFileNameKeyword) !== -1);
 
   if (estimateFiles.length === 0) {
-    return [[now, recordId, displayName, "(全項目)", "見積り未添付", "", ""]];
+    return [[now, recordId, displayName, contractorName, "(全項目)", "見積り未添付", "", "", "", ""]];
   }
 
   let extractedItems;
@@ -218,12 +223,12 @@ function buildResultRowsForRecord(record, fileFieldCode, subdomain, apiToken, ge
     const extraction = extractEstimateItems(blob, estimateFiles[0].contentType, geminiApiKey);
 
     if (!extraction.items || extraction.items.length === 0) {
-      return [[now, recordId, displayName, "(全項目)", "抽出失敗", "", ""]];
+      return [[now, recordId, displayName, contractorName, "(全項目)", "抽出失敗", "", "", "", ""]];
     }
     extractedItems = extraction.items;
   } catch (e) {
     console.error(`見積書の読み取り中にエラー（レコード#${recordId}）: ` + e.message);
-    return [[now, recordId, displayName, "(全項目)", "エラー", "", ""]];
+    return [[now, recordId, displayName, contractorName, "(全項目)", "エラー", "", "", "", ""]];
   }
 
   const rows = [];
@@ -237,21 +242,35 @@ function buildResultRowsForRecord(record, fileFieldCode, subdomain, apiToken, ge
 
     const matched = findMatchingEstimateItem(extractedItems, itemName);
     if (!matched) {
-      rows.push([now, recordId, displayName, itemName, "見積りに対応項目なし", currentTankaRaw, ""]);
+      rows.push([now, recordId, displayName, contractorName, itemName, "見積りに対応項目なし", currentTankaRaw, "", "", ""]);
       return;
     }
 
     const currentTankaNum = parseAmount(currentTankaRaw);
+    const diffInfo = calcDiff(currentTankaNum, matched.unitPrice);
+
     if (currentTankaNum === null) {
-      rows.push([now, recordId, displayName, itemName, "請求単価未入力", currentTankaRaw, matched.unitPrice]);
+      rows.push([now, recordId, displayName, contractorName, itemName, "請求単価未入力", currentTankaRaw, matched.unitPrice, diffInfo.diff, diffInfo.diffPercent]);
     } else if (currentTankaNum === matched.unitPrice) {
-      rows.push([now, recordId, displayName, itemName, "一致", currentTankaRaw, matched.unitPrice]);
+      rows.push([now, recordId, displayName, contractorName, itemName, "一致", currentTankaRaw, matched.unitPrice, 0, 0]);
     } else {
-      rows.push([now, recordId, displayName, itemName, "不一致", currentTankaRaw, matched.unitPrice]);
+      rows.push([now, recordId, displayName, contractorName, itemName, "不一致", currentTankaRaw, matched.unitPrice, diffInfo.diff, diffInfo.diffPercent]);
     }
   });
 
   return rows;
+}
+
+/**
+ * 現在の請求単価と見積り金額の差額・差額率(%)を計算する（比較できない場合は空文字を返す）
+ */
+function calcDiff(currentNum, extractedNum) {
+  if (currentNum === null || extractedNum === null || extractedNum === undefined || isNaN(extractedNum)) {
+    return { diff: "", diffPercent: "" };
+  }
+  const diff = extractedNum - currentNum;
+  const diffPercent = currentNum !== 0 ? Math.round((diff / currentNum) * 1000) / 10 : "";
+  return { diff, diffPercent };
 }
 
 /**
@@ -475,12 +494,80 @@ function getOrCreateSheet(spreadsheet, sheetName) {
 }
 
 /**
+ * 「請求単価チェック結果」シート（商品ごとの詳細、全件処理後の最終状態）を集計し、
+ * 契約先（レコード）ごとに1行の「要対応店舗一覧」シートを作る。
+ * 「見積り未添付」は業者ルールでの運用があり得るため、要対応件数には含めない（別列で件数のみ表示）。
+ * 差額率(%)が大きい順・要対応の有無の順に並べ替えるので、上から順に見れば「明らかにおかしいもの」から確認できる。
+ */
+function buildStoreSummarySheet() {
+  const spreadsheet = getOrCreateResultSpreadsheet();
+  const detailSheet = getOrCreateSheet(spreadsheet, BILLING_RATE_CHECK_CONFIG.resultSheetName);
+  const lastRow = detailSheet.getLastRow();
+  if (lastRow < 2) return; // 見出しのみ（データなし）
+
+  const data = detailSheet.getRange(2, 1, lastRow - 1, 10).getValues();
+  const STATUS_LIST = ["一致", "不一致", "請求単価未入力", "見積りに対応項目なし", "見積り未添付", "単価テーブルなし", "抽出失敗", "エラー"];
+  const NEEDS_ATTENTION_STATUSES = ["不一致", "請求単価未入力", "見積りに対応項目なし", "単価テーブルなし", "抽出失敗", "エラー"];
+
+  const summaryByRecord = {};
+
+  data.forEach(r => {
+    const recordId = r[1];
+    const displayName = r[2];
+    const contractorName = r[3];
+    const status = r[5];
+    const diffPercent = r[9];
+
+    if (!summaryByRecord[recordId]) {
+      const counts = {};
+      STATUS_LIST.forEach(s => counts[s] = 0);
+      summaryByRecord[recordId] = { recordId, displayName, contractorName, counts, maxAbsDiffPercent: 0 };
+    }
+
+    const entry = summaryByRecord[recordId];
+    if (entry.counts[status] !== undefined) entry.counts[status]++;
+    if (typeof diffPercent === "number" && Math.abs(diffPercent) > entry.maxAbsDiffPercent) {
+      entry.maxAbsDiffPercent = Math.abs(diffPercent);
+    }
+  });
+
+  const header = ["レコードID", "契約先", "収集業者名", "一致", "不一致", "請求単価未入力",
+    "見積りに対応項目なし", "見積り未添付", "単価テーブルなし", "抽出失敗", "エラー", "最大差額率(%)", "要対応"];
+
+  const bodyRows = Object.keys(summaryByRecord).map(recordId => {
+    const e = summaryByRecord[recordId];
+    const needsAttentionCount = NEEDS_ATTENTION_STATUSES.reduce((sum, s) => sum + e.counts[s], 0);
+    return [
+      e.recordId, e.displayName, e.contractorName,
+      e.counts["一致"], e.counts["不一致"], e.counts["請求単価未入力"], e.counts["見積りに対応項目なし"],
+      e.counts["見積り未添付"], e.counts["単価テーブルなし"], e.counts["抽出失敗"], e.counts["エラー"],
+      e.maxAbsDiffPercent, needsAttentionCount > 0 ? "要対応" : ""
+    ];
+  });
+
+  bodyRows.sort((a, b) => {
+    const aNeeds = a[12] === "要対応" ? 1 : 0;
+    const bNeeds = b[12] === "要対応" ? 1 : 0;
+    if (aNeeds !== bNeeds) return bNeeds - aNeeds; // 要対応のものを先に
+    return (b[11] || 0) - (a[11] || 0); // 最大差額率(%)が大きい順
+  });
+
+  const summarySheet = getOrCreateSheet(spreadsheet, BILLING_RATE_CHECK_CONFIG.summarySheetName);
+  summarySheet.clear();
+  summarySheet.getRange(1, 1, 1, header.length).setValues([header]);
+  if (bodyRows.length > 0) {
+    summarySheet.getRange(2, 1, bodyRows.length, header.length).setValues(bodyRows);
+  }
+}
+
+/**
  * 全件処理が完了した際に、件数のサマリーをメールで送る（詳細はスプレッドシート参照）
  */
 function sendBillingRateCheckFinalReport(okCount, attentionCount) {
   const total = okCount + attentionCount;
   const body = `対象 ${total}件中、一致 ${okCount}件・要確認 ${attentionCount}件でした。\n\n` +
-    "商品ごとの詳細（契約先・商品名・現在の請求単価・見積りから読み取った金額）はスプレッドシートをご確認ください:\n" +
+    "・商品ごとの詳細は「請求単価チェック結果」シート\n" +
+    "・どの契約先（店舗）を直すべきかは「要対応店舗一覧」シート（差額率が大きい順に並んでいます）\n\n" +
     getOrCreateResultSpreadsheet().getUrl();
 
   notifyByEmail(`🤖 請求単価チェック完了（要確認 ${attentionCount}件）`, body);
