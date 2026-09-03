@@ -1,9 +1,11 @@
 /**
  * ====================================================================
- * 請求単価チェック（契約管理アプリ 見積り添付ファイルとの突合）
+ * 請求単価チェック（契約管理アプリ「単価テーブル」と見積書添付ファイルの突合）
  *
- * kintone「契約管理」アプリの各レコードについて、添付された見積りファイル（PDF/Excel/画像）から
- * AIで金額を読み取り、現在の「請求単価」フィールドと一致しているかを確認する。
+ * kintone「契約管理」アプリの各レコードについて、
+ * 「単価テーブル」サブテーブルの商品ごとの請求単価と、
+ * 「契約書PDF」欄に添付されている見積書（ファイル名に「見積」を含むもの）から
+ * AIで読み取った商品ごとの金額を、商品名で突き合わせて確認する。
  *
  * ※このプロジェクトは瀬戸口秘書ボットとは完全に独立した、単独のGASプロジェクトです。
  * ※kintoneへの書き込みは一切行わず、結果をメールとスプレッドシートへ出力するのみです。
@@ -14,23 +16,26 @@
  *   KINTONE_KEIYAKU_API_TOKEN: 契約管理アプリのAPIトークン（レコード閲覧・アプリ管理の権限が必要）
  *   GEMINI_API_KEY           : Gemini APIキー
  *
- * 【任意】自動判定がうまくいかない場合のみ、以下を追加で手動指定できます
- *   KINTONE_KEIYAKU_MITSUMORI_FIELD : 見積り添付ファイルのフィールドコード
- *   KINTONE_KEIYAKU_TANKA_FIELD     : 請求単価のフィールドコード
+ * 【任意】添付ファイル欄のフィールドコードが異なる場合のみ
+ *   KINTONE_KEIYAKU_MITSUMORI_FIELD : 見積書が入っている添付ファイル欄のフィールドコード（未設定時は既定値"契約書PDF"を使う）
  * ====================================================================
  */
 
 const BILLING_RATE_CHECK_CONFIG = {
   appIdProp: "KINTONE_KEIYAKU_APP_ID",
   apiTokenProp: "KINTONE_KEIYAKU_API_TOKEN",
-  mitsumoriFieldProp: "KINTONE_KEIYAKU_MITSUMORI_FIELD", // 見積り添付ファイルのフィールドコード（任意・手動指定用）
-  tankaFieldProp: "KINTONE_KEIYAKU_TANKA_FIELD",         // 請求単価のフィールドコード（任意・手動指定用）
+  fileFieldProp: "KINTONE_KEIYAKU_MITSUMORI_FIELD", // 見積書が入っている添付ファイル欄のフィールドコード（任意・手動指定用）
+  defaultFileFieldCode: "契約書PDF",                 // 上記が未設定の場合に使う既定のフィールドコード
+  subtableFieldCode: "単価テーブル",                  // 請求単価が入っているサブテーブルのフィールドコード
+  itemNameFieldCode: "商品名",                        // サブテーブル内：商品名の列
+  tankaFieldCode: "請求単価",                         // サブテーブル内：請求単価の列
+  estimateFileNameKeyword: "見積",                    // 添付ファイルのうち、これを名前に含むものを見積書とみなす
   resultSheetName: "請求単価チェック結果",
   resultSpreadsheetUrlProp: "RESULT_SPREADSHEET_URL" // 結果シートのURL（初回実行時に自動作成してここへ保存する）
 };
 
 /**
- * 契約管理アプリの全レコードを対象に、見積り添付ファイルの金額と請求単価フィールドを突合する関数
+ * 契約管理アプリの全レコードを対象に、単価テーブルの各商品の請求単価と見積書の金額を突合する関数
  * 時間主導型トリガー、またはGASエディタからの手動実行を想定
  */
 function checkBillingRates() {
@@ -39,6 +44,7 @@ function checkBillingRates() {
   const appId = props.getProperty(BILLING_RATE_CHECK_CONFIG.appIdProp);
   const apiToken = props.getProperty(BILLING_RATE_CHECK_CONFIG.apiTokenProp);
   const geminiApiKey = props.getProperty("GEMINI_API_KEY");
+  const fileFieldCode = props.getProperty(BILLING_RATE_CHECK_CONFIG.fileFieldProp) || BILLING_RATE_CHECK_CONFIG.defaultFileFieldCode;
 
   if (!subdomain || !appId || !apiToken || !geminiApiKey) {
     const message = "請求単価チェックに必要なスクリプトプロパティが不足しています（KINTONE_SUBDOMAIN / " +
@@ -47,17 +53,6 @@ function checkBillingRates() {
     notifyByEmail("⚠️ 請求単価チェック：設定エラー", message);
     return;
   }
-
-  let fieldCodes;
-  try {
-    fieldCodes = resolveKeiyakuFieldCodes(subdomain, appId, apiToken);
-  } catch (e) {
-    console.error("請求単価チェックを中止しました: " + e.message);
-    notifyByEmail("⚠️ 請求単価チェック：実行できませんでした", e.message);
-    return;
-  }
-  const mitsumoriField = fieldCodes.mitsumoriField;
-  const tankaField = fieldCodes.tankaField;
 
   const records = fetchKintoneRecords(subdomain, appId, apiToken);
   const results = [];
@@ -69,36 +64,62 @@ function checkBillingRates() {
                          (record["会社名"] && record["会社名"].value) ||
                          `レコード#${recordId}`;
 
-    const currentTankaRaw = record[tankaField] ? record[tankaField].value : "";
-    const files = (record[mitsumoriField] && record[mitsumoriField].value) || [];
+    const tableRows = (record[BILLING_RATE_CHECK_CONFIG.subtableFieldCode] &&
+                        record[BILLING_RATE_CHECK_CONFIG.subtableFieldCode].value) || [];
 
-    if (files.length === 0) {
-      results.push({ recordId, displayName, status: "見積り未添付", current: currentTankaRaw, extracted: "", note: "" });
+    if (tableRows.length === 0) {
+      results.push({ recordId, displayName, itemName: "(全項目)", status: "単価テーブルなし", current: "", extracted: "", note: "" });
       return;
     }
 
-    try {
-      const file = files[0]; // 複数添付されている場合は先頭（最新想定）のみをチェック対象にする
-      const blob = fetchKintoneFile(subdomain, file.fileKey, apiToken);
-      const extraction = extractEstimateAmount(blob, file.contentType, geminiApiKey);
+    const files = (record[fileFieldCode] && record[fileFieldCode].value) || [];
+    const estimateFiles = files.filter(f => f.name.indexOf(BILLING_RATE_CHECK_CONFIG.estimateFileNameKeyword) !== -1);
 
-      if (extraction.amount === null) {
-        results.push({ recordId, displayName, status: "抽出失敗", current: currentTankaRaw, extracted: "", note: extraction.note || "" });
+    if (estimateFiles.length === 0) {
+      results.push({ recordId, displayName, itemName: "(全項目)", status: "見積り未添付", current: "", extracted: "", note: "" });
+      return;
+    }
+
+    let extractedItems;
+    try {
+      // 複数見積りが添付されている場合は先頭（最新想定）のみをチェック対象にする
+      const blob = fetchKintoneFile(subdomain, estimateFiles[0].fileKey, apiToken);
+      const extraction = extractEstimateItems(blob, estimateFiles[0].contentType, geminiApiKey);
+
+      if (!extraction.items || extraction.items.length === 0) {
+        results.push({ recordId, displayName, itemName: "(全項目)", status: "抽出失敗", current: "", extracted: "", note: extraction.note || "" });
+        return;
+      }
+      extractedItems = extraction.items;
+    } catch (e) {
+      console.error(`見積書の読み取り中にエラー（レコード#${recordId}）: ` + e.message);
+      results.push({ recordId, displayName, itemName: "(全項目)", status: "エラー", current: "", extracted: "", note: e.message });
+      return;
+    }
+
+    tableRows.forEach(row => {
+      const itemName = row.value[BILLING_RATE_CHECK_CONFIG.itemNameFieldCode]
+        ? row.value[BILLING_RATE_CHECK_CONFIG.itemNameFieldCode].value : "";
+      const currentTankaRaw = row.value[BILLING_RATE_CHECK_CONFIG.tankaFieldCode]
+        ? row.value[BILLING_RATE_CHECK_CONFIG.tankaFieldCode].value : "";
+
+      if (!itemName) return; // 商品名が空の行はスキップ
+
+      const matched = findMatchingEstimateItem(extractedItems, itemName);
+      if (!matched) {
+        results.push({ recordId, displayName, itemName, status: "見積りに対応項目なし", current: currentTankaRaw, extracted: "", note: "" });
         return;
       }
 
       const currentTankaNum = parseAmount(currentTankaRaw);
       if (currentTankaNum === null) {
-        results.push({ recordId, displayName, status: "請求単価未入力", current: currentTankaRaw, extracted: extraction.amount, note: extraction.note || "" });
-      } else if (currentTankaNum === extraction.amount) {
-        results.push({ recordId, displayName, status: "一致", current: currentTankaRaw, extracted: extraction.amount, note: "" });
+        results.push({ recordId, displayName, itemName, status: "請求単価未入力", current: currentTankaRaw, extracted: matched.unitPrice, note: "" });
+      } else if (currentTankaNum === matched.unitPrice) {
+        results.push({ recordId, displayName, itemName, status: "一致", current: currentTankaRaw, extracted: matched.unitPrice, note: "" });
       } else {
-        results.push({ recordId, displayName, status: "不一致", current: currentTankaRaw, extracted: extraction.amount, note: extraction.note || "" });
+        results.push({ recordId, displayName, itemName, status: "不一致", current: currentTankaRaw, extracted: matched.unitPrice, note: "" });
       }
-    } catch (e) {
-      console.error(`請求単価チェック中にエラー（レコード#${recordId}）: ` + e.message);
-      results.push({ recordId, displayName, status: "エラー", current: currentTankaRaw, extracted: "", note: e.message });
-    }
+    });
   });
 
   saveBillingRateCheckResults(results);
@@ -106,60 +127,22 @@ function checkBillingRates() {
 }
 
 /**
- * 契約管理アプリのフォーム設定（フィールド一覧）をkintone APIから取得し、
- * 「見積り添付ファイル」「請求単価」に該当するフィールドコードをラベル名から自動で特定する。
- * スクリプトプロパティで手動指定されている場合はそちらを優先する。
- * ラベルから一意に特定できない場合は、フィールド一覧を添えてエラーを投げる。
+ * 見積りから抽出した品目リストの中から、単価テーブルの商品名に対応するものを探す
+ * 空白除去のうえ、完全一致または部分一致（どちらかがどちらかを含む）で判定する
  */
-function resolveKeiyakuFieldCodes(subdomain, appId, apiToken) {
-  const props = PropertiesService.getScriptProperties();
-  const overrideMitsumori = props.getProperty(BILLING_RATE_CHECK_CONFIG.mitsumoriFieldProp);
-  const overrideTanka = props.getProperty(BILLING_RATE_CHECK_CONFIG.tankaFieldProp);
-  if (overrideMitsumori && overrideTanka) {
-    return { mitsumoriField: overrideMitsumori, tankaField: overrideTanka };
-  }
+function findMatchingEstimateItem(items, itemName) {
+  const target = normalizeItemName(itemName);
+  if (!target) return null;
 
-  const url = `https://${subdomain}.cybozu.com/k/v1/app/form/fields.json?app=${appId}`;
-  const response = UrlFetchApp.fetch(url, {
-    method: "get",
-    headers: { "X-Cybozu-API-Token": apiToken },
-    muteHttpExceptions: true
-  });
-  if (response.getResponseCode() !== 200) {
-    throw new Error(`kintoneフィールド情報の取得失敗 (HTTP ${response.getResponseCode()}): ${response.getContentText()}`);
-  }
-
-  const properties = JSON.parse(response.getContentText()).properties || {};
-  const fields = Object.keys(properties).map(code => ({
-    code,
-    label: properties[code].label || "",
-    type: properties[code].type
-  }));
-
-  const mitsumoriField = overrideMitsumori ||
-    findUniqueFieldCode(fields, f => f.type === "FILE" && f.label.indexOf("見積") !== -1);
-  const tankaField = overrideTanka ||
-    findUniqueFieldCode(fields, f => f.label.indexOf("請求単価") !== -1 || (f.label.indexOf("請求") !== -1 && f.label.indexOf("単価") !== -1));
-
-  if (!mitsumoriField || !tankaField) {
-    const fieldList = fields.map(f => `${f.code}: ${f.label}（${f.type}）`).join("\n");
-    throw new Error(
-      "見積り添付ファイル/請求単価のフィールドを自動で特定できませんでした。" +
-      "スクリプトプロパティ「" + BILLING_RATE_CHECK_CONFIG.mitsumoriFieldProp + "」「" +
-      BILLING_RATE_CHECK_CONFIG.tankaFieldProp + "」で手動指定してください。\n" +
-      "契約管理アプリのフィールド一覧:\n" + fieldList
-    );
-  }
-
-  return { mitsumoriField, tankaField };
+  return items.find(it => {
+    const n = normalizeItemName(it.itemName);
+    if (!n) return false;
+    return n === target || n.indexOf(target) !== -1 || target.indexOf(n) !== -1;
+  }) || null;
 }
 
-/**
- * 条件に一致するフィールドが1件だけの場合にそのフィールドコードを返す（0件・複数件はnull＝特定不可）
- */
-function findUniqueFieldCode(fields, predicate) {
-  const matches = fields.filter(predicate);
-  return matches.length === 1 ? matches[0].code : null;
+function normalizeItemName(name) {
+  return String(name || "").replace(/[\s　]/g, "").trim();
 }
 
 /**
@@ -212,17 +195,16 @@ function fetchKintoneFile(subdomain, fileKey, apiToken) {
 }
 
 /**
- * 見積りファイル（PDF/画像/Excel）から請求すべき金額をAIで抽出する
+ * 見積りファイル（PDF/画像/Excel）から、品目名と単価のペアをすべてAIで抽出する
  * PDF・画像はGeminiのマルチモーダル入力でそのまま読み取り、
  * Excel（.xlsx）はセルの文字列を抽出してテキストとしてAIに渡す
  */
-function extractEstimateAmount(blob, contentType, apiKey) {
-  const promptBase = "これは取引先への見積書です。この見積書に記載されている、実際に請求すべき単価・金額" +
-    "（値引き後の最終的な金額。消費税込みの合計金額を優先）を1つだけ特定してください。" +
-    "複数の商品/サービスが並んでいる場合は、個別の内訳ではなく合計金額（税込）を優先してください。" +
-    "金額がどうしても読み取れない場合はamountをnullにしてください。" +
+function extractEstimateItems(blob, contentType, apiKey) {
+  const promptBase = "これは取引先への見積書です。見積書に記載されている品目（商品名・サービス名）と、" +
+    "それぞれの単価（金額）のペアを、書かれている行すべてについて抽出してください。" +
+    "小計・消費税・合計などの集計行は含めず、個別の品目行だけを対象にしてください。" +
     "説明文などは一切含めず、次のJSON形式の文字列のみを出力してください:\n" +
-    '{"amount": 数値（円、カンマなし。税込金額）またはnull, "note": "抽出時に気になった点があれば一言（無ければ空文字）"}';
+    '{"items": [{"itemName": "品目名", "unitPrice": 数値（円、カンマなし）}], "note": "抽出時に気になった点があれば一言（無ければ空文字）"}';
 
   let parts;
   if (contentType === "application/pdf" || contentType.indexOf("image/") === 0) {
@@ -232,19 +214,19 @@ function extractEstimateAmount(blob, contentType, apiKey) {
     ];
   } else if (contentType.indexOf("spreadsheetml") !== -1) {
     const sheetText = extractTextFromXlsx(blob);
-    if (!sheetText) return { amount: null, note: "Excelファイルの内容を読み取れませんでした。" };
+    if (!sheetText) return { items: [], note: "Excelファイルの内容を読み取れませんでした。" };
     parts = [{ text: promptBase + "\n\n【見積書の内容（セルの値を抽出したもの）】\n" + sheetText }];
   } else {
-    return { amount: null, note: `未対応のファイル形式です（${contentType}）。` };
+    return { items: [], note: `未対応のファイル形式です（${contentType}）。` };
   }
 
-  return callGeminiForAmount(parts, apiKey);
+  return callGeminiForItems(parts, apiKey);
 }
 
 /**
- * Gemini APIへ画像/PDF/テキストを渡し、金額抽出結果のJSONを解析して返す
+ * Gemini APIへ画像/PDF/テキストを渡し、品目ごとの金額抽出結果のJSONを解析して返す
  */
-function callGeminiForAmount(parts, apiKey) {
+function callGeminiForItems(parts, apiKey) {
   const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=" + apiKey;
   const payload = {
     "contents": [{ "parts": parts }],
@@ -261,15 +243,18 @@ function callGeminiForAmount(parts, apiKey) {
     const response = UrlFetchApp.fetch(url, options);
     const json = JSON.parse(response.getContentText());
     const text = json.candidates && json.candidates[0].content.parts[0].text;
-    if (!text) return { amount: null, note: "AIから金額を読み取れませんでした。" };
+    if (!text) return { items: [], note: "AIから内容を読み取れませんでした。" };
 
     const cleanJsonStr = text.replace(/```json/g, "").replace(/```/g, "").trim();
     const parsed = JSON.parse(cleanJsonStr);
-    const amount = (parsed.amount === null || parsed.amount === undefined) ? null : Number(parsed.amount);
-    return { amount: (amount === null || isNaN(amount)) ? null : amount, note: parsed.note || "" };
+    const items = Array.isArray(parsed.items) ? parsed.items
+      .map(it => ({ itemName: String(it.itemName || ""), unitPrice: Number(it.unitPrice) }))
+      .filter(it => it.itemName && !isNaN(it.unitPrice)) : [];
+
+    return { items, note: parsed.note || "" };
   } catch (e) {
-    console.error("見積り金額抽出のGemini呼び出しでエラー: " + e.message);
-    return { amount: null, note: "AI呼び出し中にエラーが発生しました。" };
+    console.error("見積り品目抽出のGemini呼び出しでエラー: " + e.message);
+    return { items: [], note: "AI呼び出し中にエラーが発生しました。" };
   }
 }
 
@@ -402,9 +387,9 @@ function saveBillingRateCheckResults(results) {
   sheet.clear();
 
   const now = Utilities.formatDate(new Date(), "Asia/Tokyo", "yyyy/MM/dd HH:mm:ss");
-  const rows = [["チェック日時", "レコードID", "契約先", "ステータス", "現在の請求単価", "見積りから読み取った金額", "備考"]];
+  const rows = [["チェック日時", "レコードID", "契約先", "商品名", "ステータス", "現在の請求単価", "見積りから読み取った金額"]];
   results.forEach(r => {
-    rows.push([now, r.recordId, r.displayName, r.status, r.current, r.extracted, r.note]);
+    rows.push([now, r.recordId, r.displayName, r.itemName, r.status, r.current, r.extracted]);
   });
   sheet.getRange(1, 1, rows.length, 7).setValues(rows);
 }
@@ -423,10 +408,9 @@ function sendBillingRateCheckReport(results) {
     body += "すべて一致していました。特に対応は不要です。";
   } else {
     body += needsAttention.slice(0, MAX_LINES).map(r => {
-      let line = `【${r.status}】${r.displayName}（現在: ${r.current || "(空)"}`;
+      let line = `【${r.status}】${r.displayName}／${r.itemName}（現在: ${r.current || "(空)"}`;
       if (r.extracted !== "") line += ` / 見積り: ${r.extracted}`;
       line += "）";
-      if (r.note) line += `\n  備考: ${r.note}`;
       return line;
     }).join("\n");
 
@@ -468,31 +452,4 @@ function setupBillingRateCheckTrigger() {
     .atHour(8)
     .everyDays(1)
     .create();
-}
-
-/**
- * 調査用：指定したフィールドコードの詳細設定（サブテーブルの内部フィールドコードなど）をメールで確認する
- * 設計を詰めるための一時的な関数。本番運用では使わない
- */
-function debugKeiyakuFieldDetails() {
-  const props = PropertiesService.getScriptProperties();
-  const subdomain = props.getProperty("KINTONE_SUBDOMAIN");
-  const appId = props.getProperty(BILLING_RATE_CHECK_CONFIG.appIdProp);
-  const apiToken = props.getProperty(BILLING_RATE_CHECK_CONFIG.apiTokenProp);
-
-  const url = `https://${subdomain}.cybozu.com/k/v1/app/form/fields.json?app=${appId}`;
-  const response = UrlFetchApp.fetch(url, {
-    method: "get",
-    headers: { "X-Cybozu-API-Token": apiToken },
-    muteHttpExceptions: true
-  });
-  const properties = JSON.parse(response.getContentText()).properties || {};
-
-  const targets = ["契約書PDF", "単価テーブル"];
-  const detail = targets.map(code => {
-    return `--- ${code} ---\n` + JSON.stringify(properties[code], null, 2);
-  }).join("\n\n");
-
-  console.log(detail);
-  notifyByEmail("🔍 請求単価チェック：フィールド詳細", detail);
 }
