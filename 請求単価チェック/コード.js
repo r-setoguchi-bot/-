@@ -10,6 +10,11 @@
  * ※このプロジェクトは瀬戸口秘書ボットとは完全に独立した、単独のGASプロジェクトです。
  * ※kintoneへの書き込みは一切行わず、結果をメールとスプレッドシートへ出力するのみです。
  *
+ * ※対象レコードが多い（1000件以上など）場合、1回の実行では終わらないため、
+ *   数分ごとに自動で続きを実行する「分割処理」方式になっています。
+ *   checkBillingRates を実行すると、処理しきれなかった分は1分ごとのトリガーで
+ *   自動的に続きが実行され、全件終わったタイミングで完了メールが届きます。
+ *
  * 【事前に設定が必要なスクリプトプロパティ】（プロジェクトの設定 → スクリプト プロパティ）
  *   KINTONE_SUBDOMAIN        : kintoneのサブドメイン（例: https://xxxx.cybozu.com なら "xxxx"）
  *   KINTONE_KEIYAKU_APP_ID   : 契約管理アプリのアプリID
@@ -31,14 +36,49 @@ const BILLING_RATE_CHECK_CONFIG = {
   tankaFieldCode: "請求単価",                         // サブテーブル内：請求単価の列
   estimateFileNameKeyword: "見積",                    // 添付ファイルのうち、これを名前に含むものを見積書とみなす
   resultSheetName: "請求単価チェック結果",
-  resultSpreadsheetUrlProp: "RESULT_SPREADSHEET_URL" // 結果シートのURL（初回実行時に自動作成してここへ保存する）
+  resultSpreadsheetUrlProp: "RESULT_SPREADSHEET_URL", // 結果シートのURL（初回実行時に自動作成してここへ保存する）
+  progressLastIdProp: "BILLING_CHECK_PROGRESS_LAST_ID",
+  progressOkCountProp: "BILLING_CHECK_PROGRESS_OK_COUNT",
+  progressAttentionCountProp: "BILLING_CHECK_PROGRESS_ATTENTION_COUNT",
+  continuationHandlerName: "continueBillingRateCheck"
 };
 
+const EXECUTION_TIME_BUDGET_MS = 4.5 * 60 * 1000; // 1回の実行で使ってよい時間（安全のため4分30秒までにしておく）
+const KINTONE_PAGE_SIZE = 100; // 1回のkintone取得件数
+
 /**
- * 契約管理アプリの全レコードを対象に、単価テーブルの各商品の請求単価と見積書の金額を突合する関数
- * 時間主導型トリガー、またはGASエディタからの手動実行を想定
+ * 請求単価チェックを開始する関数。GASエディタからの手動実行を想定
+ * 対象レコードが多い場合は1回で終わらないため、進捗をリセットしたうえで1回目のバッチを実行し、
+ * 終わらなければ1分ごとに自動で続きが実行されるようにする
  */
 function checkBillingRates() {
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty(BILLING_RATE_CHECK_CONFIG.progressLastIdProp);
+  props.setProperty(BILLING_RATE_CHECK_CONFIG.progressOkCountProp, "0");
+  props.setProperty(BILLING_RATE_CHECK_CONFIG.progressAttentionCountProp, "0");
+
+  const spreadsheet = getOrCreateResultSpreadsheet();
+  const sheet = getOrCreateSheet(spreadsheet, BILLING_RATE_CHECK_CONFIG.resultSheetName);
+  sheet.clear();
+  sheet.appendRow(["チェック日時", "レコードID", "契約先", "商品名", "ステータス", "現在の請求単価", "見積りから読み取った金額"]);
+
+  removeContinuationTrigger();
+  runBillingRateCheckBatch();
+}
+
+/**
+ * 1分ごとのトリガーから呼ばれ、続きのバッチを実行する関数（手動実行はしない）
+ */
+function continueBillingRateCheck() {
+  runBillingRateCheckBatch();
+}
+
+/**
+ * 実際の1バッチ分の処理。時間切れになったら進捗を保存して抜け、まだ終わっていなければ
+ * 続行用トリガーを仕込む。全件終わったらトリガーを消して完了メールを送る
+ */
+function runBillingRateCheckBatch() {
+  const startTime = Date.now();
   const props = PropertiesService.getScriptProperties();
   const subdomain = props.getProperty("KINTONE_SUBDOMAIN");
   const appId = props.getProperty(BILLING_RATE_CHECK_CONFIG.appIdProp);
@@ -51,79 +91,167 @@ function checkBillingRates() {
       BILLING_RATE_CHECK_CONFIG.appIdProp + " / " + BILLING_RATE_CHECK_CONFIG.apiTokenProp + " / GEMINI_API_KEY）。";
     console.error(message);
     notifyByEmail("⚠️ 請求単価チェック：設定エラー", message);
+    removeContinuationTrigger();
     return;
   }
 
-  const records = fetchKintoneRecords(subdomain, appId, apiToken);
-  const results = [];
+  const sheet = getOrCreateSheet(getOrCreateResultSpreadsheet(), BILLING_RATE_CHECK_CONFIG.resultSheetName);
+  let lastId = Number(props.getProperty(BILLING_RATE_CHECK_CONFIG.progressLastIdProp) || "0");
+  let okCount = Number(props.getProperty(BILLING_RATE_CHECK_CONFIG.progressOkCountProp) || "0");
+  let attentionCount = Number(props.getProperty(BILLING_RATE_CHECK_CONFIG.progressAttentionCountProp) || "0");
+  let finished = false;
 
-  records.forEach(record => {
-    const recordId = record.$id.value;
-    const displayName = (record["屋号名"] && record["屋号名"].value) ||
-                         (record["契約店舗名称"] && record["契約店舗名称"].value) ||
-                         (record["会社名"] && record["会社名"].value) ||
-                         `レコード#${recordId}`;
-
-    const tableRows = (record[BILLING_RATE_CHECK_CONFIG.subtableFieldCode] &&
-                        record[BILLING_RATE_CHECK_CONFIG.subtableFieldCode].value) || [];
-
-    if (tableRows.length === 0) {
-      results.push({ recordId, displayName, itemName: "(全項目)", status: "単価テーブルなし", current: "", extracted: "", note: "" });
-      return;
-    }
-
-    const files = (record[fileFieldCode] && record[fileFieldCode].value) || [];
-    const estimateFiles = files.filter(f => f.name.indexOf(BILLING_RATE_CHECK_CONFIG.estimateFileNameKeyword) !== -1);
-
-    if (estimateFiles.length === 0) {
-      results.push({ recordId, displayName, itemName: "(全項目)", status: "見積り未添付", current: "", extracted: "", note: "" });
-      return;
-    }
-
-    let extractedItems;
-    try {
-      // 複数見積りが添付されている場合は先頭（最新想定）のみをチェック対象にする
-      const blob = fetchKintoneFile(subdomain, estimateFiles[0].fileKey, apiToken);
-      const extraction = extractEstimateItems(blob, estimateFiles[0].contentType, geminiApiKey);
-
-      if (!extraction.items || extraction.items.length === 0) {
-        results.push({ recordId, displayName, itemName: "(全項目)", status: "抽出失敗", current: "", extracted: "", note: extraction.note || "" });
-        return;
-      }
-      extractedItems = extraction.items;
-    } catch (e) {
-      console.error(`見積書の読み取り中にエラー（レコード#${recordId}）: ` + e.message);
-      results.push({ recordId, displayName, itemName: "(全項目)", status: "エラー", current: "", extracted: "", note: e.message });
-      return;
-    }
-
-    tableRows.forEach(row => {
-      const itemName = row.value[BILLING_RATE_CHECK_CONFIG.itemNameFieldCode]
-        ? row.value[BILLING_RATE_CHECK_CONFIG.itemNameFieldCode].value : "";
-      const currentTankaRaw = row.value[BILLING_RATE_CHECK_CONFIG.tankaFieldCode]
-        ? row.value[BILLING_RATE_CHECK_CONFIG.tankaFieldCode].value : "";
-
-      if (!itemName) return; // 商品名が空の行はスキップ
-
-      const matched = findMatchingEstimateItem(extractedItems, itemName);
-      if (!matched) {
-        results.push({ recordId, displayName, itemName, status: "見積りに対応項目なし", current: currentTankaRaw, extracted: "", note: "" });
-        return;
-      }
-
-      const currentTankaNum = parseAmount(currentTankaRaw);
-      if (currentTankaNum === null) {
-        results.push({ recordId, displayName, itemName, status: "請求単価未入力", current: currentTankaRaw, extracted: matched.unitPrice, note: "" });
-      } else if (currentTankaNum === matched.unitPrice) {
-        results.push({ recordId, displayName, itemName, status: "一致", current: currentTankaRaw, extracted: matched.unitPrice, note: "" });
-      } else {
-        results.push({ recordId, displayName, itemName, status: "不一致", current: currentTankaRaw, extracted: matched.unitPrice, note: "" });
-      }
+  outer:
+  while (true) {
+    const query = encodeURIComponent(`$id > ${lastId} order by $id asc limit ${KINTONE_PAGE_SIZE}`);
+    const url = `https://${subdomain}.cybozu.com/k/v1/records.json?app=${appId}&query=${query}`;
+    const response = UrlFetchApp.fetch(url, {
+      method: "get",
+      headers: { "X-Cybozu-API-Token": apiToken },
+      muteHttpExceptions: true
     });
+
+    if (response.getResponseCode() !== 200) {
+      const message = `kintone取得失敗 (HTTP ${response.getResponseCode()}): ${response.getContentText()}`;
+      console.error(message);
+      notifyByEmail("⚠️ 請求単価チェック：実行できませんでした", message);
+      removeContinuationTrigger();
+      return;
+    }
+
+    const records = JSON.parse(response.getContentText()).records || [];
+    if (records.length === 0) {
+      finished = true;
+      break;
+    }
+
+    for (let i = 0; i < records.length; i++) {
+      if (Date.now() - startTime > EXECUTION_TIME_BUDGET_MS) {
+        break outer; // 時間切れ。ここまでの進捗は保存済みなので、続きは次のトリガーで行う
+      }
+
+      const record = records[i];
+      const rows = buildResultRowsForRecord(record, fileFieldCode, subdomain, apiToken, geminiApiKey);
+
+      if (rows.length > 0) {
+        sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, 7).setValues(rows);
+        rows.forEach(r => { if (r[4] === "一致") okCount++; else attentionCount++; });
+      }
+
+      lastId = Number(record.$id.value);
+      props.setProperty(BILLING_RATE_CHECK_CONFIG.progressLastIdProp, String(lastId));
+      props.setProperty(BILLING_RATE_CHECK_CONFIG.progressOkCountProp, String(okCount));
+      props.setProperty(BILLING_RATE_CHECK_CONFIG.progressAttentionCountProp, String(attentionCount));
+    }
+
+    if (records.length < KINTONE_PAGE_SIZE) {
+      finished = true;
+      break;
+    }
+  }
+
+  if (finished) {
+    removeContinuationTrigger();
+    sendBillingRateCheckFinalReport(okCount, attentionCount);
+    props.deleteProperty(BILLING_RATE_CHECK_CONFIG.progressLastIdProp);
+    props.deleteProperty(BILLING_RATE_CHECK_CONFIG.progressOkCountProp);
+    props.deleteProperty(BILLING_RATE_CHECK_CONFIG.progressAttentionCountProp);
+  } else {
+    ensureContinuationTrigger();
+  }
+}
+
+/**
+ * 続行用トリガー（1分ごと）が無ければ作成する
+ */
+function ensureContinuationTrigger() {
+  const exists = ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === BILLING_RATE_CHECK_CONFIG.continuationHandlerName);
+  if (!exists) {
+    ScriptApp.newTrigger(BILLING_RATE_CHECK_CONFIG.continuationHandlerName)
+      .timeBased()
+      .everyMinutes(1)
+      .create();
+  }
+}
+
+/**
+ * 続行用トリガーを削除する
+ */
+function removeContinuationTrigger() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === BILLING_RATE_CHECK_CONFIG.continuationHandlerName) {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+}
+
+/**
+ * レコード1件分を処理し、スプレッドシートに書き込む行（商品ごと）の配列を返す
+ * （単価テーブルが無い/見積書が無い/読み取り失敗の場合も、状況が分かる1行を返す）
+ */
+function buildResultRowsForRecord(record, fileFieldCode, subdomain, apiToken, geminiApiKey) {
+  const now = Utilities.formatDate(new Date(), "Asia/Tokyo", "yyyy/MM/dd HH:mm:ss");
+  const recordId = record.$id.value;
+  const displayName = (record["屋号名"] && record["屋号名"].value) ||
+                       (record["契約店舗名称"] && record["契約店舗名称"].value) ||
+                       (record["会社名"] && record["会社名"].value) ||
+                       `レコード#${recordId}`;
+
+  const tableRows = (record[BILLING_RATE_CHECK_CONFIG.subtableFieldCode] &&
+                      record[BILLING_RATE_CHECK_CONFIG.subtableFieldCode].value) || [];
+
+  if (tableRows.length === 0) {
+    return [[now, recordId, displayName, "(全項目)", "単価テーブルなし", "", ""]];
+  }
+
+  const files = (record[fileFieldCode] && record[fileFieldCode].value) || [];
+  const estimateFiles = files.filter(f => f.name.indexOf(BILLING_RATE_CHECK_CONFIG.estimateFileNameKeyword) !== -1);
+
+  if (estimateFiles.length === 0) {
+    return [[now, recordId, displayName, "(全項目)", "見積り未添付", "", ""]];
+  }
+
+  let extractedItems;
+  try {
+    // 複数見積りが添付されている場合は先頭（最新想定）のみをチェック対象にする
+    const blob = fetchKintoneFile(subdomain, estimateFiles[0].fileKey, apiToken);
+    const extraction = extractEstimateItems(blob, estimateFiles[0].contentType, geminiApiKey);
+
+    if (!extraction.items || extraction.items.length === 0) {
+      return [[now, recordId, displayName, "(全項目)", "抽出失敗", "", ""]];
+    }
+    extractedItems = extraction.items;
+  } catch (e) {
+    console.error(`見積書の読み取り中にエラー（レコード#${recordId}）: ` + e.message);
+    return [[now, recordId, displayName, "(全項目)", "エラー", "", ""]];
+  }
+
+  const rows = [];
+  tableRows.forEach(row => {
+    const itemName = row.value[BILLING_RATE_CHECK_CONFIG.itemNameFieldCode]
+      ? row.value[BILLING_RATE_CHECK_CONFIG.itemNameFieldCode].value : "";
+    const currentTankaRaw = row.value[BILLING_RATE_CHECK_CONFIG.tankaFieldCode]
+      ? row.value[BILLING_RATE_CHECK_CONFIG.tankaFieldCode].value : "";
+
+    if (!itemName) return; // 商品名が空の行はスキップ
+
+    const matched = findMatchingEstimateItem(extractedItems, itemName);
+    if (!matched) {
+      rows.push([now, recordId, displayName, itemName, "見積りに対応項目なし", currentTankaRaw, ""]);
+      return;
+    }
+
+    const currentTankaNum = parseAmount(currentTankaRaw);
+    if (currentTankaNum === null) {
+      rows.push([now, recordId, displayName, itemName, "請求単価未入力", currentTankaRaw, matched.unitPrice]);
+    } else if (currentTankaNum === matched.unitPrice) {
+      rows.push([now, recordId, displayName, itemName, "一致", currentTankaRaw, matched.unitPrice]);
+    } else {
+      rows.push([now, recordId, displayName, itemName, "不一致", currentTankaRaw, matched.unitPrice]);
+    }
   });
 
-  saveBillingRateCheckResults(results);
-  sendBillingRateCheckReport(results);
+  return rows;
 }
 
 /**
@@ -143,38 +271,6 @@ function findMatchingEstimateItem(items, itemName) {
 
 function normalizeItemName(name) {
   return String(name || "").replace(/[\s　]/g, "").trim();
-}
-
-/**
- * kintoneアプリの全レコードをREST APIで取得する（$idベースでページング）
- */
-function fetchKintoneRecords(subdomain, appId, apiToken) {
-  let allRecords = [];
-  let lastId = 0;
-  const limit = 500;
-
-  while (true) {
-    const query = encodeURIComponent(`$id > ${lastId} order by $id asc limit ${limit}`);
-    const url = `https://${subdomain}.cybozu.com/k/v1/records.json?app=${appId}&query=${query}`;
-    const response = UrlFetchApp.fetch(url, {
-      method: "get",
-      headers: { "X-Cybozu-API-Token": apiToken },
-      muteHttpExceptions: true
-    });
-
-    if (response.getResponseCode() !== 200) {
-      throw new Error(`kintone取得失敗 (app=${appId}, HTTP ${response.getResponseCode()}): ${response.getContentText()}`);
-    }
-
-    const records = JSON.parse(response.getContentText()).records || [];
-    if (records.length === 0) break;
-
-    allRecords = allRecords.concat(records);
-    lastId = Number(records[records.length - 1].$id.value);
-    if (records.length < limit) break;
-  }
-
-  return allRecords;
 }
 
 /**
@@ -379,48 +475,15 @@ function getOrCreateSheet(spreadsheet, sheetName) {
 }
 
 /**
- * チェック結果をスプレッドシートへ保存する（毎回上書き。詳細確認用）
+ * 全件処理が完了した際に、件数のサマリーをメールで送る（詳細はスプレッドシート参照）
  */
-function saveBillingRateCheckResults(results) {
-  const spreadsheet = getOrCreateResultSpreadsheet();
-  const sheet = getOrCreateSheet(spreadsheet, BILLING_RATE_CHECK_CONFIG.resultSheetName);
-  sheet.clear();
+function sendBillingRateCheckFinalReport(okCount, attentionCount) {
+  const total = okCount + attentionCount;
+  const body = `対象 ${total}件中、一致 ${okCount}件・要確認 ${attentionCount}件でした。\n\n` +
+    "商品ごとの詳細（契約先・商品名・現在の請求単価・見積りから読み取った金額）はスプレッドシートをご確認ください:\n" +
+    getOrCreateResultSpreadsheet().getUrl();
 
-  const now = Utilities.formatDate(new Date(), "Asia/Tokyo", "yyyy/MM/dd HH:mm:ss");
-  const rows = [["チェック日時", "レコードID", "契約先", "商品名", "ステータス", "現在の請求単価", "見積りから読み取った金額"]];
-  results.forEach(r => {
-    rows.push([now, r.recordId, r.displayName, r.itemName, r.status, r.current, r.extracted]);
-  });
-  sheet.getRange(1, 1, rows.length, 7).setValues(rows);
-}
-
-/**
- * チェック結果のうち「一致」以外（要確認）の項目のみをメールで要約送信する
- */
-function sendBillingRateCheckReport(results) {
-  const needsAttention = results.filter(r => r.status !== "一致");
-  const okCount = results.length - needsAttention.length;
-  const MAX_LINES = 50;
-
-  let body = `対象 ${results.length}件中、一致 ${okCount}件・要確認 ${needsAttention.length}件でした。\n\n`;
-
-  if (needsAttention.length === 0) {
-    body += "すべて一致していました。特に対応は不要です。";
-  } else {
-    body += needsAttention.slice(0, MAX_LINES).map(r => {
-      let line = `【${r.status}】${r.displayName}／${r.itemName}（現在: ${r.current || "(空)"}`;
-      if (r.extracted !== "") line += ` / 見積り: ${r.extracted}`;
-      line += "）";
-      return line;
-    }).join("\n");
-
-    if (needsAttention.length > MAX_LINES) {
-      body += `\n…ほか${needsAttention.length - MAX_LINES}件`;
-    }
-    body += "\n\n詳細は結果スプレッドシートをご確認ください: " + getOrCreateResultSpreadsheet().getUrl();
-  }
-
-  notifyByEmail(`🤖 請求単価チェック結果（要確認 ${needsAttention.length}件）`, body);
+  notifyByEmail(`🤖 請求単価チェック完了（要確認 ${attentionCount}件）`, body);
 }
 
 /**
@@ -434,22 +497,4 @@ function notifyByEmail(subject, body) {
     return;
   }
   MailApp.sendEmail(to, subject, body);
-}
-
-/**
- * checkBillingRatesを1日1回（午前8時）自動実行するトリガーを設定する関数
- * 自動チェックを開始したいタイミングでGASエディタからこの関数を1回だけ手動実行してください
- */
-function setupBillingRateCheckTrigger() {
-  ScriptApp.getProjectTriggers().forEach(trigger => {
-    if (trigger.getHandlerFunction() === "checkBillingRates") {
-      ScriptApp.deleteTrigger(trigger);
-    }
-  });
-
-  ScriptApp.newTrigger("checkBillingRates")
-    .timeBased()
-    .atHour(8)
-    .everyDays(1)
-    .create();
 }
