@@ -469,3 +469,30 @@ function setupBillingRateCheckTrigger() {
     .everyDays(1)
     .create();
 }
+
+/**
+ * 調査用：指定したフィールドコードの詳細設定（サブテーブルの内部フィールドコードなど）をメールで確認する
+ * 設計を詰めるための一時的な関数。本番運用では使わない
+ */
+function debugKeiyakuFieldDetails() {
+  const props = PropertiesService.getScriptProperties();
+  const subdomain = props.getProperty("KINTONE_SUBDOMAIN");
+  const appId = props.getProperty(BILLING_RATE_CHECK_CONFIG.appIdProp);
+  const apiToken = props.getProperty(BILLING_RATE_CHECK_CONFIG.apiTokenProp);
+
+  const url = `https://${subdomain}.cybozu.com/k/v1/app/form/fields.json?app=${appId}`;
+  const response = UrlFetchApp.fetch(url, {
+    method: "get",
+    headers: { "X-Cybozu-API-Token": apiToken },
+    muteHttpExceptions: true
+  });
+  const properties = JSON.parse(response.getContentText()).properties || {};
+
+  const targets = ["契約書PDF", "単価テーブル"];
+  const detail = targets.map(code => {
+    return `--- ${code} ---\n` + JSON.stringify(properties[code], null, 2);
+  }).join("\n\n");
+
+  console.log(detail);
+  notifyByEmail("🔍 請求単価チェック：フィールド詳細", detail);
+}
