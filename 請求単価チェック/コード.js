@@ -176,9 +176,12 @@ function runBillingRateCheckBatch(isFreshStart) {
     }
   }
 
+    // 全件終わっていなくても、その時点までの結果で「要対応店舗一覧」を更新する
+    // （処理に時間がかかっても、途中経過をいつでも確認できるように）
+    buildStoreSummarySheet();
+
     if (finished) {
       removeContinuationTrigger();
-      buildStoreSummarySheet();
       sendBillingRateCheckFinalReport(okCount, attentionCount);
       props.deleteProperty(BILLING_RATE_CHECK_CONFIG.progressLastIdProp);
       props.deleteProperty(BILLING_RATE_CHECK_CONFIG.progressOkCountProp);
