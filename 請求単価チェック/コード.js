@@ -148,6 +148,7 @@ function runBillingRateCheckBatch(isFreshStart) {
     for (let i = 0; i < records.length; i++) {
       if (Date.now() - startTime > EXECUTION_TIME_BUDGET_MS) {
         console.log(`時間切れのため中断します（経過 ${Date.now() - startTime}ms、このページの${i}/${records.length}件目まで処理済み）`);
+        buildStoreSummarySheet(); // 時間切れで抜ける前に、ここまでの分で要対応店舗一覧を更新しておく
         break outer; // 時間切れ。ここまでの進捗は保存済みなので、続きは次のトリガーで行う
       }
 
@@ -175,15 +176,15 @@ function runBillingRateCheckBatch(isFreshStart) {
       console.log(`[${i + 1}/${records.length}] レコード#${record.$id.value} 処理完了（経過 ${Date.now() - startTime}ms）`);
     }
 
+    // 1ページ（最大100件）処理し終わるたびに要対応店舗一覧を更新する
+    // （全件終わるまで待たなくても、途中経過をいつでも確認できるように）
+    buildStoreSummarySheet();
+
     if (records.length < KINTONE_PAGE_SIZE) {
       finished = true;
       break;
     }
   }
-
-    // 全件終わっていなくても、その時点までの結果で「要対応店舗一覧」を更新する
-    // （処理に時間がかかっても、途中経過をいつでも確認できるように）
-    buildStoreSummarySheet();
 
     if (finished) {
       removeContinuationTrigger();
