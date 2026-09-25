@@ -36,6 +36,8 @@ const BILLING_RATE_CHECK_CONFIG = {
   tankaFieldCode: "請求単価",                         // サブテーブル内：請求単価の列
   costFieldCode: "仕入単価",                          // サブテーブル内：仕入単価の列（赤字チェック用）
   contractorFieldCode: "収集業者名称",                // レコード内：収集業者名のフィールドコード
+  contractTypeFieldCode: "契約種別",                  // レコード内：契約状況（契約中/解約済み/収集ストップ）のフィールドコード
+  targetContractTypes: ["契約中", "収集ストップ"],     // チェック対象とする契約種別（解約済みは対象外）
   estimateFileNameKeyword: "見積",                    // 添付ファイルのうち、これを名前に含むものを見積書とみなす
   resultSheetName: "請求単価チェック結果",
   summarySheetName: "要対応店舗一覧",
@@ -116,7 +118,10 @@ function runBillingRateCheckBatch(isFreshStart) {
 
     outer:
     while (true) {
-    const query = encodeURIComponent(`$id > ${lastId} order by $id asc limit ${KINTONE_PAGE_SIZE}`);
+    const contractTypeCondition = BILLING_RATE_CHECK_CONFIG.targetContractTypes.map(v => `"${v}"`).join(", ");
+    const query = encodeURIComponent(
+      `${BILLING_RATE_CHECK_CONFIG.contractTypeFieldCode} in (${contractTypeCondition}) and $id > ${lastId} order by $id asc limit ${KINTONE_PAGE_SIZE}`
+    );
     const url = `https://${subdomain}.cybozu.com/k/v1/records.json?app=${appId}&query=${query}`;
     console.log(`kintoneからレコード取得開始（$id > ${lastId}）...`);
     const response = UrlFetchApp.fetch(url, {
