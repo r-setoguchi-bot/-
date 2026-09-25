@@ -602,6 +602,10 @@ function getOrCreateSheet(spreadsheet, sheetName) {
  * 差額率(%)が大きい順・要対応の有無の順に並べ替えるので、上から順に見れば「明らかにおかしいもの」から確認できる。
  */
 function buildStoreSummarySheet() {
+  const props = PropertiesService.getScriptProperties();
+  const subdomain = props.getProperty("KINTONE_SUBDOMAIN");
+  const appId = props.getProperty(BILLING_RATE_CHECK_CONFIG.appIdProp);
+
   const spreadsheet = getOrCreateResultSpreadsheet();
   const detailSheet = getOrCreateSheet(spreadsheet, BILLING_RATE_CHECK_CONFIG.resultSheetName);
   const lastRow = detailSheet.getLastRow();
@@ -638,7 +642,7 @@ function buildStoreSummarySheet() {
   });
 
   const header = ["レコードID", "契約先", "収集業者名", "一致", "不一致", "請求単価未入力",
-    "見積りに対応項目なし", "見積り未添付", "単価テーブルなし", "抽出失敗", "エラー", "赤字件数", "未入力件数", "最大差額率(%)", "要対応", "要対応の理由"];
+    "見積りに対応項目なし", "見積り未添付", "単価テーブルなし", "抽出失敗", "エラー", "赤字件数", "未入力件数", "最大差額率(%)", "要対応", "要対応の理由", "契約管理を開く"];
 
   const bodyRows = Object.keys(summaryByRecord).map(recordId => {
     const e = summaryByRecord[recordId];
@@ -651,12 +655,15 @@ function buildStoreSummarySheet() {
     if (e.marginAlertCount > 0) reasons.push(`赤字${e.marginAlertCount}件`);
     if (e.blankAlertCount > 0) reasons.push(`未入力${e.blankAlertCount}件`);
 
+    const recordUrl = (subdomain && appId) ? `https://${subdomain}.cybozu.com/k/${appId}/show#record=${e.recordId}` : "";
+    const recordLink = recordUrl ? `=HYPERLINK("${recordUrl}", "開く")` : "";
+
     return [
       e.recordId, e.displayName, e.contractorName,
       e.counts["一致"], e.counts["不一致"], e.counts["請求単価未入力"], e.counts["見積りに対応項目なし"],
       e.counts["見積り未添付"], e.counts["単価テーブルなし"], e.counts["抽出失敗"], e.counts["エラー"],
       e.marginAlertCount, e.blankAlertCount, e.maxAbsDiffPercent, needsAttentionCount > 0 ? "要対応" : "",
-      reasons.join("、")
+      reasons.join("、"), recordLink
     ];
   });
 
