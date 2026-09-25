@@ -433,15 +433,15 @@ function callGeminiForItems(parts, apiKey) {
     "muteHttpExceptions": true
   };
 
-  const MAX_ATTEMPTS = 3;
+  const MAX_ATTEMPTS = 4;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
       const response = UrlFetchApp.fetch(url, options);
       const code = response.getResponseCode();
       const bodyText = response.getContentText();
 
-      // レート制限（429）は少し待ってから再試行する
-      if (code === 429 && attempt < MAX_ATTEMPTS) {
+      // レート制限（429）やGemini側の一時的な障害（500番台）は少し待ってから再試行する
+      if ((code === 429 || code >= 500) && attempt < MAX_ATTEMPTS) {
         Utilities.sleep(2000 * attempt);
         continue;
       }
