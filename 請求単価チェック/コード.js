@@ -54,57 +54,67 @@ const KINTONE_PAGE_SIZE = 100; // 1回のkintone取得件数
  * 終わらなければ1分ごとに自動で続きが実行されるようにする
  */
 function checkBillingRates() {
-  const props = PropertiesService.getScriptProperties();
-  props.deleteProperty(BILLING_RATE_CHECK_CONFIG.progressLastIdProp);
-  props.setProperty(BILLING_RATE_CHECK_CONFIG.progressOkCountProp, "0");
-  props.setProperty(BILLING_RATE_CHECK_CONFIG.progressAttentionCountProp, "0");
-
-  const spreadsheet = getOrCreateResultSpreadsheet();
-  const sheet = getOrCreateSheet(spreadsheet, BILLING_RATE_CHECK_CONFIG.resultSheetName);
-  sheet.clear();
-  sheet.appendRow(["チェック日時", "レコードID", "契約先", "収集業者名", "商品名", "ステータス", "現在の請求単価", "見積りから読み取った金額", "差額", "差額率(%)", "備考"]);
-
   removeContinuationTrigger();
-  runBillingRateCheckBatch();
+  runBillingRateCheckBatch(true);
 }
 
 /**
  * 1分ごとのトリガーから呼ばれ、続きのバッチを実行する関数（手動実行はしない）
  */
 function continueBillingRateCheck() {
-  runBillingRateCheckBatch();
+  runBillingRateCheckBatch(false);
 }
 
 /**
  * 実際の1バッチ分の処理。時間切れになったら進捗を保存して抜け、まだ終わっていなければ
  * 続行用トリガーを仕込む。全件終わったらトリガーを消して完了メールを送る
+ *
+ * 手動実行と1分ごとの自動継続が同時に走ってシートを取り合う（行の上書き・重複）事故を防ぐため、
+ * スクリプトロックを取得できた場合のみ処理する。ロックが取れない場合は「他の処理が実行中」として
+ * 何もせず終了する（自動継続なら次の1分後にまた試みられる）
  */
-function runBillingRateCheckBatch() {
-  const startTime = Date.now();
-  const props = PropertiesService.getScriptProperties();
-  const subdomain = props.getProperty("KINTONE_SUBDOMAIN");
-  const appId = props.getProperty(BILLING_RATE_CHECK_CONFIG.appIdProp);
-  const apiToken = props.getProperty(BILLING_RATE_CHECK_CONFIG.apiTokenProp);
-  const geminiApiKey = props.getProperty("GEMINI_API_KEY");
-  const fileFieldCode = props.getProperty(BILLING_RATE_CHECK_CONFIG.fileFieldProp) || BILLING_RATE_CHECK_CONFIG.defaultFileFieldCode;
-
-  if (!subdomain || !appId || !apiToken || !geminiApiKey) {
-    const message = "請求単価チェックに必要なスクリプトプロパティが不足しています（KINTONE_SUBDOMAIN / " +
-      BILLING_RATE_CHECK_CONFIG.appIdProp + " / " + BILLING_RATE_CHECK_CONFIG.apiTokenProp + " / GEMINI_API_KEY）。";
-    console.error(message);
-    notifyByEmail("⚠️ 請求単価チェック：設定エラー", message);
-    removeContinuationTrigger();
+function runBillingRateCheckBatch(isFreshStart) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) {
+    console.error("他の請求単価チェックの処理が実行中のため、今回はスキップしました。手動実行の場合は、実行中の処理が終わってからもう一度お試しください。");
     return;
   }
 
-  const sheet = getOrCreateSheet(getOrCreateResultSpreadsheet(), BILLING_RATE_CHECK_CONFIG.resultSheetName);
-  let lastId = Number(props.getProperty(BILLING_RATE_CHECK_CONFIG.progressLastIdProp) || "0");
-  let okCount = Number(props.getProperty(BILLING_RATE_CHECK_CONFIG.progressOkCountProp) || "0");
-  let attentionCount = Number(props.getProperty(BILLING_RATE_CHECK_CONFIG.progressAttentionCountProp) || "0");
-  let finished = false;
+  try {
+    const startTime = Date.now();
+    const props = PropertiesService.getScriptProperties();
+    const subdomain = props.getProperty("KINTONE_SUBDOMAIN");
+    const appId = props.getProperty(BILLING_RATE_CHECK_CONFIG.appIdProp);
+    const apiToken = props.getProperty(BILLING_RATE_CHECK_CONFIG.apiTokenProp);
+    const geminiApiKey = props.getProperty("GEMINI_API_KEY");
+    const fileFieldCode = props.getProperty(BILLING_RATE_CHECK_CONFIG.fileFieldProp) || BILLING_RATE_CHECK_CONFIG.defaultFileFieldCode;
 
-  outer:
-  while (true) {
+    if (!subdomain || !appId || !apiToken || !geminiApiKey) {
+      const message = "請求単価チェックに必要なスクリプトプロパティが不足しています（KINTONE_SUBDOMAIN / " +
+        BILLING_RATE_CHECK_CONFIG.appIdProp + " / " + BILLING_RATE_CHECK_CONFIG.apiTokenProp + " / GEMINI_API_KEY）。";
+      console.error(message);
+      notifyByEmail("⚠️ 請求単価チェック：設定エラー", message);
+      removeContinuationTrigger();
+      return;
+    }
+
+    const sheet = getOrCreateSheet(getOrCreateResultSpreadsheet(), BILLING_RATE_CHECK_CONFIG.resultSheetName);
+
+    if (isFreshStart) {
+      props.deleteProperty(BILLING_RATE_CHECK_CONFIG.progressLastIdProp);
+      props.setProperty(BILLING_RATE_CHECK_CONFIG.progressOkCountProp, "0");
+      props.setProperty(BILLING_RATE_CHECK_CONFIG.progressAttentionCountProp, "0");
+      sheet.clear();
+      sheet.appendRow(["チェック日時", "レコードID", "契約先", "収集業者名", "商品名", "ステータス", "現在の請求単価", "見積りから読み取った金額", "差額", "差額率(%)", "備考"]);
+    }
+
+    let lastId = Number(props.getProperty(BILLING_RATE_CHECK_CONFIG.progressLastIdProp) || "0");
+    let okCount = Number(props.getProperty(BILLING_RATE_CHECK_CONFIG.progressOkCountProp) || "0");
+    let attentionCount = Number(props.getProperty(BILLING_RATE_CHECK_CONFIG.progressAttentionCountProp) || "0");
+    let finished = false;
+
+    outer:
+    while (true) {
     const query = encodeURIComponent(`$id > ${lastId} order by $id asc limit ${KINTONE_PAGE_SIZE}`);
     const url = `https://${subdomain}.cybozu.com/k/v1/records.json?app=${appId}&query=${query}`;
     console.log(`kintoneからレコード取得開始（$id > ${lastId}）...`);
@@ -165,15 +175,18 @@ function runBillingRateCheckBatch() {
     }
   }
 
-  if (finished) {
-    removeContinuationTrigger();
-    buildStoreSummarySheet();
-    sendBillingRateCheckFinalReport(okCount, attentionCount);
-    props.deleteProperty(BILLING_RATE_CHECK_CONFIG.progressLastIdProp);
-    props.deleteProperty(BILLING_RATE_CHECK_CONFIG.progressOkCountProp);
-    props.deleteProperty(BILLING_RATE_CHECK_CONFIG.progressAttentionCountProp);
-  } else {
-    ensureContinuationTrigger();
+    if (finished) {
+      removeContinuationTrigger();
+      buildStoreSummarySheet();
+      sendBillingRateCheckFinalReport(okCount, attentionCount);
+      props.deleteProperty(BILLING_RATE_CHECK_CONFIG.progressLastIdProp);
+      props.deleteProperty(BILLING_RATE_CHECK_CONFIG.progressOkCountProp);
+      props.deleteProperty(BILLING_RATE_CHECK_CONFIG.progressAttentionCountProp);
+    } else {
+      ensureContinuationTrigger();
+    }
+  } finally {
+    lock.releaseLock();
   }
 }
 
