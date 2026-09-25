@@ -106,7 +106,7 @@ function runBillingRateCheckBatch(isFreshStart) {
       props.setProperty(BILLING_RATE_CHECK_CONFIG.progressOkCountProp, "0");
       props.setProperty(BILLING_RATE_CHECK_CONFIG.progressAttentionCountProp, "0");
       sheet.clear();
-      sheet.appendRow(["チェック日時", "レコードID", "契約先", "収集業者名", "商品名", "ステータス", "現在の請求単価", "見積りから読み取った金額", "差額", "差額率(%)", "備考", "赤字チェック"]);
+      sheet.appendRow(["チェック日時", "レコードID", "契約先", "収集業者名", "商品名", "ステータス", "現在の請求単価", "見積りから読み取った金額", "差額", "差額率(%)", "備考", "赤字チェック", "未入力チェック"]);
     }
 
     let lastId = Number(props.getProperty(BILLING_RATE_CHECK_CONFIG.progressLastIdProp) || "0");
@@ -154,11 +154,11 @@ function runBillingRateCheckBatch(isFreshStart) {
         rows = buildResultRowsForRecord(record, fileFieldCode, subdomain, apiToken, geminiApiKey);
       } catch (e) {
         console.error(`レコード#${record.$id.value}の処理中に想定外のエラー: ${e.message}`);
-        rows = [[Utilities.formatDate(new Date(), "Asia/Tokyo", "yyyy/MM/dd HH:mm:ss"), record.$id.value, "", "", "(全項目)", "エラー", "", "", "", "", e.message, ""]];
+        rows = [[Utilities.formatDate(new Date(), "Asia/Tokyo", "yyyy/MM/dd HH:mm:ss"), record.$id.value, "", "", "(全項目)", "エラー", "", "", "", "", e.message, "", ""]];
       }
 
       if (rows.length > 0) {
-        sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, 12).setValues(rows);
+        sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, 13).setValues(rows);
         SpreadsheetApp.flush();
         rows.forEach(r => { if (r[5] === "一致") okCount++; else attentionCount++; });
       }
@@ -236,7 +236,7 @@ function buildResultRowsForRecord(record, fileFieldCode, subdomain, apiToken, ge
                       record[BILLING_RATE_CHECK_CONFIG.subtableFieldCode].value) || [];
 
   if (tableRows.length === 0) {
-    return [[now, recordId, displayName, contractorName, "(全項目)", "単価テーブルなし", "", "", "", "", "", ""]];
+    return [[now, recordId, displayName, contractorName, "(全項目)", "単価テーブルなし", "", "", "", "", "", "", ""]];
   }
 
   const files = (record[fileFieldCode] && record[fileFieldCode].value) || [];
@@ -295,6 +295,8 @@ function buildResultRowsForRecord(record, fileFieldCode, subdomain, apiToken, ge
     const marginAlert = (currentTankaNum !== null && costNum !== null && currentTankaNum < costNum)
       ? `赤字（仕入${costNum}円 > 請求${currentTankaNum}円）`
       : "";
+    // 見積りの有無に関わらず、請求単価が空欄の場合は常に指摘する
+    const blankAlert = (currentTankaNum === null) ? "未入力" : "";
 
     let status;
     let extractedAmount = "";
@@ -322,12 +324,12 @@ function buildResultRowsForRecord(record, fileFieldCode, subdomain, apiToken, ge
       status = "見積り未添付";
     }
 
-    rows.push([now, recordId, displayName, contractorName, itemName, status, currentTankaRaw, extractedAmount, diff, diffPercent, note, marginAlert]);
+    rows.push([now, recordId, displayName, contractorName, itemName, status, currentTankaRaw, extractedAmount, diff, diffPercent, note, marginAlert, blankAlert]);
   });
 
   if (rows.length === 0) {
     // 単価テーブルはあるが、商品名がすべて空だった場合など
-    return [[now, recordId, displayName, contractorName, "(全項目)", extractionFailureStatus || "見積り未添付", "", "", "", "", extractionNote, ""]];
+    return [[now, recordId, displayName, contractorName, "(全項目)", extractionFailureStatus || "見積り未添付", "", "", "", "", extractionNote, "", ""]];
   }
 
   return rows;
@@ -599,7 +601,7 @@ function buildStoreSummarySheet() {
   const lastRow = detailSheet.getLastRow();
   if (lastRow < 2) return; // 見出しのみ（データなし）
 
-  const data = detailSheet.getRange(2, 1, lastRow - 1, 12).getValues();
+  const data = detailSheet.getRange(2, 1, lastRow - 1, 13).getValues();
   const STATUS_LIST = ["一致", "不一致", "請求単価未入力", "見積りに対応項目なし", "見積り未添付", "単価テーブルなし", "抽出失敗", "エラー"];
   const NEEDS_ATTENTION_STATUSES = ["不一致", "請求単価未入力", "見積りに対応項目なし", "単価テーブルなし", "抽出失敗", "エラー"];
 
@@ -612,11 +614,12 @@ function buildStoreSummarySheet() {
     const status = r[5];
     const diffPercent = r[9];
     const marginAlert = r[11];
+    const blankAlert = r[12];
 
     if (!summaryByRecord[recordId]) {
       const counts = {};
       STATUS_LIST.forEach(s => counts[s] = 0);
-      summaryByRecord[recordId] = { recordId, displayName, contractorName, counts, maxAbsDiffPercent: 0, marginAlertCount: 0 };
+      summaryByRecord[recordId] = { recordId, displayName, contractorName, counts, maxAbsDiffPercent: 0, marginAlertCount: 0, blankAlertCount: 0 };
     }
 
     const entry = summaryByRecord[recordId];
@@ -625,28 +628,30 @@ function buildStoreSummarySheet() {
       entry.maxAbsDiffPercent = Math.abs(diffPercent);
     }
     if (marginAlert) entry.marginAlertCount++;
+    if (blankAlert) entry.blankAlertCount++;
   });
 
   const header = ["レコードID", "契約先", "収集業者名", "一致", "不一致", "請求単価未入力",
-    "見積りに対応項目なし", "見積り未添付", "単価テーブルなし", "抽出失敗", "エラー", "赤字件数", "最大差額率(%)", "要対応"];
+    "見積りに対応項目なし", "見積り未添付", "単価テーブルなし", "抽出失敗", "エラー", "赤字件数", "未入力件数", "最大差額率(%)", "要対応"];
 
   const bodyRows = Object.keys(summaryByRecord).map(recordId => {
     const e = summaryByRecord[recordId];
-    const needsAttentionCount = NEEDS_ATTENTION_STATUSES.reduce((sum, s) => sum + e.counts[s], 0) + e.marginAlertCount;
+    const needsAttentionCount = NEEDS_ATTENTION_STATUSES.reduce((sum, s) => sum + e.counts[s], 0) + e.marginAlertCount + e.blankAlertCount;
     return [
       e.recordId, e.displayName, e.contractorName,
       e.counts["一致"], e.counts["不一致"], e.counts["請求単価未入力"], e.counts["見積りに対応項目なし"],
       e.counts["見積り未添付"], e.counts["単価テーブルなし"], e.counts["抽出失敗"], e.counts["エラー"],
-      e.marginAlertCount, e.maxAbsDiffPercent, needsAttentionCount > 0 ? "要対応" : ""
+      e.marginAlertCount, e.blankAlertCount, e.maxAbsDiffPercent, needsAttentionCount > 0 ? "要対応" : ""
     ];
   });
 
   bodyRows.sort((a, b) => {
-    const aNeeds = a[13] === "要対応" ? 1 : 0;
-    const bNeeds = b[13] === "要対応" ? 1 : 0;
+    const aNeeds = a[14] === "要対応" ? 1 : 0;
+    const bNeeds = b[14] === "要対応" ? 1 : 0;
     if (aNeeds !== bNeeds) return bNeeds - aNeeds; // 要対応のものを先に
     if (a[11] !== b[11]) return (b[11] || 0) - (a[11] || 0); // 赤字件数が多い順
-    return (b[12] || 0) - (a[12] || 0); // 最大差額率(%)が大きい順
+    if (a[12] !== b[12]) return (b[12] || 0) - (a[12] || 0); // 未入力件数が多い順
+    return (b[13] || 0) - (a[13] || 0); // 最大差額率(%)が大きい順
   });
 
   const summarySheet = getOrCreateSheet(spreadsheet, BILLING_RATE_CHECK_CONFIG.summarySheetName);
