@@ -62,7 +62,7 @@ function checkBillingRates() {
   const spreadsheet = getOrCreateResultSpreadsheet();
   const sheet = getOrCreateSheet(spreadsheet, BILLING_RATE_CHECK_CONFIG.resultSheetName);
   sheet.clear();
-  sheet.appendRow(["チェック日時", "レコードID", "契約先", "収集業者名", "商品名", "ステータス", "現在の請求単価", "見積りから読み取った金額", "差額", "差額率(%)"]);
+  sheet.appendRow(["チェック日時", "レコードID", "契約先", "収集業者名", "商品名", "ステータス", "現在の請求単価", "見積りから読み取った金額", "差額", "差額率(%)", "備考"]);
 
   removeContinuationTrigger();
   runBillingRateCheckBatch();
@@ -136,7 +136,7 @@ function runBillingRateCheckBatch() {
       const rows = buildResultRowsForRecord(record, fileFieldCode, subdomain, apiToken, geminiApiKey);
 
       if (rows.length > 0) {
-        sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, 10).setValues(rows);
+        sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, 11).setValues(rows);
         rows.forEach(r => { if (r[5] === "一致") okCount++; else attentionCount++; });
       }
 
@@ -206,29 +206,31 @@ function buildResultRowsForRecord(record, fileFieldCode, subdomain, apiToken, ge
                       record[BILLING_RATE_CHECK_CONFIG.subtableFieldCode].value) || [];
 
   if (tableRows.length === 0) {
-    return [[now, recordId, displayName, contractorName, "(全項目)", "単価テーブルなし", "", "", "", ""]];
+    return [[now, recordId, displayName, contractorName, "(全項目)", "単価テーブルなし", "", "", "", "", ""]];
   }
 
   const files = (record[fileFieldCode] && record[fileFieldCode].value) || [];
   const estimateFiles = files.filter(f => f.name.indexOf(BILLING_RATE_CHECK_CONFIG.estimateFileNameKeyword) !== -1);
 
   if (estimateFiles.length === 0) {
-    return [[now, recordId, displayName, contractorName, "(全項目)", "見積り未添付", "", "", "", ""]];
+    return [[now, recordId, displayName, contractorName, "(全項目)", "見積り未添付", "", "", "", "", ""]];
   }
 
   let extractedItems;
   try {
     // 複数見積りが添付されている場合は先頭（最新想定）のみをチェック対象にする
+    // Gemini APIのレート制限に引っかかりにくくするため、呼び出し前に少し間隔を空ける
+    Utilities.sleep(300);
     const blob = fetchKintoneFile(subdomain, estimateFiles[0].fileKey, apiToken);
     const extraction = extractEstimateItems(blob, estimateFiles[0].contentType, geminiApiKey);
 
     if (!extraction.items || extraction.items.length === 0) {
-      return [[now, recordId, displayName, contractorName, "(全項目)", "抽出失敗", "", "", "", ""]];
+      return [[now, recordId, displayName, contractorName, "(全項目)", "抽出失敗", "", "", "", "", extraction.note || ""]];
     }
     extractedItems = extraction.items;
   } catch (e) {
     console.error(`見積書の読み取り中にエラー（レコード#${recordId}）: ` + e.message);
-    return [[now, recordId, displayName, contractorName, "(全項目)", "エラー", "", "", "", ""]];
+    return [[now, recordId, displayName, contractorName, "(全項目)", "エラー", "", "", "", "", e.message]];
   }
 
   const rows = [];
@@ -242,7 +244,7 @@ function buildResultRowsForRecord(record, fileFieldCode, subdomain, apiToken, ge
 
     const matched = findMatchingEstimateItem(extractedItems, itemName);
     if (!matched) {
-      rows.push([now, recordId, displayName, contractorName, itemName, "見積りに対応項目なし", currentTankaRaw, "", "", ""]);
+      rows.push([now, recordId, displayName, contractorName, itemName, "見積りに対応項目なし", currentTankaRaw, "", "", "", ""]);
       return;
     }
 
@@ -250,11 +252,11 @@ function buildResultRowsForRecord(record, fileFieldCode, subdomain, apiToken, ge
     const diffInfo = calcDiff(currentTankaNum, matched.unitPrice);
 
     if (currentTankaNum === null) {
-      rows.push([now, recordId, displayName, contractorName, itemName, "請求単価未入力", currentTankaRaw, matched.unitPrice, diffInfo.diff, diffInfo.diffPercent]);
+      rows.push([now, recordId, displayName, contractorName, itemName, "請求単価未入力", currentTankaRaw, matched.unitPrice, diffInfo.diff, diffInfo.diffPercent, ""]);
     } else if (currentTankaNum === matched.unitPrice) {
-      rows.push([now, recordId, displayName, contractorName, itemName, "一致", currentTankaRaw, matched.unitPrice, 0, 0]);
+      rows.push([now, recordId, displayName, contractorName, itemName, "一致", currentTankaRaw, matched.unitPrice, 0, 0, ""]);
     } else {
-      rows.push([now, recordId, displayName, contractorName, itemName, "不一致", currentTankaRaw, matched.unitPrice, diffInfo.diff, diffInfo.diffPercent]);
+      rows.push([now, recordId, displayName, contractorName, itemName, "不一致", currentTankaRaw, matched.unitPrice, diffInfo.diff, diffInfo.diffPercent, ""]);
     }
   });
 
@@ -354,23 +356,45 @@ function callGeminiForItems(parts, apiKey) {
     "muteHttpExceptions": true
   };
 
-  try {
-    const response = UrlFetchApp.fetch(url, options);
-    const json = JSON.parse(response.getContentText());
-    const text = json.candidates && json.candidates[0].content.parts[0].text;
-    if (!text) return { items: [], note: "AIから内容を読み取れませんでした。" };
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const response = UrlFetchApp.fetch(url, options);
+      const code = response.getResponseCode();
+      const bodyText = response.getContentText();
 
-    const cleanJsonStr = text.replace(/```json/g, "").replace(/```/g, "").trim();
-    const parsed = JSON.parse(cleanJsonStr);
-    const items = Array.isArray(parsed.items) ? parsed.items
-      .map(it => ({ itemName: String(it.itemName || ""), unitPrice: Number(it.unitPrice) }))
-      .filter(it => it.itemName && !isNaN(it.unitPrice)) : [];
+      // レート制限（429）は少し待ってから再試行する
+      if (code === 429 && attempt < MAX_ATTEMPTS) {
+        Utilities.sleep(2000 * attempt);
+        continue;
+      }
 
-    return { items, note: parsed.note || "" };
-  } catch (e) {
-    console.error("見積り品目抽出のGemini呼び出しでエラー: " + e.message);
-    return { items: [], note: "AI呼び出し中にエラーが発生しました。" };
+      if (code !== 200) {
+        console.error(`Gemini API呼び出し失敗 (HTTP ${code}): ` + bodyText);
+        return { items: [], note: `AI呼び出し失敗 (HTTP ${code}): ` + bodyText.substring(0, 200) };
+      }
+
+      const json = JSON.parse(bodyText);
+      const text = json.candidates && json.candidates[0].content.parts[0].text;
+      if (!text) {
+        console.error("Geminiの応答に想定した内容が含まれていませんでした: " + bodyText);
+        return { items: [], note: "AIから内容を読み取れませんでした（想定外の応答形式）。" };
+      }
+
+      const cleanJsonStr = text.replace(/```json/g, "").replace(/```/g, "").trim();
+      const parsed = JSON.parse(cleanJsonStr);
+      const items = Array.isArray(parsed.items) ? parsed.items
+        .map(it => ({ itemName: String(it.itemName || ""), unitPrice: Number(it.unitPrice) }))
+        .filter(it => it.itemName && !isNaN(it.unitPrice)) : [];
+
+      return { items, note: parsed.note || "" };
+    } catch (e) {
+      console.error("見積り品目抽出のGemini呼び出しでエラー: " + e.message);
+      if (attempt >= MAX_ATTEMPTS) return { items: [], note: "AI呼び出し中にエラーが発生しました: " + e.message };
+      Utilities.sleep(1000 * attempt);
+    }
   }
+  return { items: [], note: "AI呼び出しがリトライ上限に達しました。" };
 }
 
 /**
@@ -505,7 +529,7 @@ function buildStoreSummarySheet() {
   const lastRow = detailSheet.getLastRow();
   if (lastRow < 2) return; // 見出しのみ（データなし）
 
-  const data = detailSheet.getRange(2, 1, lastRow - 1, 10).getValues();
+  const data = detailSheet.getRange(2, 1, lastRow - 1, 11).getValues();
   const STATUS_LIST = ["一致", "不一致", "請求単価未入力", "見積りに対応項目なし", "見積り未添付", "単価テーブルなし", "抽出失敗", "エラー"];
   const NEEDS_ATTENTION_STATUSES = ["不一致", "請求単価未入力", "見積りに対応項目なし", "単価テーブルなし", "抽出失敗", "エラー"];
 
