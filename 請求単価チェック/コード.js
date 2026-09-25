@@ -107,6 +107,7 @@ function runBillingRateCheckBatch() {
   while (true) {
     const query = encodeURIComponent(`$id > ${lastId} order by $id asc limit ${KINTONE_PAGE_SIZE}`);
     const url = `https://${subdomain}.cybozu.com/k/v1/records.json?app=${appId}&query=${query}`;
+    console.log(`kintoneからレコード取得開始（$id > ${lastId}）...`);
     const response = UrlFetchApp.fetch(url, {
       method: "get",
       headers: { "X-Cybozu-API-Token": apiToken },
@@ -122,6 +123,7 @@ function runBillingRateCheckBatch() {
     }
 
     const records = JSON.parse(response.getContentText()).records || [];
+    console.log(`${records.length}件のレコードを取得しました（経過 ${Date.now() - startTime}ms）`);
     if (records.length === 0) {
       finished = true;
       break;
@@ -129,14 +131,24 @@ function runBillingRateCheckBatch() {
 
     for (let i = 0; i < records.length; i++) {
       if (Date.now() - startTime > EXECUTION_TIME_BUDGET_MS) {
+        console.log(`時間切れのため中断します（経過 ${Date.now() - startTime}ms、このページの${i}/${records.length}件目まで処理済み）`);
         break outer; // 時間切れ。ここまでの進捗は保存済みなので、続きは次のトリガーで行う
       }
 
       const record = records[i];
-      const rows = buildResultRowsForRecord(record, fileFieldCode, subdomain, apiToken, geminiApiKey);
+      console.log(`[${i + 1}/${records.length}] レコード#${record.$id.value} 処理開始（経過 ${Date.now() - startTime}ms）`);
+
+      let rows;
+      try {
+        rows = buildResultRowsForRecord(record, fileFieldCode, subdomain, apiToken, geminiApiKey);
+      } catch (e) {
+        console.error(`レコード#${record.$id.value}の処理中に想定外のエラー: ${e.message}`);
+        rows = [[Utilities.formatDate(new Date(), "Asia/Tokyo", "yyyy/MM/dd HH:mm:ss"), record.$id.value, "", "", "(全項目)", "エラー", "", "", "", "", e.message]];
+      }
 
       if (rows.length > 0) {
         sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, 11).setValues(rows);
+        SpreadsheetApp.flush();
         rows.forEach(r => { if (r[5] === "一致") okCount++; else attentionCount++; });
       }
 
@@ -144,6 +156,7 @@ function runBillingRateCheckBatch() {
       props.setProperty(BILLING_RATE_CHECK_CONFIG.progressLastIdProp, String(lastId));
       props.setProperty(BILLING_RATE_CHECK_CONFIG.progressOkCountProp, String(okCount));
       props.setProperty(BILLING_RATE_CHECK_CONFIG.progressAttentionCountProp, String(attentionCount));
+      console.log(`[${i + 1}/${records.length}] レコード#${record.$id.value} 処理完了（経過 ${Date.now() - startTime}ms）`);
     }
 
     if (records.length < KINTONE_PAGE_SIZE) {
@@ -214,6 +227,14 @@ function buildResultRowsForRecord(record, fileFieldCode, subdomain, apiToken, ge
 
   if (estimateFiles.length === 0) {
     return [[now, recordId, displayName, contractorName, "(全項目)", "見積り未添付", "", "", "", "", ""]];
+  }
+
+  const targetFile = estimateFiles[0];
+  const fileSizeBytes = Number(targetFile.size) || 0;
+  const MAX_FILE_SIZE_BYTES = 15 * 1024 * 1024; // 15MB。大きすぎるファイルはAI呼び出しが極端に遅くなる/失敗するため除外
+  if (fileSizeBytes > MAX_FILE_SIZE_BYTES) {
+    console.error(`見積りファイルのサイズが大きすぎるためスキップ（レコード#${recordId}、${Math.round(fileSizeBytes / 1024 / 1024)}MB）`);
+    return [[now, recordId, displayName, contractorName, "(全項目)", "抽出失敗", "", "", "", "", `見積りファイルのサイズが大きすぎます（${Math.round(fileSizeBytes / 1024 / 1024)}MB）。手動で確認してください。`]];
   }
 
   let extractedItems;
