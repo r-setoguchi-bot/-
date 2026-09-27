@@ -287,9 +287,11 @@ function buildResultRowsForRecord(record, fileFieldCode, subdomain, apiToken, ge
 
   const rows = [];
   tableRows.forEach(row => {
-    const itemName = row.value[BILLING_RATE_CHECK_CONFIG.itemNameFieldCode]
+    const itemNameRaw = row.value[BILLING_RATE_CHECK_CONFIG.itemNameFieldCode]
       ? row.value[BILLING_RATE_CHECK_CONFIG.itemNameFieldCode].value : "";
-    if (!itemName) return; // 商品名が空の行はスキップ
+    // 商品名が空欄でも、請求単価・仕入単価のチェックは行う（商品名が無いからといって
+    // 中身を見ずにスキップすると、請求単価が未入力のまま見逃されてしまうため）
+    const itemName = itemNameRaw || "(商品名未設定)";
 
     const currentTankaRaw = row.value[BILLING_RATE_CHECK_CONFIG.tankaFieldCode]
       ? row.value[BILLING_RATE_CHECK_CONFIG.tankaFieldCode].value : "";
