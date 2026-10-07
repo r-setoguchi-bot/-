@@ -28,6 +28,10 @@ const FORM_DATE_COL_START = 3;
 const FORM_DATE_COL_END = 10;
 
 const FORM_TITLE = '【株式会社クリメン】2026年～2027年 年末年始廃棄物回収に関するアンケート';
+const FORM_PERIOD_TEXT = '2026年12月28日(月)から2027年1月4日(月)';
+
+const FORM_CHOICE_WANT = '特別回収期間の回収を希望する（有料）';
+const FORM_CHOICE_NOT_WANT = 'すべての日程において回収を希望しない';
 
 const FORM_DEFAULT_FEE = "7,000円";
 const FORM_VENDOR_FEES = {
@@ -162,17 +166,18 @@ function createFormForStores(stores, headers) {
 
   const form = FormApp.create(FORM_TITLE);
 
-  form.setDescription(`【対象店舗】
+  try {
+    form.setDescription(`【対象店舗】
 ${storeNamesText}
 
-特別回収期間：2025年12月28日(日)から2026年1月4日(日)
+特別回収期間：${FORM_PERIOD_TEXT}
 ※1月1日は回収不可
 
 ★特別回収料金：店舗ごとに異なります。各店舗の設問をご確認ください。
 ★回収対象：可燃ごみのみ
 
 ◆ 特別回収期間の回収を希望 される場合（※）は
-「特別回収期間の回収を希望する（有料）」を選択し
+「${FORM_CHOICE_WANT}」を選択し
 次の画面にて希望日にチェックをしてください 。
  ※通常、伺っております可燃回収曜日に準じます。予めご了承ください。
  ※通常回収日以外にチェックをされましても回収は出来かねますので、予めご留意ください。
@@ -180,30 +185,52 @@ ${storeNamesText}
 ◆希望日とは回収に伺う日付です。
  （例：12月29日営業分のゴミは、12月30日が回収日となります。）
 
-◆特別回収期間の回収を希望されない場合「すべての日程において回収を希望しない」を選択してください。`);
+◆特別回収期間の回収を希望されない場合「${FORM_CHOICE_NOT_WANT}」を選択してください。`);
 
-  stores.forEach(store => {
-    const fee = FORM_VENDOR_FEES[store.vendor] || FORM_DEFAULT_FEE;
+    // 1ページ目：希望の有無。「希望しない」はそのまま送信、「希望する」は次ページの希望日選択へ進む
+    const wantItem = form.addMultipleChoiceItem()
+        .setTitle('特別回収期間の回収について')
+        .setRequired(true);
 
-    form.addSectionHeaderItem()
-        .setTitle(`【${store.storeName}】の収集希望について`)
-        .setHelpText(`特別回収料金：${fee}/1日`);
+    const datePage = form.addPageBreakItem().setTitle('希望日の選択');
 
-    for (let col = FORM_DATE_COL_START; col <= FORM_DATE_COL_END; col++) {
-      if (store.rowData[col] === "○") {
-        form.addMultipleChoiceItem()
-            .setTitle(`【${store.storeName}】${headers[col]}の収集を希望しますか？`)
-            .setChoiceValues(['希望する', '希望しない'])
-            .setRequired(true);
+    wantItem.setChoices([
+      wantItem.createChoice(FORM_CHOICE_WANT, datePage),
+      wantItem.createChoice(FORM_CHOICE_NOT_WANT, FormApp.PageNavigationType.SUBMIT)
+    ]);
+
+    // 2ページ目：店舗ごとの希望日
+    stores.forEach(store => {
+      const fee = FORM_VENDOR_FEES[store.vendor] || FORM_DEFAULT_FEE;
+
+      form.addSectionHeaderItem()
+          .setTitle(`【${store.storeName}】の収集希望について`)
+          .setHelpText(`特別回収料金：${fee}/1日`);
+
+      for (let col = FORM_DATE_COL_START; col <= FORM_DATE_COL_END; col++) {
+        if (store.rowData[col] === "○") {
+          form.addMultipleChoiceItem()
+              .setTitle(`【${store.storeName}】${headers[col]}の収集を希望しますか？`)
+              .setChoiceValues(['希望する', '希望しない'])
+              .setRequired(true);
+        }
       }
-    }
-  });
+    });
 
-  return {
-    formUrl: form.getPublishedUrl(),
-    formId: form.getId(),
-    storeNamesText: storeNamesText
-  };
+    return {
+      formUrl: form.getPublishedUrl(),
+      formId: form.getId(),
+      storeNamesText: storeNamesText
+    };
+  } catch (e) {
+    // 作りかけのフォームがドライブに残らないようゴミ箱へ移す
+    try {
+      DriveApp.getFileById(form.getId()).setTrashed(true);
+    } catch (trashError) {
+      console.error(`作りかけのフォームを削除できませんでした: ${form.getId()} / ${trashError}`);
+    }
+    throw e;
+  }
 }
 
 // このフォーム作成処理用のトリガーだけを削除する（リマインド・日報などのトリガーは残す）
