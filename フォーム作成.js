@@ -15,6 +15,7 @@ const FORM_SEND_SHEET_NAME = "メール送信用";
 const FORM_BATCH_HANDLER = "createFormsInBatches";
 const FORM_TIME_LIMIT_MS = 4.5 * 60 * 1000; // 1回あたりの処理時間上限（6分制限対策）
 const FORM_RETRY_DELAY_MS = 60 * 1000;      // 続きを実行するまでの待ち時間
+const FORM_SAFETY_DELAY_MS = 7 * 60 * 1000; // 実行が強制終了した場合に再開するまでの待ち時間（6分制限より長く）
 
 const FORM_STATUS_SENT = "送信済";
 const FORM_STATUS_ERROR = "エラー";
@@ -63,7 +64,9 @@ function createFormsInBatches() {
   let remaining = 0;
 
   try {
+    // 先に保険の再開トリガーを予約しておく。6分制限などで強制終了しても、これで処理が再開する
     deleteFormBatchTriggers();
+    scheduleFormBatch(FORM_SAFETY_DELAY_MS);
 
     const ss = getFormSpreadsheet();
     const sheet = ss.getSheetByName(FORM_LIST_SHEET_NAME);
@@ -108,8 +111,9 @@ function createFormsInBatches() {
       }
     }
 
+    deleteFormBatchTriggers();
     if (remaining > 0) {
-      ScriptApp.newTrigger(FORM_BATCH_HANDLER).timeBased().after(FORM_RETRY_DELAY_MS).create();
+      scheduleFormBatch(FORM_RETRY_DELAY_MS);
       console.log(`今回 ${formCount} 件作成（エラー ${errorCount} 件）。残り ${remaining} 件は自動で続行します。`);
     } else {
       console.log(`今回 ${formCount} 件作成（エラー ${errorCount} 件）。すべて完了しました。`);
@@ -231,6 +235,10 @@ ${storeNamesText}
     }
     throw e;
   }
+}
+
+function scheduleFormBatch(delayMs) {
+  ScriptApp.newTrigger(FORM_BATCH_HANDLER).timeBased().after(delayMs).create();
 }
 
 // このフォーム作成処理用のトリガーだけを削除する（リマインド・日報などのトリガーは残す）
