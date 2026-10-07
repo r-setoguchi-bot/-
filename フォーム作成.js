@@ -119,7 +119,12 @@ function createFormsInBatches() {
       console.log(`今回 ${formCount} 件作成（エラー ${errorCount} 件）。すべて完了しました。`);
     }
   } finally {
-    lock.releaseLock();
+    // ロック解除時に一時的なサーバーエラーが出ることがある。実行終了時に自動で解除されるので失敗扱いにしない
+    try {
+      lock.releaseLock();
+    } catch (e) {
+      console.warn(`ロック解除に失敗しました（処理には影響しません）: ${e}`);
+    }
   }
 }
 
