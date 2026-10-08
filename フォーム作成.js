@@ -117,6 +117,7 @@ function createFormsInBatches() {
       console.log(`今回 ${formCount} 件作成（エラー ${errorCount} 件）。残り ${remaining} 件は自動で続行します。`);
     } else {
       console.log(`今回 ${formCount} 件作成（エラー ${errorCount} 件）。すべて完了しました。`);
+      refreshContractStatusList();
     }
   } finally {
     // ロック解除時に一時的なサーバーエラーが出ることがある。実行終了時に自動で解除されるので失敗扱いにしない
@@ -125,6 +126,17 @@ function createFormsInBatches() {
     } catch (e) {
       console.warn(`ロック解除に失敗しました（処理には影響しません）: ${e}`);
     }
+  }
+}
+
+// kintoneリスト作成.js があれば、全件完了時に「契約状況一覧」を最新にする（失敗してもフォーム作成には影響しない）
+function refreshContractStatusList() {
+  try {
+    if (typeof updateContractStatusList === "function") {
+      updateContractStatusList();
+    }
+  } catch (e) {
+    console.warn(`契約状況一覧の更新に失敗しました: ${e}`);
   }
 }
 

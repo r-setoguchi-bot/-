@@ -1,11 +1,14 @@
 // ===== kintone契約管理 → フォーム作成用リストの作成 =====
-// kintoneの契約管理アプリから「契約中」の契約を取得し、フォーム作成用の「リスト」と同じ形のシートを作る。
-// 作れない契約は「要確認」シートに理由つきで出力する。フォームは作らない（メールも送らない）。
+// kintoneの契約管理アプリから「契約中」の契約を取得し、次のシートを作る。フォームは作らない（メールも送らない）。
+//   ・リスト_kintone … フォーム作成用（フォーム作成側の「リスト」と同じ形）
+//   ・要確認       … フォームを作れない契約と、その理由
+//   ・契約状況一覧 … 人が見る管理用。契約中の全件について、フォーム作成の状況を一覧にする
 //
 // 使い方:
 //   1. dumpKeiyakuFields を実行して項目名とフィールドコードの対応を確認（初回のみ）
-//   2. buildListFromKintone を実行 → 「リスト_kintone」「要確認」シートができる
+//   2. buildListFromKintone を実行 → 上の3つのシートができる
 //   3. 内容を確認してから、フォーム作成側の「リスト」と差し替える
+//   4. 状況を最新にしたいときは updateContractStatusList を実行（「契約状況一覧」だけを更新する）
 //
 // 必要なスクリプトプロパティ（コード.js と同じ名前）:
 //   KINTONE_SUBDOMAIN / KINTONE_KEIYAKU_APP_ID / KINTONE_KEIYAKU_API_TOKEN
@@ -22,6 +25,8 @@ const KLIST_SOURCE_SHEET_NAME = "リスト";       // 作成済みフォーム�
 const KLIST_STATUS_SENT = "送信済";
 const KLIST_OUTPUT_SHEET_NAME = "リスト_kintone";
 const KLIST_REVIEW_SHEET_NAME = "要確認";
+const KLIST_STATUS_SHEET_NAME = "契約状況一覧";
+const KLIST_STATUS_ERROR = "エラー";
 const KLIST_TARGET_CONTRACT_TYPE = "契約中";
 
 // 特別回収期間（フォームの列 D〜K に対応する8日分）と、回収不可の日
@@ -36,6 +41,7 @@ const KLIST_WEEKDAYS = "日月火水木金土"; // Date#getDay() の順
 const KLIST_LABELS = {
   contractType: "契約種別",
   storeName: "契約店舗名称",
+  customer: "顧客名称",
   vendor: "収集業者：名称",
   replyEmail: "年末年始　回答アドレス①",
   guideEmail: "案内等送付先メールアドレス:(to)"
@@ -134,6 +140,7 @@ function klistResolveFieldCodes(config) {
   return {
     contractType: codeOf(KLIST_LABELS.contractType),
     storeName: codeOf(KLIST_LABELS.storeName),
+    customer: codeOf(KLIST_LABELS.customer),
     vendor: codeOf(KLIST_LABELS.vendor),
     replyEmail: codeOf(KLIST_LABELS.replyEmail),
     guideEmail: codeOf(KLIST_LABELS.guideEmail),
@@ -144,8 +151,8 @@ function klistResolveFieldCodes(config) {
 // 必要な項目だけを、$idベースのページングで全件取得する
 function klistFetchRecords(config, fieldCodes) {
   const wanted = ["$id"].concat(
-    [fieldCodes.contractType, fieldCodes.storeName, fieldCodes.vendor, fieldCodes.replyEmail,
-      fieldCodes.guideEmail, fieldCodes.burnable]
+    [fieldCodes.contractType, fieldCodes.storeName, fieldCodes.customer, fieldCodes.vendor,
+      fieldCodes.replyEmail, fieldCodes.guideEmail, fieldCodes.burnable]
   );
   const fieldsParam = wanted.map((code, i) => `fields%5B${i}%5D=${encodeURIComponent(code)}`).join("&");
 
@@ -221,20 +228,24 @@ function klistBuildDates() {
   });
 }
 
-// 既存の「リスト」で「送信済」の店舗は、URL・ID・状況を引き継ぐ（作成済みフォームを作り直さないため）
-function klistLoadSentStatus(ss) {
+// 既存の「リスト」の状況を読む。「送信済」の店舗はURL・ID・状況を引き継ぎ（作成済みフォームを作り直さないため）、
+// 「エラー」の店舗は一覧に表示するために控えておく
+function klistLoadSourceStatus(ss) {
   const sentByStore = {};
+  const errorStores = new Set();
   const sheet = ss.getSheetByName(KLIST_SOURCE_SHEET_NAME);
-  if (!sheet) return sentByStore;
+  if (!sheet) return { sentByStore: sentByStore, errorStores: errorStores };
 
   const data = sheet.getDataRange().getDisplayValues();
   for (let i = 1; i < data.length; i++) {
     const row = data[i];
     if (row[13] === KLIST_STATUS_SENT) {
       sentByStore[row[0]] = [row[11], row[12], row[13]]; // L, M, N列
+    } else if (row[13] === KLIST_STATUS_ERROR) {
+      errorStores.add(row[0]);
     }
   }
-  return sentByStore;
+  return { sentByStore: sentByStore, errorStores: errorStores };
 }
 
 function klistWriteSheet(ss, sheetName, header, rows) {
@@ -247,17 +258,18 @@ function klistWriteSheet(ss, sheetName, header, rows) {
   sheet.getRange(1, 1, values.length, header.length).setValues(values);
 }
 
-function buildListFromKintone() {
+// kintoneから契約中の契約を取得し、フォーム作成用リスト・要確認・契約状況一覧の中身を作る（シートには書かない）
+function klistCollect(ss) {
   const config = klistGetKintoneConfig();
   const fieldCodes = klistResolveFieldCodes(config);
   const records = klistFetchRecords(config, fieldCodes);
 
-  const ss = klistGetSpreadsheet();
   const dates = klistBuildDates();
-  const sentByStore = klistLoadSentStatus(ss);
+  const source = klistLoadSourceStatus(ss);
 
   const listRows = [];
   const reviewRows = [];
+  const statusRows = [];
   let targetCount = 0;
   let carriedCount = 0;
   const seenBurnableOptions = new Set();
@@ -269,8 +281,17 @@ function buildListFromKintone() {
 
     const recordId = record.$id.value;
     const storeName = klistValue(record, fieldCodes.storeName);
+    const customer = klistValue(record, fieldCodes.customer);
     const vendor = klistValue(record, fieldCodes.vendor);
-    const addReview = (reason, raw) => reviewRows.push([recordId, storeName, reason, raw || ""]);
+    const recordUrl = `https://${config.subdomain}.cybozu.com/k/${config.appId}/show#record=${recordId}`;
+
+    // 管理用の一覧に1行追加する。状況: フォーム作成済 / 未作成 / エラー / 要確認
+    const addStatus = (status, email, reason) =>
+      statusRows.push([storeName, customer, recordUrl, status, email || "", reason || ""]);
+    const addReview = (reason, raw, email) => {
+      reviewRows.push([recordId, storeName, reason, raw || ""]);
+      addStatus("要確認", email, reason);
+    };
 
     const picked = klistPickEmail(
       klistValue(record, fieldCodes.replyEmail),
@@ -286,18 +307,25 @@ function buildListFromKintone() {
     const burnableOn = klistWeekdayFlags(selectedOptions); // 日〜土の順
     if (burnableOn.some(Boolean)) recognizedWeekdayCount++;
     if (!burnableOn.some(Boolean)) {
-      addReview("可燃の回収曜日が登録されていません");
+      addReview("可燃の回収曜日が登録されていません", "", picked.email);
       return;
     }
 
     const marks = dates.map(date => (date.collectable && burnableOn[date.weekdayIndex] ? "○" : ""));
     if (!marks.some(mark => mark === "○")) {
-      addReview("期間中に回収できる日がありません（回収曜日が1月1日の曜日のみ、など）");
+      addReview("期間中に回収できる日がありません（回収曜日が1月1日の曜日のみ、など）", "", picked.email);
       return;
     }
 
-    const carried = sentByStore[storeName] || ["", "", ""];
-    if (carried[2]) carriedCount++;
+    const carried = source.sentByStore[storeName] || ["", "", ""];
+    if (carried[2]) {
+      carriedCount++;
+      addStatus("フォーム作成済", picked.email);
+    } else if (source.errorStores.has(storeName)) {
+      addStatus(KLIST_STATUS_ERROR, picked.email, "フォーム作成でエラーになりました");
+    } else {
+      addStatus("未作成", picked.email);
+    }
     listRows.push([storeName, picked.email, vendor].concat(marks, carried));
   });
 
@@ -308,16 +336,47 @@ function buildListFromKintone() {
 
   listRows.sort((a, b) => (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0)); // 同じアドレスが並ぶように
 
-  const listHeader = ["店舗名", "メールアドレス", "業者名"]
-    .concat(dates.map(date => date.header), ["フォームURL", "フォームID", "送信状況"]);
-  klistWriteSheet(ss, KLIST_OUTPUT_SHEET_NAME, listHeader, listRows);
-  klistWriteSheet(ss, KLIST_REVIEW_SHEET_NAME, ["レコード番号", "契約店舗名称", "理由", "アドレス欄の内容"], reviewRows);
+  return {
+    dates: dates,
+    listRows: listRows,
+    reviewRows: reviewRows,
+    statusRows: statusRows,
+    targetCount: targetCount,
+    carriedCount: carriedCount
+  };
+}
 
-  const emailCount = new Set(listRows.map(row => row[1])).size;
+function klistWriteStatusSheet(ss, statusRows) {
+  klistWriteSheet(ss, KLIST_STATUS_SHEET_NAME,
+    ["店舗名", "契約者", "契約管理URL", "状況", "送信先アドレス", "理由"], statusRows);
+}
+
+function buildListFromKintone() {
+  const ss = klistGetSpreadsheet();
+  const result = klistCollect(ss);
+
+  const listHeader = ["店舗名", "メールアドレス", "業者名"]
+    .concat(result.dates.map(date => date.header), ["フォームURL", "フォームID", "送信状況"]);
+  klistWriteSheet(ss, KLIST_OUTPUT_SHEET_NAME, listHeader, result.listRows);
+  klistWriteSheet(ss, KLIST_REVIEW_SHEET_NAME, ["レコード番号", "契約店舗名称", "理由", "アドレス欄の内容"], result.reviewRows);
+  klistWriteStatusSheet(ss, result.statusRows);
+
+  const emailCount = new Set(result.listRows.map(row => row[1])).size;
   console.log(
-    `契約中 ${targetCount} 件 → リスト ${listRows.length} 件（送信先 ${emailCount} 件、うち作成済みを引き継ぎ ${carriedCount} 件）、` +
-    `要確認 ${reviewRows.length} 件。シート「${KLIST_OUTPUT_SHEET_NAME}」「${KLIST_REVIEW_SHEET_NAME}」を確認してください。`
+    `契約中 ${result.targetCount} 件 → リスト ${result.listRows.length} 件（送信先 ${emailCount} 件、うち作成済みを引き継ぎ ${result.carriedCount} 件）、` +
+    `要確認 ${result.reviewRows.length} 件。シート「${KLIST_OUTPUT_SHEET_NAME}」「${KLIST_REVIEW_SHEET_NAME}」「${KLIST_STATUS_SHEET_NAME}」を確認してください。`
   );
+}
+
+// 「契約状況一覧」だけを最新にする（フォーム作成用のリストや要確認は変更しない）
+function updateContractStatusList() {
+  const ss = klistGetSpreadsheet();
+  const result = klistCollect(ss);
+  klistWriteStatusSheet(ss, result.statusRows);
+
+  const counts = {};
+  result.statusRows.forEach(row => { counts[row[3]] = (counts[row[3]] || 0) + 1; });
+  console.log(`契約状況一覧を更新しました（契約中 ${result.targetCount} 件）: ${JSON.stringify(counts)}`);
 }
 
 // 契約管理アプリの項目名とフィールドコードの対応をログに出す（個人情報は出さない）
