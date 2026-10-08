@@ -26,6 +26,7 @@ const KLIST_STATUS_SENT = "送信済";
 const KLIST_OUTPUT_SHEET_NAME = "リスト_kintone";
 const KLIST_REVIEW_SHEET_NAME = "要確認";
 const KLIST_STATUS_SHEET_NAME = "契約状況一覧";
+const KLIST_RESPONSE_SHEET_NAME = "回答集計";   // 回答集計.js が作る。回答状況の表示に使う
 const KLIST_STATUS_ERROR = "エラー";
 const KLIST_TARGET_CONTRACT_TYPE = "契約中";
 
@@ -248,6 +249,19 @@ function klistLoadSourceStatus(ss) {
   return { sentByStore: sentByStore, errorStores: errorStores };
 }
 
+// 「回答集計」シートから、回答のある店舗と回答日時を読む（シートが無ければ空）
+function klistLoadResponseTimes(ss) {
+  const answeredAtByStore = {};
+  const sheet = ss.getSheetByName(KLIST_RESPONSE_SHEET_NAME);
+  if (!sheet || sheet.getLastRow() < 2) return answeredAtByStore;
+
+  const values = sheet.getDataRange().getDisplayValues();
+  for (let i = 1; i < values.length; i++) {
+    answeredAtByStore[values[i][0]] = values[i][1]; // A列: 店舗名, B列: 回答日時
+  }
+  return answeredAtByStore;
+}
+
 function klistWriteSheet(ss, sheetName, header, rows) {
   let sheet = ss.getSheetByName(sheetName);
   if (!sheet) {
@@ -266,6 +280,7 @@ function klistCollect(ss) {
 
   const dates = klistBuildDates();
   const source = klistLoadSourceStatus(ss);
+  const answeredAtByStore = klistLoadResponseTimes(ss);
 
   const listRows = [];
   const reviewRows = [];
@@ -286,8 +301,13 @@ function klistCollect(ss) {
     const recordUrl = `https://${config.subdomain}.cybozu.com/k/${config.appId}/show#record=${recordId}`;
 
     // 管理用の一覧に1行追加する。状況: フォーム作成済 / 未作成 / エラー / 要確認
-    const addStatus = (status, email, reason) =>
-      statusRows.push([storeName, customer, recordUrl, status, email || "", reason || ""]);
+    // フォーム作成済の店舗だけ、回答状況（回答済 / 未回答）と回答日時も入れる
+    const addStatus = (status, email, reason) => {
+      const answeredAt = answeredAtByStore[storeName];
+      const answerState = status === "フォーム作成済" ? (answeredAt ? "回答済" : "未回答") : "";
+      statusRows.push([storeName, customer, recordUrl, status, email || "", reason || "",
+        answerState, answeredAt || ""]);
+    };
     const addReview = (reason, raw, email) => {
       reviewRows.push([recordId, storeName, reason, raw || ""]);
       addStatus("要確認", email, reason);
@@ -348,7 +368,7 @@ function klistCollect(ss) {
 
 function klistWriteStatusSheet(ss, statusRows) {
   klistWriteSheet(ss, KLIST_STATUS_SHEET_NAME,
-    ["店舗名", "契約者", "契約管理URL", "状況", "送信先アドレス", "理由"], statusRows);
+    ["店舗名", "契約者", "契約管理URL", "状況", "送信先アドレス", "理由", "回答状況", "回答日時"], statusRows);
 }
 
 function buildListFromKintone() {

@@ -9,6 +9,10 @@
 // スプレッドシートの指定:
 //   スクリプトプロパティ FORM_SPREADSHEET_URL があればそのスプレッドシートを使う。
 //   無ければスクリプトが紐づいているスプレッドシート（コンテナバインド時）を使う。
+//
+// フォームの保存先フォルダ:
+//   スクリプトプロパティ FORM_FOLDER_ID にドライブのフォルダID（フォルダのURLの folders/ の後ろ）を入れると、
+//   作ったフォームをそのフォルダに移す。未設定ならマイドライブ直下に残る。
 
 const FORM_LIST_SHEET_NAME = "リスト";
 const FORM_SEND_SHEET_NAME = "メール送信用";
@@ -30,6 +34,15 @@ const FORM_DATE_COL_END = 10;
 
 const FORM_TITLE = '【株式会社クリメン】2026年～2027年 年末年始廃棄物回収に関するアンケート';
 const FORM_PERIOD_TEXT = '2026年12月28日(月)から2027年1月4日(月)';
+
+// 回答期限（例: '2026年11月13日(金)'）。空のままなら説明文に期限の行を入れない
+const FORM_DEADLINE_TEXT = "";
+
+// 回答者への質問。回答集計.js が回答を読み取る目印にもなるので、文言を変えるときは両方そろえること
+const FORM_Q_CONTACT_NAME = "ご担当者様のお名前";
+const FORM_Q_PHONE = "ご連絡可能なお電話番号";
+const FORM_Q_COMMENT = "ご不明点・ご要望（任意）";
+const FORM_Q_WANT = "特別回収期間の回収について";
 
 const FORM_CHOICE_WANT = '特別回収期間の回収を希望する（有料）';
 const FORM_CHOICE_NOT_WANT = 'すべての日程において回収を希望しない';
@@ -64,9 +77,7 @@ function createFormsInBatches() {
   let remaining = 0;
 
   try {
-    // 先に保険の再開トリガーを予約しておく。6分制限などで強制終了しても、これで処理が再開する
     deleteFormBatchTriggers();
-    scheduleFormBatch(FORM_SAFETY_DELAY_MS);
 
     const ss = getFormSpreadsheet();
     const sheet = ss.getSheetByName(FORM_LIST_SHEET_NAME);
@@ -77,8 +88,13 @@ function createFormsInBatches() {
     const headers = data[0];
     const sendSheet = getFormSendSheet(ss);
 
+    const folder = getFormFolder();
+
     const groupedData = groupUnsentRowsByEmail(data);
     const emails = Object.keys(groupedData);
+
+    // 準備が終わったら、保険の再開トリガーを予約しておく。6分制限などで強制終了しても、これで処理が再開する
+    scheduleFormBatch(FORM_SAFETY_DELAY_MS);
 
     for (let n = 0; n < emails.length; n++) {
       if (Date.now() - startTime > FORM_TIME_LIMIT_MS) {
@@ -90,7 +106,7 @@ function createFormsInBatches() {
       const stores = groupedData[email];
 
       try {
-        const result = createFormForStores(stores, headers);
+        const result = createFormForStores(stores, headers, folder);
 
         // 1件ごとに書き込み、途中で止まっても同じフォームを二重に作らないようにする
         stores.forEach(store => {
@@ -152,6 +168,17 @@ function getFormSpreadsheet() {
   return ss;
 }
 
+// 保存先フォルダを返す。未設定ならnull。設定されているのに開けない場合は、フォームを作る前にエラーで止める
+function getFormFolder() {
+  const folderId = PropertiesService.getScriptProperties().getProperty("FORM_FOLDER_ID");
+  if (!folderId) return null;
+  try {
+    return DriveApp.getFolderById(folderId.trim());
+  } catch (e) {
+    throw new Error("スクリプトプロパティ FORM_FOLDER_ID のフォルダを開けません。IDと共有設定を確認してください。");
+  }
+}
+
 function getFormSendSheet(ss) {
   let sendSheet = ss.getSheetByName(FORM_SEND_SHEET_NAME);
   if (!sendSheet) {
@@ -182,12 +209,18 @@ function groupUnsentRowsByEmail(data) {
   return groupedData;
 }
 
-function createFormForStores(stores, headers) {
+function createFormForStores(stores, headers, folder) {
   const storeNamesText = stores.map(store => store.storeName).join('・');
 
   const form = FormApp.create(FORM_TITLE);
 
   try {
+    if (folder) {
+      DriveApp.getFileById(form.getId()).moveTo(folder);
+    }
+
+    const deadlineText = FORM_DEADLINE_TEXT ? `◆ご回答期限：${FORM_DEADLINE_TEXT}まで\n\n` : "";
+
     form.setDescription(`【対象店舗】
 ${storeNamesText}
 
@@ -197,7 +230,7 @@ ${storeNamesText}
 ★特別回収料金：店舗ごとに異なります。各店舗の設問をご確認ください。
 ★回収対象：可燃ごみのみ
 
-◆ 特別回収期間の回収を希望 される場合（※）は
+${deadlineText}◆ 特別回収期間の回収を希望 される場合（※）は
 「${FORM_CHOICE_WANT}」を選択し
 次の画面にて希望日にチェックをしてください 。
  ※通常、伺っております可燃回収曜日に準じます。予めご了承ください。
@@ -208,9 +241,13 @@ ${storeNamesText}
 
 ◆特別回収期間の回収を希望されない場合「${FORM_CHOICE_NOT_WANT}」を選択してください。`);
 
-    // 1ページ目：希望の有無。「希望しない」はそのまま送信、「希望する」は次ページの希望日選択へ進む
+    // 1ページ目：回答者の連絡先と希望の有無。「希望しない」はそのまま送信、「希望する」は次ページの希望日選択へ進む
+    form.addTextItem().setTitle(FORM_Q_CONTACT_NAME).setRequired(true);
+    form.addTextItem().setTitle(FORM_Q_PHONE).setRequired(true);
+    form.addParagraphTextItem().setTitle(FORM_Q_COMMENT);
+
     const wantItem = form.addMultipleChoiceItem()
-        .setTitle('特別回収期間の回収について')
+        .setTitle(FORM_Q_WANT)
         .setRequired(true);
 
     const datePage = form.addPageBreakItem().setTitle('希望日の選択');
