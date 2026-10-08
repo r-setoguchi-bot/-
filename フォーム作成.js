@@ -36,7 +36,7 @@ const FORM_TITLE = '【株式会社クリメン】2026年～2027年 年末年始
 const FORM_PERIOD_TEXT = '2026年12月28日(月)から2027年1月4日(月)';
 
 // 回答期限（例: '2026年11月13日(金)'）。空のままなら説明文に期限の行を入れない
-const FORM_DEADLINE_TEXT = "";
+const FORM_DEADLINE_TEXT = '2026年11月15日(日)';
 
 // 回答者への質問。回答集計.js が回答を読み取る目印にもなるので、文言を変えるときは両方そろえること
 const FORM_Q_CONTACT_NAME = "ご担当者様のお名前";
