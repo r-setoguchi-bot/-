@@ -33,7 +33,7 @@ const FORM_DATE_COL_START = 3;
 const FORM_DATE_COL_END = 10;
 
 const FORM_TITLE = '【株式会社クリメン】2026年～2027年 年末年始廃棄物回収に関するアンケート';
-const FORM_PERIOD_TEXT = '2026年12月28日(月)から2027年1月4日(月)';
+const FORM_PERIOD_TEXT = '2026年12月30日(水)から2027年1月3日(日)';
 
 // 回答期限（例: '2026年11月13日(金)'）。空のままなら説明文に期限の行を入れない
 const FORM_DEADLINE_TEXT = '2026年11月15日(日)';

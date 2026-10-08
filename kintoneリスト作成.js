@@ -30,12 +30,13 @@ const KLIST_RESPONSE_SHEET_NAME = "回答集計";   // 回答集計.js が作る
 const KLIST_STATUS_ERROR = "エラー";
 const KLIST_TARGET_CONTRACT_TYPE = "契約中";
 
-// 特別回収期間（フォームの列 D〜K に対応する8日分）と、回収不可の日
+// 特別回収期間（2026年12月30日(水)〜2027年1月3日(日)）の日付と、回収不可の日
 const KLIST_DATES = [
-  [2026, 12, 28], [2026, 12, 29], [2026, 12, 30], [2026, 12, 31],
-  [2027, 1, 1], [2027, 1, 2], [2027, 1, 3], [2027, 1, 4]
+  [2026, 12, 30], [2026, 12, 31], [2027, 1, 1], [2027, 1, 2], [2027, 1, 3]
 ];
 const KLIST_NO_COLLECTION_DATES = ["2027-1-1"];
+// フォーム作成用リストの日付の列数（D〜K列の8列）。期間が短いときは、余った列を空にする
+const KLIST_DATE_SLOTS = 8;
 
 const KLIST_WEEKDAYS = "日月火水木金土"; // Date#getDay() の順
 
@@ -217,7 +218,7 @@ function klistPickEmail(replyRaw, guideRaw) {
   return { reason: "送信先アドレスがありません", raw: "" };
 }
 
-// 期間中の8日分について、見出しと「回収できる曜日か」を作る
+// 期間中の各日について、見出しと「回収できる曜日か」を作る
 function klistBuildDates() {
   return KLIST_DATES.map(([y, m, d]) => {
     const weekdayIndex = new Date(y, m - 1, d).getDay();
@@ -333,9 +334,10 @@ function klistCollect(ss) {
 
     const marks = dates.map(date => (date.collectable && burnableOn[date.weekdayIndex] ? "○" : ""));
     if (!marks.some(mark => mark === "○")) {
-      addReview("期間中に回収できる日がありません（回収曜日が1月1日の曜日のみ、など）", "", picked.email);
+      addReview("期間中に回収できる日がありません（回収曜日が期間外の曜日のみ、など）", "", picked.email);
       return;
     }
+    while (marks.length < KLIST_DATE_SLOTS) marks.push(""); // 列 D〜K の8列に合わせる
 
     const carried = source.sentByStore[storeName] || ["", "", ""];
     if (carried[2]) {
@@ -375,8 +377,10 @@ function buildListFromKintone() {
   const ss = klistGetSpreadsheet();
   const result = klistCollect(ss);
 
+  const dateHeaders = result.dates.map(date => date.header);
+  while (dateHeaders.length < KLIST_DATE_SLOTS) dateHeaders.push("");
   const listHeader = ["店舗名", "メールアドレス", "業者名"]
-    .concat(result.dates.map(date => date.header), ["フォームURL", "フォームID", "送信状況"]);
+    .concat(dateHeaders, ["フォームURL", "フォームID", "送信状況"]);
   klistWriteSheet(ss, KLIST_OUTPUT_SHEET_NAME, listHeader, result.listRows);
   klistWriteSheet(ss, KLIST_REVIEW_SHEET_NAME, ["レコード番号", "契約店舗名称", "理由", "アドレス欄の内容"], result.reviewRows);
   klistWriteStatusSheet(ss, result.statusRows);

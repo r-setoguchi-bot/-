@@ -179,11 +179,13 @@ function respReadFormResponses(form, headers) {
     : parsed.want;
 
   return form.stores.map(store => {
-    const dateCells = headers.map((header, i) => {
-      if (!store.offered[i]) return "";                       // 設問が無かった日
-      if (parsed.want === RESP_CHOICE_NOT_WANT) return "×";   // 「希望しない」で送信した場合は、全日程が「×」
+    const dateCells = [];
+    headers.forEach((header, i) => {
+      if (!header) return;                                    // 見出しの無い列（期間が短いときの余り）は使わない
+      if (!store.offered[i]) { dateCells.push(""); return; }  // 設問が無かった日
+      if (parsed.want === RESP_CHOICE_NOT_WANT) { dateCells.push("×"); return; }  // 「希望しない」で送信した場合は、全日程が「×」
       const answer = (parsed.dateAnswers[store.name] || {})[header];
-      return answer === RESP_ANSWER_YES ? "○" : answer === RESP_ANSWER_NO ? "×" : "";
+      dateCells.push(answer === RESP_ANSWER_YES ? "○" : answer === RESP_ANSWER_NO ? "×" : "");
     });
     return [store.name, answeredAt, wantLabel].concat(dateCells,
       [parsed.contactName, parsed.phone, parsed.comment, store.email, form.formId]);
@@ -233,7 +235,7 @@ function respWriteOutputSheet(ss, headers, rowsByStore) {
   if (!sheet) {
     sheet = ss.insertSheet(RESP_OUTPUT_SHEET_NAME);
   }
-  const header = ["店舗名", "回答日時", "特別回収"].concat(headers,
+  const header = ["店舗名", "回答日時", "特別回収"].concat(headers.filter(h => h),
     ["ご担当者名", "電話番号", "コメント", "メールアドレス", "フォームID"]);
   const rows = Object.keys(rowsByStore).map(store => rowsByStore[store])
     .sort((a, b) => (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0)); // 回答が古い順
