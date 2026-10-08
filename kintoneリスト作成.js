@@ -13,8 +13,13 @@
 //     「アプリ管理」を付けない場合は、スクリプトプロパティ KLIST_FIELD_CODES に
 //     {"契約種別":"フィールドコード", ...} のJSONで項目名→コードを登録する。
 //
-// フォーム作成.js の getFormSpreadsheet / FORM_LIST_SHEET_NAME / FORM_STATUS_SENT を使う。
+// スプレッドシートの指定:
+//   スクリプトプロパティ FORM_SPREADSHEET_URL があればそのスプレッドシートを使う。
+//   無ければスクリプトが紐づいているスプレッドシート（コンテナバインド時）を使う。
+// このファイルだけで動く（フォーム作成.js が無くても実行できる）。
 
+const KLIST_SOURCE_SHEET_NAME = "リスト";       // 作成済みフォームの状況を引き継ぐ元
+const KLIST_STATUS_SENT = "送信済";
 const KLIST_OUTPUT_SHEET_NAME = "リスト_kintone";
 const KLIST_REVIEW_SHEET_NAME = "要確認";
 const KLIST_TARGET_CONTRACT_TYPE = "契約中";
@@ -43,6 +48,18 @@ const KLIST_EMAIL_PATTERN = /^[a-z0-9._%+\-]+@[a-z0-9\-]+(\.[a-z0-9\-]+)+$/;
 // 項目名を比較用にそろえる（全角半角・空白の違いを無視）
 function klistNormalizeLabel(label) {
   return String(label).normalize("NFKC").replace(/\s/g, "");
+}
+
+function klistGetSpreadsheet() {
+  const url = PropertiesService.getScriptProperties().getProperty("FORM_SPREADSHEET_URL");
+  if (url) {
+    return SpreadsheetApp.openByUrl(url);
+  }
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) {
+    throw new Error("スクリプトプロパティ FORM_SPREADSHEET_URL を設定してください。");
+  }
+  return ss;
 }
 
 function klistGetKintoneConfig() {
@@ -207,13 +224,13 @@ function klistBuildDates() {
 // 既存の「リスト」で「送信済」の店舗は、URL・ID・状況を引き継ぐ（作成済みフォームを作り直さないため）
 function klistLoadSentStatus(ss) {
   const sentByStore = {};
-  const sheet = ss.getSheetByName(FORM_LIST_SHEET_NAME);
+  const sheet = ss.getSheetByName(KLIST_SOURCE_SHEET_NAME);
   if (!sheet) return sentByStore;
 
   const data = sheet.getDataRange().getDisplayValues();
   for (let i = 1; i < data.length; i++) {
     const row = data[i];
-    if (row[13] === FORM_STATUS_SENT) {
+    if (row[13] === KLIST_STATUS_SENT) {
       sentByStore[row[0]] = [row[11], row[12], row[13]]; // L, M, N列
     }
   }
@@ -235,7 +252,7 @@ function buildListFromKintone() {
   const fieldCodes = klistResolveFieldCodes(config);
   const records = klistFetchRecords(config, fieldCodes);
 
-  const ss = getFormSpreadsheet();
+  const ss = klistGetSpreadsheet();
   const dates = klistBuildDates();
   const sentByStore = klistLoadSentStatus(ss);
 
