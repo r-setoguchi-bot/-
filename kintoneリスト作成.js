@@ -35,7 +35,8 @@ const KLIST_LABELS = {
   replyEmail: "年末年始　回答アドレス①",
   guideEmail: "案内等送付先メールアドレス:(to)"
 };
-const KLIST_BURNABLE_LABEL = weekday => `可燃収集日[${weekday}]`;
+// 可燃の回収曜日は、チェックボックス1項目（選択肢が曜日）に入っている
+const KLIST_BURNABLE_LABEL = "可燃収集日";
 
 const KLIST_EMAIL_PATTERN = /^[a-z0-9._%+\-]+@[a-z0-9\-]+(\.[a-z0-9\-]+)+$/;
 
@@ -77,7 +78,8 @@ function klistFetchFields(config) {
   return Object.keys(properties).map(code => ({
     code: code,
     label: properties[code].label,
-    type: properties[code].type
+    type: properties[code].type,
+    options: properties[code].options ? Object.keys(properties[code].options) : []
   }));
 }
 
@@ -103,7 +105,7 @@ function klistResolveFieldCodes(config) {
   }
 
   const requiredLabels = Object.keys(KLIST_LABELS).map(key => KLIST_LABELS[key]);
-  KLIST_WEEKDAYS.split("").forEach(w => requiredLabels.push(KLIST_BURNABLE_LABEL(w)));
+  requiredLabels.push(KLIST_BURNABLE_LABEL);
 
   const missing = requiredLabels.filter(label => !(klistNormalizeLabel(label) in labelToCode));
   if (missing.length > 0) {
@@ -118,15 +120,15 @@ function klistResolveFieldCodes(config) {
     vendor: codeOf(KLIST_LABELS.vendor),
     replyEmail: codeOf(KLIST_LABELS.replyEmail),
     guideEmail: codeOf(KLIST_LABELS.guideEmail),
-    burnable: KLIST_WEEKDAYS.split("").map(w => codeOf(KLIST_BURNABLE_LABEL(w))) // 日〜土の順
+    burnable: codeOf(KLIST_BURNABLE_LABEL)
   };
 }
 
 // 必要な項目だけを、$idベースのページングで全件取得する
 function klistFetchRecords(config, fieldCodes) {
   const wanted = ["$id"].concat(
-    [fieldCodes.contractType, fieldCodes.storeName, fieldCodes.vendor, fieldCodes.replyEmail, fieldCodes.guideEmail],
-    fieldCodes.burnable
+    [fieldCodes.contractType, fieldCodes.storeName, fieldCodes.vendor, fieldCodes.replyEmail,
+      fieldCodes.guideEmail, fieldCodes.burnable]
   );
   const fieldsParam = wanted.map((code, i) => `fields%5B${i}%5D=${encodeURIComponent(code)}`).join("&");
 
@@ -158,8 +160,17 @@ function klistValue(record, code) {
   return String(value);
 }
 
-function klistIsOn(value) {
-  return value !== "" && value !== "0";
+// 可燃収集日（チェックボックス）で選ばれている選択肢の一覧を返す
+function klistSelectedOptions(record, code) {
+  const field = record[code];
+  if (!field || field.value === null || field.value === undefined || field.value === "") return [];
+  return Array.isArray(field.value) ? field.value.map(String) : [String(field.value)];
+}
+
+// 選択肢が曜日（「月」「月曜」「月曜日」など）なら、日〜土の順の true/false にする
+function klistWeekdayFlags(selectedOptions) {
+  const initials = selectedOptions.map(option => klistNormalizeLabel(option).charAt(0));
+  return KLIST_WEEKDAYS.split("").map(weekday => initials.indexOf(weekday) !== -1);
 }
 
 // 送信先を決める。年末年始の回答アドレスを優先し、無ければ案内送付先(to)を使う
@@ -232,6 +243,8 @@ function buildListFromKintone() {
   const reviewRows = [];
   let targetCount = 0;
   let carriedCount = 0;
+  const seenBurnableOptions = new Set();
+  let recognizedWeekdayCount = 0;
 
   records.forEach(record => {
     if (klistValue(record, fieldCodes.contractType) !== KLIST_TARGET_CONTRACT_TYPE) return;
@@ -251,7 +264,10 @@ function buildListFromKintone() {
       return;
     }
 
-    const burnableOn = fieldCodes.burnable.map(code => klistIsOn(klistValue(record, code))); // 日〜土
+    const selectedOptions = klistSelectedOptions(record, fieldCodes.burnable);
+    selectedOptions.forEach(option => seenBurnableOptions.add(option));
+    const burnableOn = klistWeekdayFlags(selectedOptions); // 日〜土の順
+    if (burnableOn.some(Boolean)) recognizedWeekdayCount++;
     if (!burnableOn.some(Boolean)) {
       addReview("可燃の回収曜日が登録されていません");
       return;
@@ -267,6 +283,11 @@ function buildListFromKintone() {
     if (carried[2]) carriedCount++;
     listRows.push([storeName, picked.email, vendor].concat(marks, carried));
   });
+
+  // 全件で曜日が読み取れなかった場合は、選択肢の名前が想定と違うので、シートを作らずに止める
+  if (targetCount > 0 && recognizedWeekdayCount === 0) {
+    throw new Error(`「${KLIST_BURNABLE_LABEL}」の選択肢を曜日として読み取れませんでした。選択肢: ${Array.from(seenBurnableOptions).join(" / ") || "（なし）"}`);
+  }
 
   listRows.sort((a, b) => (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0)); // 同じアドレスが並ぶように
 
@@ -285,6 +306,9 @@ function buildListFromKintone() {
 // 契約管理アプリの項目名とフィールドコードの対応をログに出す（個人情報は出さない）
 function dumpKeiyakuFields() {
   const fields = klistFetchFields(klistGetKintoneConfig());
-  fields.forEach(field => console.log(`${field.code}\t${field.label}\t${field.type}`));
+  fields.forEach(field => {
+    const optionText = field.type === "CHECK_BOX" && field.options.length > 0 ? `\t選択肢: ${field.options.join("|")}` : "";
+    console.log(`${field.code}\t${field.label}\t${field.type}${optionText}`);
+  });
   console.log(`項目数: ${fields.length}`);
 }
