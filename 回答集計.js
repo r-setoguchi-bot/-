@@ -10,10 +10,20 @@
 //   ・依頼後の回答 … 「○」を確認した後に回答が来ていたら「あり」と出る（赤色の行）
 //   手入力するのは「業者依頼済」の列だけ。ほかの列は集計のたびに書き換わる。
 //
+// 回答の控えメール（エビデンス用）:
+//   回答を読み取ったときに、回答内容をまとめたメールをお客様（フォームのURLを送ったアドレス）へ送る。
+//   スクリプトプロパティ RESP_MAIL_MODE で切り替える。未設定なら送らない。
+//     off  … 送らない（初期値）
+//     test … お客様には送らず、RESP_MAIL_TEST_TO のアドレスだけに送る（動作確認用）
+//     on   … お客様へ送る。RESP_MAIL_BCC があれば、そのアドレスにも同じメールを送る（社内の控え）
+//   同じ回答には1回だけ送る。再回答があれば、その回答の分をもう一度送る。送信の結果は「控えメール」の列に残る。
+//   メールはスクリプトを実行しているアカウントから送られ、送信できる数には1日の上限がある。
+//
 // 使い方:
 //   1. setupResponseCollectionTrigger を1回だけ実行 → RESP_INTERVAL_HOURS 時間ごとに自動で集計され、
 //      1時間ごとに「業者依頼済」の印を見て受付を止める／再開する
 //   2. 今すぐ集計したいときは startResponseCollection、今すぐ受付を止めたいときは closeRequestedForms を実行
+//      控えメールの文面を確かめたいときは sendSampleReceiptMail を実行（RESP_MAIL_TEST_TO 宛てにサンプルを送る）
 //   3. 自動集計を止めるときは removeResponseCollectionTrigger を実行
 //
 // スプレッドシートの指定は フォーム作成.js と同じ（FORM_SPREADSHEET_URL、無ければ紐づいているスプレッドシート）。
@@ -34,6 +44,15 @@ const RESP_CLOSE_HANDLER = "closeRequestedForms";
 // 受付を止めたフォームを開いた人に表示するメッセージ
 const RESP_CLOSED_MESSAGE = "このアンケートの回答受付は終了しました。内容の変更をご希望の場合は、お手数ですが株式会社クリメンまでご連絡ください。";
 const RESP_CLOSED_CONTACT = "";               // 連絡先（電話番号など）。空のままなら表示しない
+
+// 控えメール
+const RESP_MAIL_MODE_PROPERTY = "RESP_MAIL_MODE";           // off / test / on
+const RESP_MAIL_TEST_TO_PROPERTY = "RESP_MAIL_TEST_TO";     // test のときの宛先
+const RESP_MAIL_BCC_PROPERTY = "RESP_MAIL_BCC";             // on のときに、社内の控えとして同じメールを送るアドレス（任意）
+const RESP_MAIL_SENDER_NAME = "株式会社クリメン";
+const RESP_MAIL_SUBJECT = "【株式会社クリメン】年末年始廃棄物回収アンケート ご回答内容の控え";
+const RESP_MAIL_PERIOD_TEXT = "2026年12月30日(水)から2027年1月3日(日)";
+const RESP_MAIL_CONTACT = "";                               // 内容の変更の連絡先（電話番号など）。空のままなら案内の文だけ入れる
 
 // フォーム作成.js の質問文・選択肢と同じ文言にしておくこと
 const RESP_Q_CONTACT_NAME = "ご担当者様のお名前";
@@ -58,7 +77,8 @@ const RESP_COL_STATUS = 13;     // N列: 送信状況
 const RESP_HEADER_REQUESTED = "業者依頼済";
 const RESP_HEADER_REQUESTED_AT = "依頼確認日時";
 const RESP_HEADER_ACCEPTING = "フォーム受付";
-const RESP_KEEP_HEADERS = [RESP_HEADER_REQUESTED, RESP_HEADER_REQUESTED_AT, RESP_HEADER_ACCEPTING];
+const RESP_HEADER_MAILED = "控えメール";   // 控えメールを送った回答の日時（テスト送信は「テスト:」、失敗は「失敗:」が付く）
+const RESP_KEEP_HEADERS = [RESP_HEADER_REQUESTED, RESP_HEADER_REQUESTED_AT, RESP_HEADER_ACCEPTING, RESP_HEADER_MAILED];
 const RESP_STATE_CLOSED = "停止済";
 const RESP_STATE_WAITING = "他の店舗が未依頼のため受付中";
 const RESP_STATE_ERROR = "停止できませんでした";
@@ -143,6 +163,10 @@ function collectFormResponses() {
     nextIndex = savedCursor < forms.length ? savedCursor : 0;
 
     const rowsByStore = respLoadExistingRows(ss, outputHeader);
+    const mailedByStore = {};                       // 今回、控えメールを送った（または送ろうとした）店舗
+    const mailSettings = respGetMailSettings();
+    const mailedColumn = outputHeader.indexOf(RESP_HEADER_MAILED);
+    const dateHeaders = headers.filter(h => h);
 
     while (nextIndex < forms.length) {
       if (Date.now() - startTime > RESP_TIME_LIMIT_MS) break;
@@ -150,6 +174,14 @@ function collectFormResponses() {
       const form = forms[nextIndex];
       try {
         const rows = respReadFormResponses(form, headers);
+        if (rows.length > 0) {
+          const before = rowsByStore[rows[0][0]];
+          const previousMailed = before && before[mailedColumn] ? before[mailedColumn] : "";
+          const mark = respSendReceiptIfNeeded(form, rows, dateHeaders, previousMailed, mailSettings);
+          rows.forEach(row => {
+            if (mark) mailedByStore[row[0]] = mark;
+          });
+        }
         rows.forEach(row => { rowsByStore[row[0]] = row; });
         processedCount++;
       } catch (e) {
@@ -159,7 +191,7 @@ function collectFormResponses() {
       nextIndex++;
     }
 
-    respWriteOutputSheet(ss, outputHeader, rowsByStore);
+    respWriteOutputSheet(ss, outputHeader, rowsByStore, mailedByStore);
 
     if (nextIndex < forms.length) {
       props.setProperty(RESP_CURSOR_PROPERTY, String(nextIndex));
@@ -322,7 +354,7 @@ function respLoadExistingRows(ss, outputHeader, quiet) {
   return rowsByStore;
 }
 
-function respWriteOutputSheet(ss, outputHeader, rowsByStore) {
+function respWriteOutputSheet(ss, outputHeader, rowsByStore, mailedByStore) {
   let sheet = ss.getSheetByName(RESP_OUTPUT_SHEET_NAME);
   if (!sheet) {
     sheet = ss.insertSheet(RESP_OUTPUT_SHEET_NAME);
@@ -336,6 +368,7 @@ function respWriteOutputSheet(ss, outputHeader, rowsByStore) {
     const base = rowsByStore[store].slice(0, baseLength);
     const kept = current[store] ? current[store].slice(baseLength + 1) : [];
     const keep = RESP_KEEP_HEADERS.map((_, i) => kept[i] || "");
+    if (mailedByStore && mailedByStore[store]) keep[RESP_KEEP_HEADERS.indexOf(RESP_HEADER_MAILED)] = mailedByStore[store];
     const requestedAt = keep[1];
     const answeredAt = base[1];
     const afterRequest = requestedAt && answeredAt > requestedAt ? "あり" : "";
@@ -423,6 +456,127 @@ function respApplyRequestedStatus(ss, forms) {
   sheet.getRange(2, colRequestedAt + 1, autoColumns.length, 2).setValues(autoColumns);
 
   console.log(`受付を止めたフォーム: ${closedCount} 件、再開したフォーム: ${reopenedCount} 件、失敗: ${errorCount} 件`);
+}
+
+// 控えメールの設定を読む。modeが on / test 以外のときは送らない
+function respGetMailSettings() {
+  const props = PropertiesService.getScriptProperties();
+  const rawMode = String(props.getProperty(RESP_MAIL_MODE_PROPERTY) || "off").trim().toLowerCase();
+  const testTo = String(props.getProperty(RESP_MAIL_TEST_TO_PROPERTY) || "").trim();
+  const bcc = String(props.getProperty(RESP_MAIL_BCC_PROPERTY) || "").trim();
+
+  let mode = rawMode === "on" || rawMode === "test" ? rawMode : "off";
+  if (mode === "test" && !testTo) {
+    console.warn(`${RESP_MAIL_MODE_PROPERTY} が test ですが、${RESP_MAIL_TEST_TO_PROPERTY} が未設定のため、控えメールは送りません。`);
+    mode = "off";
+  }
+  return { mode: mode, testTo: testTo, bcc: bcc };
+}
+
+// 回答1件につき、控えメールを1回だけ送る。送った（または送れなかった）印の文字列を返す。何もしなかったときは空文字
+//   印: 回答日時のみ=お客様に送信済 / 「テスト:」+回答日時=テスト送信済 / 「失敗:」+回答日時=送信を試みて失敗（自動では再送しない）
+function respSendReceiptIfNeeded(form, rows, dateHeaders, previousMailed, mail) {
+  if (mail.mode === "off") return "";
+
+  const answeredAt = rows[0][1];
+  const sentMark = answeredAt;
+  const testMark = "テスト:" + answeredAt;
+  const failMark = "失敗:" + answeredAt;
+
+  if (previousMailed === sentMark || previousMailed === failMark) return "";
+  if (mail.mode === "test" && previousMailed === testMark) return "";
+
+  const customerEmail = String((form.stores[0] || {}).email || "").trim();
+  const to = mail.mode === "test" ? mail.testTo : customerEmail;
+  if (!/^[^@\s,]+@[^@\s,]+\.[^@\s,]+$/.test(to)) {
+    console.error(`控えメールの宛先が正しくありません: ${form.formId} / ${to}`);
+    return mail.mode === "test" ? "" : failMark;
+  }
+
+  const recipientCount = 1 + (mail.mode === "on" && mail.bcc ? 1 : 0);
+  if (MailApp.getRemainingDailyQuota() < recipientCount) {
+    console.warn("メールの1日の送信上限に達したため、控えメールの送信を見送りました。次の集計で送ります。");
+    return "";
+  }
+
+  const message = respBuildReceiptMail(rows, dateHeaders);
+  const subjectPrefix = mail.mode === "test" ? "【テスト】" : "";
+  const bodyPrefix = mail.mode === "test" ? `（テスト送信です。本来の宛先: ${customerEmail}）\n\n` : "";
+  const options = { to: to, subject: subjectPrefix + message.subject, body: bodyPrefix + message.body, name: RESP_MAIL_SENDER_NAME };
+  if (mail.mode === "on" && mail.bcc) options.bcc = mail.bcc;
+
+  try {
+    MailApp.sendEmail(options);
+    return mail.mode === "test" ? testMark : sentMark;
+  } catch (e) {
+    console.error(`控えメールを送れませんでした: ${form.formId} / ${e}`);
+    return mail.mode === "test" ? "" : failMark;
+  }
+}
+
+// 1つのフォームの回答（店舗ごとの行）から、控えメールの件名と本文を作る
+function respBuildReceiptMail(rows, dateHeaders) {
+  const D = dateHeaders.length;
+  const first = rows[0];
+  const answeredAt = first[1];
+  const contactName = first[3 + D];
+  const phone = first[4 + D];
+  const comment = first[5 + D];
+  const responseCount = Number(first[8 + D]) || 1;
+
+  const lines = [];
+  lines.push(`${contactName || "ご担当者"} 様`, "");
+  lines.push("このたびは「年末年始廃棄物回収に関するアンケート」にご回答いただき、ありがとうございました。");
+  lines.push("下記の内容で承りました。ご確認ください。", "");
+  lines.push(`■回答日時：${answeredAt}`);
+  lines.push(`■特別回収期間：${RESP_MAIL_PERIOD_TEXT}`);
+  lines.push(`■ご担当者様：${contactName}`);
+  lines.push(`■お電話番号：${phone}`, "");
+  lines.push("【店舗ごとのご回答】");
+
+  rows.forEach(row => {
+    lines.push(`▼${row[0]}`);
+    const want = row[2];
+    if (want === RESP_ANSWER_YES) {
+      lines.push("  特別回収：希望する");
+      dateHeaders.forEach((header, i) => {
+        const cell = row[3 + i];
+        if (cell === "○") lines.push(`    ${header}：希望する`);
+        else if (cell === "×") lines.push(`    ${header}：希望しない`);
+      });
+    } else if (want === RESP_ANSWER_NO) {
+      lines.push("  特別回収：希望しない（すべての日程において回収を希望しない）");
+    } else {
+      lines.push(`  特別回収：${want}`);
+    }
+  });
+
+  if (comment) lines.push("", `■ご不明点・ご要望：${comment}`);
+  lines.push("");
+  lines.push("※本メールは、ご回答内容の控えとしてお送りしています。");
+  lines.push(RESP_MAIL_CONTACT
+    ? `※回答内容の変更をご希望の場合は、${RESP_MAIL_CONTACT}までご連絡ください。`
+    : "※回答内容の変更をご希望の場合は、お手数ですが当社までご連絡ください。");
+  lines.push("", RESP_MAIL_SENDER_NAME);
+
+  const subject = responseCount > 1 ? RESP_MAIL_SUBJECT.replace("の控え", "の控え（再回答）") : RESP_MAIL_SUBJECT;
+  return { subject: subject, body: lines.join("\n") };
+}
+
+// 控えメールの文面を確かめるため、サンプルのメールを RESP_MAIL_TEST_TO に送る（お客様には送らない）
+function sendSampleReceiptMail() {
+  const testTo = String(PropertiesService.getScriptProperties().getProperty(RESP_MAIL_TEST_TO_PROPERTY) || "").trim();
+  if (!testTo) {
+    throw new Error(`スクリプトプロパティ ${RESP_MAIL_TEST_TO_PROPERTY} にテスト用のメールアドレスを設定してください。`);
+  }
+  const dateHeaders = ["12月30日(水)", "12月31日(木)", "1月2日(土)", "1月3日(日)"];
+  const rows = [
+    ["サンプル店A", "2026/11/01 10:00:00", RESP_ANSWER_YES, "○", "×", "", "○", "山田 太郎", "03-0000-0000", "朝に来ますか？", "sample@example.com", "FORMID", 1, ""],
+    ["サンプル店B", "2026/11/01 10:00:00", RESP_ANSWER_NO, "×", "×", "", "", "山田 太郎", "03-0000-0000", "朝に来ますか？", "sample@example.com", "FORMID", 1, ""]
+  ];
+  const message = respBuildReceiptMail(rows, dateHeaders);
+  MailApp.sendEmail({ to: testTo, subject: "【テスト】" + message.subject, body: "（サンプルです。実際の回答ではありません）\n\n" + message.body, name: RESP_MAIL_SENDER_NAME });
+  console.log(`サンプルのメールを ${testTo} に送りました。`);
 }
 
 // kintoneリスト作成.js があれば、集計が一巡したときに「契約状況一覧」の回答状況を最新にする
