@@ -1,0 +1,2571 @@
+年末年始アンケート自動化システム ソースコード一式（Google Apps Script）
+各ファイルの先頭に、ファイル名と、役割を書いています。Apps Script 上のファイル名は、拡張子 .gs です。
+APIトークンなどの秘密の値は、コードに含まれていません（スクリプトプロパティに保存）。
+作成時点: 2026年10月12日
+
+
+
+================================================================
+ファイル名: リスト作成.gs
+役割: kintoneから契約中を取得し、リスト・要確認・契約状況一覧を作る
+================================================================
+
+// ===== kintone契約管理 → フォーム作成用リストの作成 =====
+// kintoneの契約管理アプリから「契約中」の契約を取得し、次のシートを作る。フォームは作らない（メールも送らない）。
+//   ・リスト_kintone … フォーム作成用（フォーム作成側の「リスト」と同じ形。R列は店舗の住所）
+//   ・要確認       … フォームを作れない契約と、その理由
+//   ・契約状況一覧 … 人が見る管理用。契約中の全件について、フォーム作成の状況を一覧にする
+//
+// 使い方:
+//   1. dumpKeiyakuFields を実行して項目名とフィールドコードの対応を確認（初回のみ）
+//   2. buildListFromKintone を実行 → 上の3つのシートができる
+//   3. 内容を確認してから、フォーム作成側の「リスト」と差し替える
+//   4. 状況を最新にしたいときは updateContractStatusList を実行（「契約状況一覧」だけを更新する）
+//
+// 必要なスクリプトプロパティ（コード.js と同じ名前）:
+//   KINTONE_SUBDOMAIN / KINTONE_KEIYAKU_APP_ID / KINTONE_KEIYAKU_API_TOKEN
+//   ※ APIトークンには「レコード閲覧」と、項目名の取得用に「アプリ管理」の権限が必要。
+//     「アプリ管理」を付けない場合は、スクリプトプロパティ KLIST_FIELD_CODES に
+//     {"契約種別":"フィールドコード", ...} のJSONで項目名→コードを登録する。
+//
+// スプレッドシートの指定:
+//   スクリプトプロパティ FORM_SPREADSHEET_URL があればそのスプレッドシートを使う。
+//   無ければスクリプトが紐づいているスプレッドシート（コンテナバインド時）を使う。
+// このファイルだけで動く（フォーム作成.js が無くても実行できる）。
+
+const KLIST_SOURCE_SHEET_NAME = "リスト";       // 作成済みフォームの状況を引き継ぐ元
+const KLIST_STATUS_SENT = "送信済";
+const KLIST_OUTPUT_SHEET_NAME = "リスト_kintone";
+const KLIST_REVIEW_SHEET_NAME = "要確認";
+const KLIST_STATUS_SHEET_NAME = "契約状況一覧";
+const KLIST_RESPONSE_SHEET_NAME = "回答集計";   // 回答集計.js が作る。回答状況の表示に使う
+const KLIST_STATUS_ERROR = "エラー";
+const KLIST_TARGET_CONTRACT_TYPE = "契約中";
+
+// 特別回収期間（2026年12月30日(水)〜2027年1月3日(日)）の日付と、回収不可の日
+const KLIST_DATES = [
+  [2026, 12, 30], [2026, 12, 31], [2027, 1, 1], [2027, 1, 2], [2027, 1, 3]
+];
+const KLIST_NO_COLLECTION_DATES = ["2027-1-1"];
+// フォーム作成用リストの日付の列数（D〜H列の5列）。フォーム作成.js・回答集計.js の列の位置と合わせてある。
+// 期間の日数を変えるときは、そちらの列の位置も直すこと
+const KLIST_DATE_SLOTS = 5;
+
+const KLIST_WEEKDAYS = "日月火水木金土"; // Date#getDay() の順
+
+const KLIST_LABELS = {
+  contractType: "契約種別",
+  storeName: "契約店舗名称",
+  customer: "顧客名称",
+  vendor: "収集業者：名称"
+};
+// 送信先アドレスの項目。上にあるものほど優先する（フォームの送信先は、最初に見つかった正しいアドレス）
+// 項目名が実際と違うと見つからないので、dumpKeiyakuFields で確認する。見つからない項目は飛ばす（最低1つは必要）
+const KLIST_EMAIL_LABELS = [
+  "年末年始　回答アドレス①",
+  "年末年始　回答アドレス②",
+  "案内等送付先メールアドレス:(to)",
+  "送付先別：e-mail",
+  "契約時の顧客担当：メールアドレス"
+];
+// 項目名が長い・変わりやすいなどで、名前では見つけられない項目は、フィールドコードで指定する（項目名 → フィールドコード）。
+// 「送付先別：e-mail」の本当の項目名は「送付先別：e-mail　※アドレスをここに複数入力しない！」と注意書きが付いている
+const KLIST_EMAIL_CODES = {
+  "送付先別：e-mail": "送付先別mail1"
+};
+// 店舗の住所（契約の住所）。フォームの各店舗のページと、控えメールに載せる。フィールドコードで指定する
+// （顧客住所は契約者の住所、送付先別は請求書などの送付先なので、使わない）
+const KLIST_ADDRESS_CODES = {
+  postal: "契約郵便番号",
+  address: "契約住所連結",
+  prefecture: "契約都道府県",
+  city: "契約市区町村",
+  building: "契約ビル名ほか"
+};
+// 可燃の回収曜日は、チェックボックス1項目（選択肢が曜日）に入っている
+const KLIST_BURNABLE_LABEL = "可燃収集日";
+
+const KLIST_EMAIL_PATTERN = /^[a-z0-9._%+\-]+@[a-z0-9\-]+(\.[a-z0-9\-]+)+$/;
+// 送信先に使わないアドレス（ダミーなど）。形式が正しくても、ここに当てはまるものは使わず、次の優先順位のアドレスを見る
+const KLIST_EXCLUDED_EMAIL_PATTERNS = [/^dummy/];
+
+// 項目名を比較用にそろえる（全角半角・空白の違いを無視）
+function klistNormalizeLabel(label) {
+  return String(label).normalize("NFKC").replace(/\s/g, "");
+}
+
+function klistGetSpreadsheet() {
+  const url = PropertiesService.getScriptProperties().getProperty("FORM_SPREADSHEET_URL");
+  if (url) {
+    return SpreadsheetApp.openByUrl(url);
+  }
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) {
+    throw new Error("スクリプトプロパティ FORM_SPREADSHEET_URL を設定してください。");
+  }
+  return ss;
+}
+
+function klistGetKintoneConfig() {
+  const props = PropertiesService.getScriptProperties();
+  const config = {
+    subdomain: props.getProperty("KINTONE_SUBDOMAIN"),
+    appId: props.getProperty("KINTONE_KEIYAKU_APP_ID"),
+    apiToken: props.getProperty("KINTONE_KEIYAKU_API_TOKEN")
+  };
+  const missing = Object.keys(config).filter(key => !config[key]);
+  if (missing.length > 0) {
+    throw new Error("スクリプトプロパティが未設定です: KINTONE_SUBDOMAIN / KINTONE_KEIYAKU_APP_ID / KINTONE_KEIYAKU_API_TOKEN");
+  }
+  return config;
+}
+
+function klistFetchJson(url, apiToken) {
+  const response = UrlFetchApp.fetch(url, {
+    method: "get",
+    headers: { "X-Cybozu-API-Token": apiToken },
+    muteHttpExceptions: true
+  });
+  if (response.getResponseCode() !== 200) {
+    throw new Error(`kintone取得失敗 (HTTP ${response.getResponseCode()})`);
+  }
+  return JSON.parse(response.getContentText());
+}
+
+// 項目の一覧（フィールドコード・項目名・種類）を取得する
+function klistFetchFields(config) {
+  const url = `https://${config.subdomain}.cybozu.com/k/v1/app/form/fields.json?app=${config.appId}`;
+  const properties = klistFetchJson(url, config.apiToken).properties || {};
+  return Object.keys(properties).map(code => ({
+    code: code,
+    label: properties[code].label,
+    type: properties[code].type,
+    options: properties[code].options ? Object.keys(properties[code].options) : []
+  }));
+}
+
+// 項目名（正規化済み）→ フィールドコード の対応表を作る。登録済みの対応（スクリプトプロパティ）が優先
+function klistResolveFieldCodes(config) {
+  const labelToCode = {};
+
+  try {
+    klistFetchFields(config).forEach(field => {
+      const key = klistNormalizeLabel(field.label);
+      if (!(key in labelToCode)) labelToCode[key] = field.code;
+    });
+  } catch (e) {
+    console.warn(`項目名の取得に失敗しました（スクリプトプロパティ KLIST_FIELD_CODES を使います）: ${e}`);
+  }
+
+  const override = PropertiesService.getScriptProperties().getProperty("KLIST_FIELD_CODES");
+  if (override) {
+    const parsed = JSON.parse(override);
+    Object.keys(parsed).forEach(label => {
+      labelToCode[klistNormalizeLabel(label)] = parsed[label];
+    });
+  }
+
+  const requiredLabels = Object.keys(KLIST_LABELS).map(key => KLIST_LABELS[key]);
+  requiredLabels.push(KLIST_BURNABLE_LABEL);
+
+  const emailCodes = [];
+  KLIST_EMAIL_LABELS.forEach(label => {
+    const code = KLIST_EMAIL_CODES[label] || labelToCode[klistNormalizeLabel(label)];
+    if (code) emailCodes.push({ label: label, code: code });
+    else console.warn(`アドレスの項目「${label}」が見つかりません。この項目は使わずに進めます。`);
+  });
+  if (emailCodes.length === 0) {
+    throw new Error("アドレスの項目が1つも見つかりません。dumpKeiyakuFields で項目名を確認してください。");
+  }
+
+  const missing = requiredLabels.filter(label => !(klistNormalizeLabel(label) in labelToCode));
+  if (missing.length > 0) {
+    throw new Error(`次の項目のフィールドコードが分かりません: ${missing.join(" / ")}\n` +
+      "dumpKeiyakuFields で項目名を確認するか、KLIST_FIELD_CODES に登録してください。");
+  }
+
+  const codeOf = label => labelToCode[klistNormalizeLabel(label)];
+  return {
+    contractType: codeOf(KLIST_LABELS.contractType),
+    storeName: codeOf(KLIST_LABELS.storeName),
+    customer: codeOf(KLIST_LABELS.customer),
+    vendor: codeOf(KLIST_LABELS.vendor),
+    emails: emailCodes,
+    burnable: codeOf(KLIST_BURNABLE_LABEL)
+  };
+}
+
+// 必要な項目だけを、$idベースのページングで全件取得する
+function klistFetchRecords(config, fieldCodes) {
+  const wanted = ["$id"].concat(
+    [fieldCodes.contractType, fieldCodes.storeName, fieldCodes.customer, fieldCodes.vendor, fieldCodes.burnable]
+      .concat(fieldCodes.emails.map(e => e.code))
+      .concat(Object.keys(KLIST_ADDRESS_CODES).map(key => KLIST_ADDRESS_CODES[key]))
+  );
+  const fieldsParam = wanted.map((code, i) => `fields%5B${i}%5D=${encodeURIComponent(code)}`).join("&");
+
+  const limit = 500;
+  let lastId = 0;
+  let allRecords = [];
+
+  while (true) {
+    const query = encodeURIComponent(`$id > ${lastId} order by $id asc limit ${limit}`);
+    const url = `https://${config.subdomain}.cybozu.com/k/v1/records.json?app=${config.appId}&query=${query}&${fieldsParam}`;
+    const records = klistFetchJson(url, config.apiToken).records || [];
+    if (records.length === 0) break;
+
+    allRecords = allRecords.concat(records);
+    lastId = Number(records[records.length - 1].$id.value);
+    if (records.length < limit) break;
+  }
+  return allRecords;
+}
+
+// レコードの項目値を文字列で取り出す（チェックボックス等の配列は「,」でつなぐ）
+function klistValue(record, code) {
+  const field = record[code];
+  if (!field || field.value === null || field.value === undefined) return "";
+  const value = field.value;
+  if (Array.isArray(value)) {
+    return value.map(v => (typeof v === "object" ? (v.name || v.code || "") : String(v))).join(",");
+  }
+  return String(value);
+}
+
+// 可燃収集日（チェックボックス）で選ばれている選択肢の一覧を返す
+function klistSelectedOptions(record, code) {
+  const field = record[code];
+  if (!field || field.value === null || field.value === undefined || field.value === "") return [];
+  return Array.isArray(field.value) ? field.value.map(String) : [String(field.value)];
+}
+
+// 選択肢が曜日（「月」「月曜」「月曜日」など）なら、日〜土の順の true/false にする
+function klistWeekdayFlags(selectedOptions) {
+  const initials = selectedOptions.map(option => klistNormalizeLabel(option).charAt(0));
+  return KLIST_WEEKDAYS.split("").map(weekday => initials.indexOf(weekday) !== -1);
+}
+
+// 優先順位に並べた各項目から、メールアドレスを集める。
+// 1つの項目に複数のアドレスが入っていても、「,」「;」「、」・空白・改行で分けて取り出す。
+// 送信先（email）は、最初に見つかった正しいアドレス。同じアドレスは1回だけ数える。
+//   sources: [{label, raw}] 優先順位順
+function klistPickEmail(sources) {
+  const valid = [];     // {email, label}
+  const invalid = [];   // 形式が正しくなかったもの
+  sources.forEach(source => {
+    const text = String(source.raw).normalize("NFKC").toLowerCase();
+    text.split(/[,;、，；\s]+/).filter(Boolean).forEach(rawCandidate => {
+      const candidate = rawCandidate.replace(/^mailto:/, "");   // 「mailto:」が付いて入力されているものは外す
+      if (KLIST_EXCLUDED_EMAIL_PATTERNS.some(pattern => pattern.test(candidate))) {
+        invalid.push(`${source.label}: ${candidate}（ダミーなど、使わないアドレス）`);
+      } else if (KLIST_EMAIL_PATTERN.test(candidate)) {
+        if (!valid.some(v => v.email === candidate)) valid.push({ email: candidate, label: source.label });
+      } else {
+        invalid.push(`${source.label}: ${candidate}`);
+      }
+    });
+  });
+
+  if (valid.length === 0) {
+    return invalid.length > 0
+      ? { reason: "使えるメールアドレスがありません（形式が正しくない、またはダミー）", raw: invalid.join(" / ") }
+      : { reason: "送信先アドレスがありません", raw: "" };
+  }
+  return {
+    email: valid[0].email,
+    usedLabel: valid[0].label,
+    others: valid.slice(1).map(v => `${v.email}（${v.label}）`).join(" / "),
+    invalid: invalid.join(" / ")
+  };
+}
+
+// 店舗の住所を、「〒郵便番号 住所」の形にする。「住所連結」が空なら、都道府県・市区町村・ビル名ほかをつなぐ
+function klistBuildAddress(record) {
+  const get = key => klistValue(record, KLIST_ADDRESS_CODES[key]).normalize("NFKC").trim();
+  const postal = get("postal");
+  let address = get("address");
+  if (!address) address = [get("prefecture"), get("city"), get("building")].filter(Boolean).join("");
+  if (!address) return "";
+  const postalDigits = postal.replace(/\D/g, "");
+  const alreadyHasPostal = postalDigits && address.replace(/\D/g, "").indexOf(postalDigits) === 0;
+  return postal && !alreadyHasPostal ? `〒${postal} ${address}` : address;
+}
+
+// 期間中の各日について、見出しと「回収できる曜日か」を作る
+function klistBuildDates() {
+  return KLIST_DATES.map(([y, m, d]) => {
+    const weekdayIndex = new Date(y, m - 1, d).getDay();
+    return {
+      header: `${m}月${d}日(${KLIST_WEEKDAYS[weekdayIndex]})`,
+      weekdayIndex: weekdayIndex,
+      collectable: KLIST_NO_COLLECTION_DATES.indexOf(`${y}-${m}-${d}`) === -1
+    };
+  });
+}
+
+// 既存の「リスト」の状況を読む。「送信済」の店舗はURL・ID・状況を引き継ぎ（作成済みフォームを作り直さないため）、
+// 「エラー」の店舗は一覧に表示するために控えておく
+function klistLoadSourceStatus(ss) {
+  const sentByStore = {};
+  const errorStores = new Set();
+  const sheet = ss.getSheetByName(KLIST_SOURCE_SHEET_NAME);
+  if (!sheet) return { sentByStore: sentByStore, errorStores: errorStores };
+
+  const data = sheet.getDataRange().getDisplayValues();
+  // フォームURL・フォームID・フォーム作成状況の列は、見出しから探す（見つからなければ I, J, K列）
+  const urlCol = data[0].indexOf("フォームURL") >= 0 ? data[0].indexOf("フォームURL") : 8;
+  const idCol = urlCol + 1;
+  const statusCol = urlCol + 2;
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    if (row[statusCol] === KLIST_STATUS_SENT) {
+      sentByStore[row[0]] = [row[urlCol], row[idCol], row[statusCol]];
+    } else if (row[statusCol] === KLIST_STATUS_ERROR) {
+      errorStores.add(row[0]);
+    }
+  }
+  return { sentByStore: sentByStore, errorStores: errorStores };
+}
+
+// 「回答集計」シートから、回答のある店舗と回答日時を読む（シートが無ければ空）
+function klistLoadResponseTimes(ss) {
+  const answeredAtByStore = {};
+  const sheet = ss.getSheetByName(KLIST_RESPONSE_SHEET_NAME);
+  if (!sheet || sheet.getLastRow() < 2) return answeredAtByStore;
+
+  const values = sheet.getDataRange().getDisplayValues();
+  for (let i = 1; i < values.length; i++) {
+    answeredAtByStore[values[i][0]] = values[i][1]; // A列: 店舗名, B列: 回答日時
+  }
+  return answeredAtByStore;
+}
+
+function klistWriteSheet(ss, sheetName, header, rows) {
+  let sheet = ss.getSheetByName(sheetName);
+  if (!sheet) {
+    sheet = ss.insertSheet(sheetName);
+  }
+  sheet.clear();
+  const values = [header].concat(rows);
+  sheet.getRange(1, 1, values.length, header.length).setValues(values);
+}
+
+// kintoneから契約中の契約を取得し、フォーム作成用リスト・要確認・契約状況一覧の中身を作る（シートには書かない）
+function klistCollect(ss) {
+  const config = klistGetKintoneConfig();
+  const fieldCodes = klistResolveFieldCodes(config);
+  const records = klistFetchRecords(config, fieldCodes);
+
+  const dates = klistBuildDates();
+  const source = klistLoadSourceStatus(ss);
+  const answeredAtByStore = klistLoadResponseTimes(ss);
+
+  const listRows = [];
+  const reviewRows = [];
+  const statusRows = [];
+  let targetCount = 0;
+  let carriedCount = 0;
+  const seenBurnableOptions = new Set();
+  let recognizedWeekdayCount = 0;
+
+  records.forEach(record => {
+    if (klistValue(record, fieldCodes.contractType) !== KLIST_TARGET_CONTRACT_TYPE) return;
+    targetCount++;
+
+    const recordId = record.$id.value;
+    const storeName = klistValue(record, fieldCodes.storeName);
+    const customer = klistValue(record, fieldCodes.customer);
+    const vendor = klistValue(record, fieldCodes.vendor);
+    const recordUrl = `https://${config.subdomain}.cybozu.com/k/${config.appId}/show#record=${recordId}`;
+
+    // 管理用の一覧に1行追加する。状況: フォーム作成済 / 未作成 / エラー / 要確認
+    // フォーム作成済の店舗だけ、回答状況（回答済 / 未回答）と回答日時も入れる
+    const addStatus = (status, email, reason, pickedInfo) => {
+      const answeredAt = answeredAtByStore[storeName];
+      const answerState = status === "フォーム作成済" ? (answeredAt ? "回答済" : "未回答") : "";
+      statusRows.push([storeName, customer, recordUrl, status, email || "", reason || "",
+        answerState, answeredAt || "",
+        pickedInfo ? pickedInfo.usedLabel : "", pickedInfo ? pickedInfo.others : "", pickedInfo ? pickedInfo.invalid : ""]);
+    };
+    const addReview = (reason, raw, pickedInfo) => {
+      reviewRows.push([recordId, storeName, reason, raw || ""]);
+      addStatus("要確認", pickedInfo && pickedInfo.email, reason, pickedInfo);
+    };
+
+    const emailSources = fieldCodes.emails.map(e => ({ label: e.label, raw: klistValue(record, e.code) }));
+    const picked = klistPickEmail(emailSources);
+    // 各アドレス項目に入っている内容をそのまま並べる（L〜P列。「メール送信用」シートに使う。Q列は契約者）。見つからない項目の列は空
+    const rawEmails = KLIST_EMAIL_LABELS.map(label => {
+      const found = emailSources.filter(e => e.label === label)[0];
+      return found ? found.raw : "";
+    });
+    if (picked.reason) {
+      addReview(picked.reason, picked.raw);
+      return;
+    }
+
+    const selectedOptions = klistSelectedOptions(record, fieldCodes.burnable);
+    selectedOptions.forEach(option => seenBurnableOptions.add(option));
+    const burnableOn = klistWeekdayFlags(selectedOptions); // 日〜土の順
+    if (burnableOn.some(Boolean)) recognizedWeekdayCount++;
+    if (!burnableOn.some(Boolean)) {
+      addReview("可燃の回収曜日が登録されていません", "", picked);
+      return;
+    }
+
+    const marks = dates.map(date => (date.collectable && burnableOn[date.weekdayIndex] ? "○" : ""));
+    if (!marks.some(mark => mark === "○")) {
+      addReview("期間中に回収できる日がありません（回収曜日が期間外の曜日のみ、など）", "", picked);
+      return;
+    }
+    while (marks.length < KLIST_DATE_SLOTS) marks.push(""); // 列 D〜H の5列に合わせる
+
+    const carried = source.sentByStore[storeName] || ["", "", ""];
+    if (carried[2]) {
+      carriedCount++;
+      addStatus("フォーム作成済", picked.email, "", picked);
+    } else if (source.errorStores.has(storeName)) {
+      addStatus(KLIST_STATUS_ERROR, picked.email, "フォーム作成でエラーになりました", picked);
+    } else {
+      addStatus("未作成", picked.email, "", picked);
+    }
+    listRows.push([storeName, picked.email, vendor].concat(marks, carried, rawEmails, [customer, klistBuildAddress(record)])); // Q列: 契約者（顧客名称）、R列: 店舗の住所
+  });
+
+  // 全件で曜日が読み取れなかった場合は、選択肢の名前が想定と違うので、シートを作らずに止める
+  if (targetCount > 0 && recognizedWeekdayCount === 0) {
+    throw new Error(`「${KLIST_BURNABLE_LABEL}」の選択肢を曜日として読み取れませんでした。選択肢: ${Array.from(seenBurnableOptions).join(" / ") || "（なし）"}`);
+  }
+
+  // 同じアドレス・同じ契約者の店舗が並ぶように（フォームは、アドレスと契約者の組ごとに作る）
+  listRows.sort((a, b) => (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : (a[16] < b[16] ? -1 : a[16] > b[16] ? 1 : 0)));
+
+  return {
+    dates: dates,
+    listRows: listRows,
+    reviewRows: reviewRows,
+    statusRows: statusRows,
+    targetCount: targetCount,
+    carriedCount: carriedCount
+  };
+}
+
+function klistWriteStatusSheet(ss, statusRows) {
+  klistWriteSheet(ss, KLIST_STATUS_SHEET_NAME,
+    ["店舗名", "契約者", "契約管理URL", "状況", "送信先アドレス", "理由", "回答状況", "回答日時",
+      "採用したアドレスの項目", "その他のアドレス（優先順）", "形式が正しくないもの"], statusRows);
+}
+
+function buildListFromKintone() {
+  const ss = klistGetSpreadsheet();
+  const result = klistCollect(ss);
+
+  const dateHeaders = result.dates.map(date => date.header);
+  while (dateHeaders.length < KLIST_DATE_SLOTS) dateHeaders.push("");
+  const listHeader = ["店舗名", "メールアドレス", "業者名"]
+    .concat(dateHeaders, ["フォームURL", "フォームID", "フォーム作成状況"], KLIST_EMAIL_LABELS, ["契約者", "店舗住所"]);
+  klistWriteSheet(ss, KLIST_OUTPUT_SHEET_NAME, listHeader, result.listRows);
+  klistWriteSheet(ss, KLIST_REVIEW_SHEET_NAME, ["レコード番号", "契約店舗名称", "理由", "アドレス欄の内容"], result.reviewRows);
+  klistWriteStatusSheet(ss, result.statusRows);
+
+  const emailCount = new Set(result.listRows.map(row => row[1])).size;
+  const formCount = new Set(result.listRows.map(row => row[1] + "\u0001" + row[16])).size;  // フォームは、アドレスと契約者の組ごと
+  const noAddress = result.listRows.filter(row => !row[17]).length;
+  if (noAddress > 0) console.warn(`店舗の住所が空の店舗が ${noAddress} 件あります（フォームの各店舗のページに住所が出ません）。「${KLIST_OUTPUT_SHEET_NAME}」のR列が空の行を確認してください。`);
+  console.log(
+    `契約中 ${result.targetCount} 件 → リスト ${result.listRows.length} 件（送信先アドレス ${emailCount} 件、作成するフォーム ${formCount} 件、うち作成済みを引き継ぎ ${result.carriedCount} 件）、` +
+    `要確認 ${result.reviewRows.length} 件。シート「${KLIST_OUTPUT_SHEET_NAME}」「${KLIST_REVIEW_SHEET_NAME}」「${KLIST_STATUS_SHEET_NAME}」を確認してください。`
+  );
+}
+
+// 「契約状況一覧」だけを最新にする（フォーム作成用のリストや要確認は変更しない）
+function updateContractStatusList() {
+  const ss = klistGetSpreadsheet();
+  const result = klistCollect(ss);
+  klistWriteStatusSheet(ss, result.statusRows);
+
+  const counts = {};
+  result.statusRows.forEach(row => { counts[row[3]] = (counts[row[3]] || 0) + 1; });
+  console.log(`契約状況一覧を更新しました（契約中 ${result.targetCount} 件）: ${JSON.stringify(counts)}`);
+}
+
+// 契約管理アプリの項目名とフィールドコードの対応をログに出す（個人情報は出さない）
+function dumpKeiyakuFields() {
+  const fields = klistFetchFields(klistGetKintoneConfig());
+  fields.forEach(field => {
+    const optionText = field.type === "CHECK_BOX" && field.options.length > 0 ? `\t選択肢: ${field.options.join("|")}` : "";
+    console.log(`${field.code}\t${field.label}\t${field.type}${optionText}`);
+  });
+  console.log(`項目数: ${fields.length}`);
+}
+
+
+================================================================
+ファイル名: フォーム作成.gs
+役割: Googleフォームを自動で一括作成する
+================================================================
+
+// ===== 年末年始回収アンケート フォーム一括作成 =====
+// 「リスト」シートの未送信行を、メールアドレスと契約者（Q列）の組ごとにまとめてフォームを作成する。
+// 同じメールアドレスに複数の契約者（会社）がある場合は、会社ごとに別のフォームを作る。
+// 1回の実行は FORM_TIME_LIMIT_MS で打ち切り、残りがあれば時間主導トリガーで自動的に続きを実行する。
+//
+// 使い方:
+//   1. startFormCreation を1回だけ手動実行（以降は全件完了まで自動で続行）
+//   2. 途中で止めたい場合は stopFormCreation を実行
+//
+// スプレッドシートの指定:
+//   スクリプトプロパティ FORM_SPREADSHEET_URL があればそのスプレッドシートを使う。
+//   無ければスクリプトが紐づいているスプレッドシート（コンテナバインド時）を使う。
+//
+// フォームの保存先フォルダ:
+//   スクリプトプロパティ FORM_FOLDER_ID にドライブのフォルダID（フォルダのURLの folders/ の後ろ）を入れると、
+//   作ったフォームをそのフォルダに移す。未設定ならマイドライブ直下に残る。
+//
+// 動作確認用:
+//   スクリプトプロパティ FORM_TEST_LIMIT に件数（例: 5）を入れると、その件数だけフォームを作って止まる（続きの自動実行もしない）。
+//   本番で全件作るときは、このプロパティを削除すること。
+
+const FORM_LIST_SHEET_NAME = "リスト";
+const FORM_SEND_SHEET_NAME = "メール送信用";
+const FORM_BATCH_HANDLER = "createFormsInBatches";
+const FORM_TIME_LIMIT_MS = 4.5 * 60 * 1000; // 1回あたりの処理時間上限（6分制限対策）
+const FORM_RETRY_DELAY_MS = 60 * 1000;      // 続きを実行するまでの待ち時間
+const FORM_SAFETY_DELAY_MS = 7 * 60 * 1000; // 実行が強制終了した場合に再開するまでの待ち時間（6分制限より長く）
+
+const FORM_STATUS_SENT = "送信済";
+const FORM_STATUS_ERROR = "エラー";
+
+// 列番号（1始まり）
+const FORM_COL_URL = 9;     // I列: フォームURL
+const FORM_COL_STATUS = 11; // K列: フォーム作成状況
+
+// 各アドレス項目の内容（0始まり、L〜P列）。「メール送信用」シートに並べる
+const FORM_COL_EMAIL_START = 11;
+const FORM_COL_EMAIL_END = 15;
+
+// 契約者（顧客名称）の列（0始まり、Q列）。フォームは、メールアドレスと契約者の組ごとに作る（同じアドレスに複数の契約者がいれば、フォームも別々）
+const FORM_COL_CUSTOMER = 16;
+
+// 店舗の住所（0始まり、R列）。各店舗のページの見出しに載せる（店名が変わっていたり、同じ屋号の店舗がある場合に、どの店舗か分かるように）
+const FORM_COL_ADDRESS = 17;
+
+// 希望日の列（0始まり、D〜H列）
+const FORM_DATE_COL_START = 3;
+const FORM_DATE_COL_END = 7;
+
+const FORM_TITLE = '【株式会社クリメン】2026年～2027年 年末年始廃棄物回収に関するアンケート';
+const FORM_PERIOD_TEXT = '2026年12月30日(水)から2027年1月3日(日)';
+
+// 回答期限（例: '2026年11月13日(金)'）。空のままなら説明文に期限の行を入れない
+const FORM_DEADLINE_TEXT = '2026年11月15日(日)';
+
+// お客様に案内する「回答内容を変更する期限」（例: '2026年11月15日(日)'）。説明文に書くだけで、受付は止めない。
+// 実際にフォームの受付を止める日時は、回答集計.js の RESP_CUTOFF_AT で決める。空のままなら、説明文に期限の文を入れない
+const FORM_CHANGE_DEADLINE_TEXT = '2026年11月15日(日)';
+
+// 回答者への質問。回答集計.js が回答を読み取る目印にもなるので、文言を変えるときは両方そろえること
+const FORM_Q_CONTACT_NAME = "ご担当者様のお名前";
+const FORM_Q_PHONE = "ご連絡可能なお電話番号";
+const FORM_Q_COMMENT = "ご不明点・ご要望（任意）";
+const FORM_Q_WANT = "特別回収期間の回収について";
+
+const FORM_CHOICE_WANT = '特別回収期間の回収を希望する（有料）';
+const FORM_CHOICE_NOT_WANT = 'すべての日程において回収を希望しない';
+
+const FORM_DEFAULT_FEE = "7,000円";
+const FORM_VENDOR_FEES = {
+  "有限会社長澤商事": "10,000円",
+  "株式会社光栄和": "20,000円",
+  "鍵本産業株式会社": "10,000円"
+};
+
+function startFormCreation() {
+  deleteFormBatchTriggers();
+  createFormsInBatches();
+}
+
+function stopFormCreation() {
+  deleteFormBatchTriggers();
+  console.log("フォーム自動作成を停止しました。");
+}
+
+function createFormsInBatches() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10 * 1000)) {
+    console.log("別の実行が処理中のためスキップしました。");
+    return;
+  }
+
+  const startTime = Date.now();
+  let formCount = 0;
+  let errorCount = 0;
+  let remaining = 0;
+
+  try {
+    deleteFormBatchTriggers();
+
+    const ss = getFormSpreadsheet();
+    const sheet = ss.getSheetByName(FORM_LIST_SHEET_NAME);
+    if (!sheet) {
+      throw new Error(`シート「${FORM_LIST_SHEET_NAME}」が見つかりません。`);
+    }
+    const data = sheet.getDataRange().getDisplayValues();
+    const headers = data[0];
+    const sendSheet = getFormSendSheet(ss, headers);
+
+    const folder = getFormFolder();
+
+    const groupedData = groupUnsentRowsByForm(data);
+    let emails = Object.keys(groupedData);
+
+    // 動作確認用: スクリプトプロパティ FORM_TEST_MULTI に on を入れると、2店舗以上のフォームだけを対象にする。本番の前に消すこと
+    if (String(PropertiesService.getScriptProperties().getProperty("FORM_TEST_MULTI") || "").trim().toLowerCase() === "on") {
+      emails = emails.filter(key => groupedData[key].stores.length >= 2);
+      console.log(`FORM_TEST_MULTI が on のため、2店舗以上のフォームだけを対象にします（${emails.length} 件）。`);
+    }
+
+    // 動作確認用: スクリプトプロパティ FORM_TEST_LIMIT に件数（例: 5）を入れると、その件数だけ作って止まる。本番の前に消すこと
+    const testLimit = Number(PropertiesService.getScriptProperties().getProperty("FORM_TEST_LIMIT") || 0);
+    if (testLimit > 0) {
+      emails = emails.slice(0, testLimit);
+      console.log(`FORM_TEST_LIMIT が設定されているため、最大 ${testLimit} 件だけ作成します。`);
+    }
+
+    // 準備が終わったら、保険の再開トリガーを予約しておく。6分制限などで強制終了しても、これで処理が再開する
+    scheduleFormBatch(FORM_SAFETY_DELAY_MS);
+
+    for (let n = 0; n < emails.length; n++) {
+      if (Date.now() - startTime > FORM_TIME_LIMIT_MS) {
+        remaining = emails.length - n;
+        break;
+      }
+
+      const group = groupedData[emails[n]];
+      const email = group.email;
+      const stores = group.stores;
+
+      try {
+        const result = createFormForStores(stores, headers, folder, group.customer);
+
+        // 1件ごとに書き込み、途中で止まっても同じフォームを二重に作らないようにする
+        stores.forEach(store => {
+          sheet.getRange(store.rowNumber, FORM_COL_URL, 1, 3)
+               .setValues([[result.formUrl, result.formId, FORM_STATUS_SENT]]);
+        });
+        // 店舗ごとに1行。各アドレス項目の内容と、フォームURL、実際にフォームの送信先にしたアドレスを並べる
+        stores.forEach(store => {
+          sendSheet.appendRow([store.storeName]
+            .concat(store.rowData.slice(FORM_COL_EMAIL_START, FORM_COL_EMAIL_END + 1), [result.formUrl, email, group.customer]));
+        });
+        SpreadsheetApp.flush();
+        formCount++;
+      } catch (e) {
+        // エラー行は対象外にして、同じ行で失敗し続けて止まらなくなるのを防ぐ
+        console.error(`フォーム作成に失敗しました: ${email} / ${e}`);
+        stores.forEach(store => {
+          sheet.getRange(store.rowNumber, FORM_COL_STATUS).setValue(FORM_STATUS_ERROR);
+        });
+        SpreadsheetApp.flush();
+        errorCount++;
+      }
+    }
+
+    deleteFormBatchTriggers();
+    if (remaining > 0) {
+      scheduleFormBatch(FORM_RETRY_DELAY_MS);
+      console.log(`今回 ${formCount} 件作成（エラー ${errorCount} 件）。残り ${remaining} 件は自動で続行します。`);
+    } else {
+      console.log(`今回 ${formCount} 件作成（エラー ${errorCount} 件）。すべて完了しました。`);
+      refreshContractStatusList();
+    }
+  } finally {
+    // ロック解除時に一時的なサーバーエラーが出ることがある。実行終了時に自動で解除されるので失敗扱いにしない
+    try {
+      lock.releaseLock();
+    } catch (e) {
+      console.warn(`ロック解除に失敗しました（処理には影響しません）: ${e}`);
+    }
+  }
+}
+
+// kintoneリスト作成.js があれば、全件完了時に「契約状況一覧」を最新にする（失敗してもフォーム作成には影響しない）
+function refreshContractStatusList() {
+  try {
+    if (typeof updateContractStatusList === "function") {
+      updateContractStatusList();
+    }
+  } catch (e) {
+    console.warn(`契約状況一覧の更新に失敗しました: ${e}`);
+  }
+}
+
+function getFormSpreadsheet() {
+  const url = PropertiesService.getScriptProperties().getProperty("FORM_SPREADSHEET_URL");
+  if (url) {
+    return SpreadsheetApp.openByUrl(url);
+  }
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) {
+    throw new Error("スクリプトプロパティ FORM_SPREADSHEET_URL を設定してください。");
+  }
+  return ss;
+}
+
+// 保存先フォルダを返す。未設定ならnull。設定されているのに開けない場合は、フォームを作る前にエラーで止める
+function getFormFolder() {
+  const folderId = PropertiesService.getScriptProperties().getProperty("FORM_FOLDER_ID");
+  if (!folderId) return null;
+  try {
+    return DriveApp.getFolderById(folderId.trim());
+  } catch (e) {
+    throw new Error("スクリプトプロパティ FORM_FOLDER_ID のフォルダを開けません。IDと共有設定を確認してください。");
+  }
+}
+
+function getFormSendSheet(ss, headers) {
+  let sendSheet = ss.getSheetByName(FORM_SEND_SHEET_NAME);
+  if (!sendSheet) {
+    sendSheet = ss.insertSheet(FORM_SEND_SHEET_NAME);
+  }
+  if (sendSheet.getLastRow() === 0) {
+    const emailHeaders = headers.slice(FORM_COL_EMAIL_START, FORM_COL_EMAIL_END + 1);
+    sendSheet.appendRow(["店名"].concat(emailHeaders, ["フォームURL", "送信先アドレス", "契約者"]));
+  }
+  return sendSheet;
+}
+
+// 未作成の店舗を、メールアドレスと契約者の組ごとにまとめる（組ごとに1つのフォーム）
+function groupUnsentRowsByForm(data) {
+  const groupedData = {};
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const email = row[1].trim();               // B列
+    const status = row[FORM_COL_STATUS - 1];   // K列
+    if (status === FORM_STATUS_SENT || status === FORM_STATUS_ERROR || !email) continue;
+
+    const customer = String(row[FORM_COL_CUSTOMER] || "").trim();
+    const key = email + "\u0001" + customer;
+    if (!groupedData[key]) {
+      groupedData[key] = { email: email, customer: customer, stores: [] };
+    }
+    groupedData[key].stores.push({
+      storeName: row[0], // A列
+      vendor: row[2],    // C列
+      rowNumber: i + 1,
+      rowData: row
+    });
+  }
+  return groupedData;
+}
+
+function createFormForStores(stores, headers, folder, customer) {
+  const storeNamesText = stores.map(store => store.storeName).join('・');
+
+  const form = FormApp.create(FORM_TITLE);
+
+  try {
+    if (folder) {
+      DriveApp.getFileById(form.getId()).moveTo(folder);
+    }
+
+    const changeDeadlineText = FORM_CHANGE_DEADLINE_TEXT ? `\n　変更のご希望は${FORM_CHANGE_DEADLINE_TEXT}までにお願いいたします。` : "";
+    const deadlineText = FORM_DEADLINE_TEXT ? `◆ご回答期限：${FORM_DEADLINE_TEXT}まで\n\n` : "";
+
+    const customerText = customer ? `【ご契約者】\n${customer}\n\n` : "";
+
+    form.setDescription(`${customerText}【対象店舗】
+${storeNamesText}
+
+特別回収期間：${FORM_PERIOD_TEXT}
+※1月1日は回収不可
+
+★特別回収料金：店舗ごとに異なります。各店舗の設問をご確認ください。
+★回収対象：可燃ごみのみ
+
+${deadlineText}◆ 次の画面で、店舗ごとに、各日の回収を「希望する」「希望しない」からお選びください。
+ ※特別回収を希望されない場合も、すべての日について「希望しない」を選択してご回答ください。
+ ※通常、伺っております可燃回収曜日に準じます。予めご了承ください。
+
+◆希望日とは回収に伺う日付です。
+ （例：12月30日営業分のゴミは、12月31日が回収日となります。）
+
+◆回答内容を変更する場合は、このフォームから再度ご回答ください（最新のご回答を有効とします）。${changeDeadlineText}`);
+
+    // 1ページ目：回答者の連絡先
+    form.addTextItem().setTitle(FORM_Q_CONTACT_NAME).setRequired(true);
+    form.addTextItem().setTitle(FORM_Q_PHONE).setRequired(true);
+    form.addParagraphTextItem().setTitle(FORM_Q_COMMENT);
+
+    // 2ページ目以降：店舗ごとに1ページ（希望しない場合も、各日に「希望しない」を選んでもらう）
+    stores.forEach((store, index) => {
+      const fee = FORM_VENDOR_FEES[store.vendor] || FORM_DEFAULT_FEE;
+
+      form.addPageBreakItem().setTitle(stores.length > 1
+        ? `希望日の選択（${index + 1}/${stores.length}店舗目）`
+        : '希望日の選択');
+
+      const address = String(store.rowData[FORM_COL_ADDRESS] || "").trim();
+      form.addSectionHeaderItem()
+          .setTitle(`【${store.storeName}】の収集希望について`)
+          .setHelpText(`ご住所：${address || "（登録がありません）"}\n特別回収料金：${fee}/1日`);
+
+      for (let col = FORM_DATE_COL_START; col <= FORM_DATE_COL_END; col++) {
+        if (store.rowData[col] === "○") {
+          form.addMultipleChoiceItem()
+              .setTitle(`【${store.storeName}】${headers[col]}の収集を希望しますか？`)
+              .setChoiceValues(['希望する', '希望しない'])
+              .setRequired(true);
+        }
+      }
+    });
+
+    return {
+      formUrl: form.getPublishedUrl(),
+      formId: form.getId(),
+      storeNamesText: storeNamesText
+    };
+  } catch (e) {
+    // 作りかけのフォームがドライブに残らないようゴミ箱へ移す
+    try {
+      DriveApp.getFileById(form.getId()).setTrashed(true);
+    } catch (trashError) {
+      console.error(`作りかけのフォームを削除できませんでした: ${form.getId()} / ${trashError}`);
+    }
+    throw e;
+  }
+}
+
+function scheduleFormBatch(delayMs) {
+  ScriptApp.newTrigger(FORM_BATCH_HANDLER).timeBased().after(delayMs).create();
+}
+
+// このフォーム作成処理用のトリガーだけを削除する（リマインド・日報などのトリガーは残す）
+function deleteFormBatchTriggers() {
+  ScriptApp.getProjectTriggers().forEach(trigger => {
+    if (trigger.getHandlerFunction() === FORM_BATCH_HANDLER) {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+}
+
+
+================================================================
+ファイル名: 案内メール送信.gs
+役割: 案内メールを1通ずつ自動送信する
+================================================================
+
+// ===== フォームの案内メールを、顧客ごとに1通ずつ送る =====
+// 「リスト」シートで作成済み（フォーム作成状況が「送信済」）のフォームごとに、案内メールを1通送る。
+// 宛先は「リスト」のB列のアドレス。同じフォームの店舗は、1通にまとめて書く。
+// 同じアドレスに複数の契約者（会社）がある場合は、会社ごとのフォームなので、同じアドレスに会社の数だけメールが届く。
+// 1回の実行は INV_TIME_LIMIT_MS で打ち切り、残りがあれば時間主導トリガーで自動的に続きを実行する。
+// 送った結果は「案内メール送信記録」シートに残り、同じフォームには二重に送らない（「リスト」を作り直しても記録は残る）。
+//
+// 送信元:
+//   スクリプトプロパティ MAIL_FROM に、会社のアドレスを入れる。
+//   そのアドレスが、実行するアカウントのGmailの「別のアドレスから送信」に登録されていること（回答の控えメールも同じアドレスから送る）。
+//   未設定なら、スクリプトを実行しているアカウントのアドレスから送る。
+//
+// 安全のしくみ（お客様に誤って送らないため）:
+//   ・スクリプトプロパティ INVITE_MODE が on のときだけ本番送信する（未設定は送らない）。
+//   ・INV_NOT_BEFORE より前は、本番送信を行わない。
+//   ・テスト送信（sendTestInvitations）は、INVITE_TEST_TO のアドレスだけに送り、記録には残さない。
+//
+// 使い方:
+//   1. スクリプトプロパティ MAIL_FROM（会社のアドレス）、INVITE_TEST_TO（テスト用の自分のアドレス）を設定
+//   2. sendTestInvitations を実行 → 先頭の数件分の案内を、テスト用のアドレスに送る（文面とURLを確認する）
+//   3. 当日、スクリプトプロパティ INVITE_MODE を on にして startInvitations を実行（終わるまで自動で続く）
+//   4. 途中で止めるときは stopInvitations
+//   5. 送れなかった行（「失敗」）は、記録シートのその行を消してから、もう一度 startInvitations を実行すると送り直す
+//
+// スプレッドシートの指定は フォーム作成.js と同じ（FORM_SPREADSHEET_URL、無ければ紐づいているスプレッドシート）。
+// このファイルだけで動く。
+
+const INV_LIST_SHEET_NAME = "リスト";
+const INV_LOG_SHEET_NAME = "案内メール送信記録";
+const INV_STATUS_SENT = "送信済";           // 「リスト」のフォーム作成状況
+const INV_MODE_PROPERTY = "INVITE_MODE";     // on のときだけ本番送信
+const INV_TEST_TO_PROPERTY = "INVITE_TEST_TO";
+const INV_FROM_PROPERTY = "MAIL_FROM";
+
+const INV_BATCH_HANDLER = "continueInvitations";
+const INV_TIME_LIMIT_MS = 4.5 * 60 * 1000;
+const INV_RETRY_DELAY_MS = 60 * 1000;          // 続きを実行するまでの待ち時間
+const INV_QUOTA_WAIT_MS = 3 * 60 * 60 * 1000;  // 1日の送信上限に達したときに、再開するまでの待ち時間
+const INV_TEST_COUNT = 3;                      // テスト送信で送る件数
+
+// この日時より前は、本番送信しない（誤って早く送らないための安全装置）
+const INV_NOT_BEFORE = "2026/10/15 09:00";
+
+// 「リスト」シートの列（0始まり）
+const INV_COL_STORE = 0;     // A列: 店舗名
+const INV_COL_EMAIL = 1;     // B列: メールアドレス
+const INV_COL_FORM_URL = 8;  // I列: フォームURL
+const INV_COL_FORM_ID = 9;   // J列: フォームID
+const INV_COL_STATUS = 10;   // K列: フォーム作成状況
+const INV_COL_CUSTOMER = 16; // Q列: 契約者（顧客名称）
+
+// 案内メールの文面
+const INV_SENDER_NAME = "株式会社クリメン";
+const INV_SUBJECT = "【株式会社クリメン】年末年始（12/30〜1/3）廃棄物回収のご希望に関するアンケートのお願い【11/15までにご回答ください】";
+const INV_PERIOD_TEXT = "2026年12月30日(水)から2027年1月3日(日)";
+const INV_DEADLINE_TEXT = "2026年11月15日(日)";   // フォーム作成.js の FORM_DEADLINE_TEXT と同じにしておく
+const INV_CONTACT = "";                           // 問い合わせ先（電話番号・メールなど）。空のままなら案内の行を入れない
+const INV_REPLY_TO = "";                          // 返信先のアドレス。空のままなら、送信元に返信される
+
+const INV_LOG_HEADER = ["フォームID", "送信先", "対象店舗", "結果", "日時"];
+const INV_RESULT_SENT = "送信済";
+const INV_RESULT_FAILED = "失敗";
+
+function invGetSpreadsheet() {
+  const url = PropertiesService.getScriptProperties().getProperty("FORM_SPREADSHEET_URL");
+  if (url) {
+    return SpreadsheetApp.openByUrl(url);
+  }
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) {
+    throw new Error("スクリプトプロパティ FORM_SPREADSHEET_URL を設定してください。");
+  }
+  return ss;
+}
+
+function invFormatNow() {
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy/MM/dd HH:mm:ss");
+}
+
+// 送信元アドレスを確認する。未設定なら空文字（実行アカウントのアドレスから送る）。使えないアドレスなら、送る前にエラーで止める
+function invGetFrom() {
+  const from = String(PropertiesService.getScriptProperties().getProperty(INV_FROM_PROPERTY) || "").trim();
+  if (!from) return "";
+  const own = String(Session.getEffectiveUser().getEmail() || "").toLowerCase();
+  const aliases = GmailApp.getAliases().map(alias => String(alias).toLowerCase());
+  if (from.toLowerCase() !== own && aliases.indexOf(from.toLowerCase()) === -1) {
+    throw new Error(`${INV_FROM_PROPERTY}（${from}）は、このアカウントから送信できるアドレスではありません。` +
+      "Gmailの設定「アカウント」→「他のメールアドレスを追加」で登録してください。");
+  }
+  return from;
+}
+
+function invSend(to, subject, body, from) {
+  const options = { name: INV_SENDER_NAME };
+  if (from) options.from = from;
+  if (INV_REPLY_TO) options.replyTo = INV_REPLY_TO;
+  GmailApp.sendEmail(to, subject, body, options);
+}
+
+// 「リスト」から、作成済みフォームごとの宛先と店舗を取り出す
+function invGroupFormsFromList(data) {
+  const formsById = {};
+  const forms = [];
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const formId = row[INV_COL_FORM_ID];
+    if (!formId || row[INV_COL_STATUS] !== INV_STATUS_SENT) continue;
+
+    if (!formsById[formId]) {
+      formsById[formId] = { formId: formId, formUrl: row[INV_COL_FORM_URL], email: String(row[INV_COL_EMAIL]).trim(),
+        customer: String(row[INV_COL_CUSTOMER] || "").trim(), stores: [] };
+      forms.push(formsById[formId]);
+    }
+    formsById[formId].stores.push(row[INV_COL_STORE]);
+  }
+  return forms;
+}
+
+// 案内メールの件名と本文を作る
+function invBuildMail(form) {
+  const lines = [];
+  lines.push("ご担当者様", "");
+  lines.push("平素より大変お世話になっております。株式会社クリメンです。");
+  lines.push("年末年始の特別回収につきまして、ご希望をお伺いするアンケートをお送りします。", "");
+  if (form.customer) lines.push("【ご契約者】", form.customer, "");
+  lines.push("【対象店舗】");
+  form.stores.forEach(store => lines.push(`・${store}`));
+  lines.push("");
+  lines.push(`■特別回収期間：${INV_PERIOD_TEXT}`);
+  lines.push("　※1月1日は回収できません。");
+  lines.push("■回収対象：可燃ごみのみ");
+  lines.push("■特別回収料金：店舗ごとに異なります。アンケート内の各店舗の設問でご確認ください。", "");
+  lines.push(`■ご回答期限：${INV_DEADLINE_TEXT}まで`, "");
+  lines.push("下記のアンケートフォームから、ご回答をお願いいたします。");
+  lines.push(form.formUrl, "");
+  lines.push("【ご回答について】");
+  lines.push("・フォームの次の画面で、店舗ごとに、各日の回収を「希望する」「希望しない」からお選びください。");
+  lines.push("・特別回収を希望されない場合も、すべての日について「希望しない」を選択してご回答ください。");
+  lines.push("・通常の可燃回収曜日以外は回収できません。希望日は、回収に伺う日付でお選びください。");
+  lines.push("・ご回答のあと、回答内容の控えをこのメールアドレスにお送りします。");
+  lines.push("・回答内容を変更する場合は、同じフォームから再度ご回答ください（最新のご回答を有効とします）。");
+  lines.push(`　変更のご希望は${INV_DEADLINE_TEXT}までにお願いいたします。`, "");
+  if (INV_CONTACT) lines.push(`ご不明な点は、${INV_CONTACT}までご連絡ください。`, "");
+  lines.push("お忙しいところ恐れ入りますが、よろしくお願いいたします。", "", INV_SENDER_NAME);
+  return { subject: INV_SUBJECT, body: lines.join("\n") };
+}
+
+// テスト送信: 先頭の数件分の案内を、INVITE_TEST_TO のアドレスだけに送る（お客様には送らない。記録にも残さない）
+function sendTestInvitations() {
+  const props = PropertiesService.getScriptProperties();
+  const testTo = String(props.getProperty(INV_TEST_TO_PROPERTY) || "").trim();
+  if (!testTo) {
+    throw new Error(`スクリプトプロパティ ${INV_TEST_TO_PROPERTY} にテスト用のメールアドレスを設定してください。`);
+  }
+  const from = invGetFrom();
+  const ss = invGetSpreadsheet();
+  const listSheet = ss.getSheetByName(INV_LIST_SHEET_NAME);
+  if (!listSheet) throw new Error(`シート「${INV_LIST_SHEET_NAME}」が見つかりません。`);
+
+  const forms = invGroupFormsFromList(listSheet.getDataRange().getDisplayValues());
+  if (forms.length === 0) throw new Error("フォーム作成済みの店舗がありません。");
+
+  forms.slice(0, INV_TEST_COUNT).forEach(form => {
+    const message = invBuildMail(form);
+    invSend(testTo, "【テスト】" + message.subject,
+      `（テスト送信です。本来の宛先: ${form.email}）\n\n` + message.body, from);
+  });
+  console.log(`${Math.min(INV_TEST_COUNT, forms.length)} 通のテストメールを ${testTo} に送りました（送信元: ${from || "実行アカウント"}）。`);
+}
+
+function startInvitations() {
+  deleteInvitationTriggers();
+  runInvitationBatch();
+}
+
+function continueInvitations() {
+  runInvitationBatch();
+}
+
+function stopInvitations() {
+  deleteInvitationTriggers();
+  console.log("案内メールの自動送信を停止しました。");
+}
+
+function runInvitationBatch() {
+  const props = PropertiesService.getScriptProperties();
+  if (String(props.getProperty(INV_MODE_PROPERTY) || "").trim().toLowerCase() !== "on") {
+    console.log(`スクリプトプロパティ ${INV_MODE_PROPERTY} が on ではないため、送信しません。`);
+    return;
+  }
+  const notBefore = new Date(INV_NOT_BEFORE.replace(/-/g, "/"));
+  if (new Date() < notBefore) {
+    console.log(`${INV_NOT_BEFORE} より前なので、送信しません。`);
+    return;
+  }
+
+  const lock = LockService.getUserLock();
+  if (!lock.tryLock(10 * 1000)) {
+    console.log("別の送信が処理中のためスキップしました。");
+    return;
+  }
+
+  const startTime = Date.now();
+  let sentCount = 0;
+  let failedCount = 0;
+  let stoppedByQuota = false;
+  let remaining = 0;
+
+  try {
+    deleteInvitationTriggers();
+
+    const from = invGetFrom();
+    const ss = invGetSpreadsheet();
+    const listSheet = ss.getSheetByName(INV_LIST_SHEET_NAME);
+    if (!listSheet) throw new Error(`シート「${INV_LIST_SHEET_NAME}」が見つかりません。`);
+    const forms = invGroupFormsFromList(listSheet.getDataRange().getDisplayValues());
+
+    let logSheet = ss.getSheetByName(INV_LOG_SHEET_NAME);
+    if (!logSheet) {
+      logSheet = ss.insertSheet(INV_LOG_SHEET_NAME);
+      logSheet.appendRow(INV_LOG_HEADER);
+    }
+    const logged = new Set();
+    if (logSheet.getLastRow() > 1) {
+      logSheet.getRange(2, 1, logSheet.getLastRow() - 1, 1).getDisplayValues().forEach(row => logged.add(row[0]));
+    }
+
+    const targets = forms.filter(form => !logged.has(form.formId));
+
+    for (let n = 0; n < targets.length; n++) {
+      if (Date.now() - startTime > INV_TIME_LIMIT_MS) {
+        remaining = targets.length - n;
+        break;
+      }
+      if (MailApp.getRemainingDailyQuota() < 1) {
+        stoppedByQuota = true;
+        remaining = targets.length - n;
+        break;
+      }
+
+      const form = targets[n];
+      const storeNames = form.stores.join("・");
+      let result = INV_RESULT_SENT;
+      if (!/^[^@\s,]+@[^@\s,]+\.[^@\s,]+$/.test(form.email)) {
+        console.error(`宛先が正しくありません: ${form.formId} / ${form.email}`);
+        result = INV_RESULT_FAILED;
+      } else {
+        try {
+          const message = invBuildMail(form);
+          invSend(form.email, message.subject, message.body, from);
+        } catch (e) {
+          console.error(`案内メールを送れませんでした: ${form.formId} / ${form.email} / ${e}`);
+          result = INV_RESULT_FAILED;
+        }
+      }
+      // 1通ごとに記録して、途中で止まっても二重に送らないようにする
+      logSheet.appendRow([form.formId, form.email, storeNames, result, invFormatNow()]);
+      SpreadsheetApp.flush();
+      if (result === INV_RESULT_SENT) sentCount++;
+      else failedCount++;
+    }
+
+    if (remaining > 0) {
+      ScriptApp.newTrigger(INV_BATCH_HANDLER).timeBased()
+        .after(stoppedByQuota ? INV_QUOTA_WAIT_MS : INV_RETRY_DELAY_MS).create();
+      console.log(`今回 ${sentCount} 通送信（失敗 ${failedCount} 件）。残り ${remaining} 件は` +
+        (stoppedByQuota ? "1日の送信上限に達したため、しばらく待ってから" : "") + "自動で続行します。");
+    } else {
+      console.log(`今回 ${sentCount} 通送信（失敗 ${failedCount} 件）。すべて完了しました。送信記録は「${INV_LOG_SHEET_NAME}」シートにあります。`);
+    }
+  } finally {
+    try {
+      lock.releaseLock();
+    } catch (e) {
+      console.warn(`ロック解除に失敗しました（処理には影響しません）: ${e}`);
+    }
+  }
+}
+
+function deleteInvitationTriggers() {
+  ScriptApp.getProjectTriggers().forEach(trigger => {
+    if (trigger.getHandlerFunction() === INV_BATCH_HANDLER) {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+}
+
+
+================================================================
+ファイル名: 回答集計.gs
+役割: 回答を集計し、控えメール・フォームの受付停止を行う
+================================================================
+
+// ===== フォームの回答を1つのシートに集める =====
+// 「リスト」シートに記録されたフォームID（J列）を元に、作成済みの全フォームの回答を読み取り、
+// 店舗ごとに1行の「回答集計」シートにまとめる。フォームはそれぞれ独立しているため、定期的に各フォームを読みに行く。
+// 1回の実行は RESP_TIME_LIMIT_MS で打ち切り、残りは時間主導トリガーで自動的に続きを実行する。
+//
+// 回答の変更に気づく・止める仕組み:
+//   ・再回答       … 同じフォームに2回以上回答があると、「再回答」に「あり（内容は同じ／内容が変わった）」と出る（黄色の行）
+//   ・業者依頼済   … 業者に依頼した店舗に「○」を入れると、そのフォームの受付を自動で止める
+//                    （同じフォームの全店舗に「○」が付いたときだけ止める。「○」を消すと受付を再開する）
+//   ・依頼後の回答 … 「○」を確認した後に回答が来ていたら「あり」と出る（赤色の行）
+//   手入力するのは「業者依頼済」の列だけ。ほかの列は集計のたびに書き換わる。
+//
+// 回答の控えメール（エビデンス用）:
+//   回答を読み取ったときに、回答内容をまとめたメールをお客様（フォームのURLを送ったアドレス）へ送る。
+//   スクリプトプロパティ RESP_MAIL_MODE で切り替える。未設定なら送らない。
+//     off  … 送らない（初期値）
+//     test … お客様には送らず、RESP_MAIL_TEST_TO のアドレスだけに送る（動作確認用）
+//     on   … お客様へ送る。RESP_MAIL_BCC があれば、そのアドレスにも同じメールを送る（社内の控え）
+//   同じ回答には1回だけ送る。再回答があれば、その回答の分をもう一度送る。送信の結果は「控えメール」の列に残る。
+//   メールには、変更するためのフォームのURLと、お客様に案内する変更の期限（RESP_CUSTOMER_DEADLINE_TEXT）を書く。
+//   社内の控え（RESP_MAIL_BCC）は、必要なときだけ設定する。回答はフォームの中に日時つきで全件残る。
+//   メールはスクリプトを実行しているアカウントから送られ、送信できる数には1日の上限がある。
+//
+// 使い方:
+//   1. setupResponseCollectionTrigger を1回だけ実行 → RESP_INTERVAL_HOURS 時間ごとに自動で集計され、
+//      1時間ごとに「業者依頼済」の印を見て受付を止める／再開する
+//   2. 今すぐ集計したいときは startResponseCollection、今すぐ受付を止めたいときは closeRequestedForms を実行
+//      控えメールの文面を確かめたいときは sendSampleReceiptMail を実行（RESP_MAIL_TEST_TO 宛てにサンプルを送る）
+//   3. 自動集計を止めるときは removeResponseCollectionTrigger を実行
+//
+// 変更の最終日時:
+//   RESP_CUTOFF_AT に日時を入れると、その日時を過ぎたあと、全フォームの受付を自動で止める（1時間ごとに確認）。
+//   お客様は、それまでは同じフォームから何度でも回答し直せる（最新の回答が有効）。空のままなら自動では止めない。
+//   お客様に案内する期限（RESP_CUSTOMER_DEADLINE_TEXT / FORM_CHANGE_DEADLINE_TEXT）より後ろの日時にしておくと、少し余裕が持てる。
+//
+// スプレッドシートの指定は フォーム作成.js と同じ（FORM_SPREADSHEET_URL、無ければ紐づいているスプレッドシート）。
+// このファイルだけで動く（質問文は フォーム作成.js と同じものを下に書いている）。
+
+const RESP_LIST_SHEET_NAME = "リスト";
+const RESP_OUTPUT_SHEET_NAME = "回答集計";
+const RESP_STATUS_SENT = "送信済";
+
+const RESP_INTERVAL_HOURS = 2;                // 自動で集計する間隔（時間）
+const RESP_TIME_LIMIT_MS = 4.5 * 60 * 1000;   // 1回あたりの処理時間上限（6分制限対策）
+const RESP_RETRY_DELAY_MS = 60 * 1000;        // 続きを実行するまでの待ち時間
+const RESP_CURSOR_PROPERTY = "RESP_CURSOR";   // 何番目のフォームまで読んだか
+const RESP_START_HANDLER = "startResponseCollection";
+const RESP_CONTINUE_HANDLER = "collectFormResponses";
+const RESP_CLOSE_HANDLER = "closeRequestedForms";
+
+// 実際にフォームの受付を止める日時（例: "2026/11/30 23:59"）。過ぎたら全フォームの受付を止める。空のままなら止めない。
+const RESP_CUTOFF_AT = "2026/11/30 23:59";
+// お客様に案内する「変更の期限」の表記（控えメールに書く）。受付を止める日時とは別。フォーム作成.js の FORM_CHANGE_DEADLINE_TEXT と同じにしておくこと。
+// 空のままなら、メールに期限の文を入れない
+const RESP_CUSTOMER_DEADLINE_TEXT = "2026年11月15日(日)";
+const RESP_CUTOFF_HANDLER = "closeAllFormsAtCutoff";
+const RESP_CUTOFF_CONTINUE_HANDLER = "continueCloseAllFormsAtCutoff";
+const RESP_CUTOFF_CURSOR_PROPERTY = "RESP_CUTOFF_CURSOR";
+const RESP_CUTOFF_DONE_PROPERTY = "RESP_CUTOFF_DONE";
+
+// 受付を止めたフォームを開いた人に表示するメッセージ
+const RESP_CLOSED_MESSAGE = "このアンケートの回答受付は終了しました。内容の変更をご希望の場合は、お手数ですが株式会社クリメンまでご連絡ください。";
+const RESP_CLOSED_CONTACT = "";               // 連絡先（電話番号など）。空のままなら表示しない
+
+// 控えメール
+const RESP_MAIL_MODE_PROPERTY = "RESP_MAIL_MODE";           // off / test / on
+const RESP_MAIL_TEST_TO_PROPERTY = "RESP_MAIL_TEST_TO";     // test のときの宛先
+const RESP_MAIL_FROM_PROPERTY = "MAIL_FROM";                // 送信元アドレス（会社のアドレス。案内メールと共通）。未設定なら実行アカウントのアドレス
+const RESP_MAIL_BCC_PROPERTY = "RESP_MAIL_BCC";             // on のときに、社内の控えとして同じメールを送るアドレス（任意）
+const RESP_MAIL_SENDER_NAME = "株式会社クリメン";
+const RESP_MAIL_SUBJECT = "【株式会社クリメン】年末年始廃棄物回収アンケート ご回答内容の控え";
+const RESP_MAIL_PERIOD_TEXT = "2026年12月30日(水)から2027年1月3日(日)";
+const RESP_MAIL_CONTACT = "";                               // 内容の変更の連絡先（電話番号など）。空のままなら案内の文だけ入れる
+
+// フォーム作成.js の質問文・選択肢と同じ文言にしておくこと
+const RESP_Q_CONTACT_NAME = "ご担当者様のお名前";
+const RESP_Q_PHONE = "ご連絡可能なお電話番号";
+const RESP_Q_COMMENT = "ご不明点・ご要望（任意）";
+const RESP_Q_WANT = "特別回収期間の回収について";
+const RESP_CHOICE_WANT = "特別回収期間の回収を希望する（有料）";
+const RESP_CHOICE_NOT_WANT = "すべての日程において回収を希望しない";
+const RESP_ANSWER_YES = "希望する";
+const RESP_ANSWER_NO = "希望しない";
+const RESP_DATE_QUESTION_PATTERN = /^【(.+)】(.+)の収集を希望しますか？$/;
+
+// 「リスト」シートの列（0始まり）
+const RESP_COL_STORE = 0;   // A列: 店舗名
+const RESP_COL_EMAIL = 1;   // B列: メールアドレス
+const RESP_COL_DATE_START = 3;  // D列〜H列: 希望日（「○」の日だけ設問がある）
+const RESP_COL_DATE_END = 7;
+const RESP_COL_FORM_URL = 8;    // I列: フォームURL
+const RESP_COL_FORM_ID = 9;     // J列: フォームID
+const RESP_COL_STATUS = 10;     // K列: フォーム作成状況
+const RESP_COL_ADDRESS = 17;    // R列: 店舗の住所（控えメールに載せる）
+
+// 「回答集計」シートの、手入力・自動記録の列（集計のたびに書き換えず、前の値を引き継ぐ）
+const RESP_HEADER_REQUESTED = "業者依頼済";
+const RESP_HEADER_REQUESTED_AT = "依頼確認日時";
+const RESP_HEADER_ACCEPTING = "フォーム受付";
+const RESP_HEADER_MAILED = "控えメール";   // 控えメールを送った回答の日時（テスト送信は「テスト:」、失敗は「失敗:」が付く）
+const RESP_KEEP_HEADERS = [RESP_HEADER_REQUESTED, RESP_HEADER_REQUESTED_AT, RESP_HEADER_ACCEPTING, RESP_HEADER_MAILED];
+const RESP_STATE_CLOSED = "停止済";
+const RESP_STATE_WAITING = "他の店舗が未依頼のため受付中";
+const RESP_STATE_ERROR = "停止できませんでした";
+
+const RESP_RERESPONSE_SAME = "あり（内容は同じ）";
+const RESP_RERESPONSE_CHANGED = "あり（内容が変わった）";
+const RESP_COLOR_CHANGED = "#fff2cc";   // 再回答で内容が変わった行（黄色）
+const RESP_COLOR_AFTER_REQUEST = "#f4cccc"; // 依頼後に回答があった行（赤色）
+const RESP_COLOR_NONE = "#ffffff";
+
+function respGetSpreadsheet() {
+  const url = PropertiesService.getScriptProperties().getProperty("FORM_SPREADSHEET_URL");
+  if (url) {
+    return SpreadsheetApp.openByUrl(url);
+  }
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) {
+    throw new Error("スクリプトプロパティ FORM_SPREADSHEET_URL を設定してください。");
+  }
+  return ss;
+}
+
+function respFormatNow() {
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy/MM/dd HH:mm:ss");
+}
+
+// 自動集計と、受付の自動停止のタイマーを登録する（1回だけ実行する）
+function setupResponseCollectionTrigger() {
+  deleteTriggersByHandler(RESP_START_HANDLER);
+  deleteTriggersByHandler(RESP_CLOSE_HANDLER);
+  ScriptApp.newTrigger(RESP_START_HANDLER).timeBased().everyHours(RESP_INTERVAL_HOURS).create();
+  ScriptApp.newTrigger(RESP_CLOSE_HANDLER).timeBased().everyHours(1).create();
+  deleteTriggersByHandler(RESP_CUTOFF_HANDLER);
+  ScriptApp.newTrigger(RESP_CUTOFF_HANDLER).timeBased().everyHours(1).create();
+  console.log(`${RESP_INTERVAL_HOURS}時間ごとの自動集計と、1時間ごとの受付停止の確認を登録しました。`);
+  startResponseCollection();
+}
+
+// 自動集計と受付の自動停止を止める（集計済みの「回答集計」シートはそのまま残る）
+function removeResponseCollectionTrigger() {
+  deleteTriggersByHandler(RESP_START_HANDLER);
+  deleteTriggersByHandler(RESP_CONTINUE_HANDLER);
+  deleteTriggersByHandler(RESP_CLOSE_HANDLER);
+  deleteTriggersByHandler(RESP_CUTOFF_HANDLER);
+  deleteTriggersByHandler(RESP_CUTOFF_CONTINUE_HANDLER);
+  PropertiesService.getScriptProperties().deleteProperty(RESP_CURSOR_PROPERTY);
+  PropertiesService.getScriptProperties().deleteProperty(RESP_CUTOFF_CURSOR_PROPERTY);
+  console.log("自動集計を停止しました。");
+}
+
+// 最初のフォームから集計を始める（手動実行・定期実行はこちら）
+function startResponseCollection() {
+  PropertiesService.getScriptProperties().deleteProperty(RESP_CURSOR_PROPERTY);
+  collectFormResponses();
+}
+
+// 前回の続きから集計する（時間切れで残ったときの自動続行はこちら）
+function collectFormResponses() {
+  const lock = LockService.getUserLock();
+  if (!lock.tryLock(10 * 1000)) {
+    console.log("別の集計が処理中のためスキップしました。");
+    return;
+  }
+
+  const startTime = Date.now();
+  let processedCount = 0;
+  let errorCount = 0;
+  let nextIndex = 0;
+  let totalForms = 0;
+
+  try {
+    deleteTriggersByHandler(RESP_CONTINUE_HANDLER);
+
+    const ss = respGetSpreadsheet();
+    const listSheet = ss.getSheetByName(RESP_LIST_SHEET_NAME);
+    if (!listSheet) {
+      throw new Error(`シート「${RESP_LIST_SHEET_NAME}」が見つかりません。`);
+    }
+    const data = listSheet.getDataRange().getDisplayValues();
+    const headers = data[0].slice(RESP_COL_DATE_START, RESP_COL_DATE_END + 1);
+    const outputHeader = respBuildOutputHeader(headers);
+    const forms = respGroupFormsFromList(data);
+    totalForms = forms.length;
+
+    const props = PropertiesService.getScriptProperties();
+    const savedCursor = Number(props.getProperty(RESP_CURSOR_PROPERTY) || 0);
+    nextIndex = savedCursor < forms.length ? savedCursor : 0;
+
+    const rowsByStore = respLoadExistingRows(ss, outputHeader);
+    const mailedByStore = {};                       // 今回、控えメールを送った（または送ろうとした）店舗
+    const mailSettings = respGetMailSettings();
+    const mailedColumn = outputHeader.indexOf(RESP_HEADER_MAILED);
+    const dateHeaders = headers.filter(h => h);
+
+    while (nextIndex < forms.length) {
+      if (Date.now() - startTime > RESP_TIME_LIMIT_MS) break;
+
+      const form = forms[nextIndex];
+      try {
+        const rows = respReadFormResponses(form, headers);
+        if (rows.length > 0) {
+          const before = rowsByStore[rows[0][0]];
+          const previousMailed = before && before[mailedColumn] ? before[mailedColumn] : "";
+          const mark = respSendReceiptIfNeeded(form, rows, dateHeaders, previousMailed, mailSettings);
+          rows.forEach(row => {
+            if (mark) mailedByStore[row[0]] = mark;
+          });
+        }
+        rows.forEach(row => { rowsByStore[row[0]] = row; });
+        processedCount++;
+      } catch (e) {
+        console.error(`フォームの回答を読み取れませんでした: ${form.formId} / ${e}`);
+        errorCount++;
+      }
+      nextIndex++;
+    }
+
+    respWriteOutputSheet(ss, outputHeader, rowsByStore, mailedByStore);
+
+    if (nextIndex < forms.length) {
+      props.setProperty(RESP_CURSOR_PROPERTY, String(nextIndex));
+      ScriptApp.newTrigger(RESP_CONTINUE_HANDLER).timeBased().after(RESP_RETRY_DELAY_MS).create();
+      console.log(`${nextIndex} / ${totalForms} 件のフォームを確認しました（エラー ${errorCount} 件）。残りは自動で続行します。`);
+    } else {
+      props.deleteProperty(RESP_CURSOR_PROPERTY);
+      console.log(`全 ${totalForms} 件のフォームを確認しました（今回 ${processedCount} 件、エラー ${errorCount} 件）。回答のある店舗: ${Object.keys(rowsByStore).length} 件`);
+      respApplyRequestedStatus(ss, forms);
+      respRefreshContractStatusList();
+    }
+  } finally {
+    try {
+      lock.releaseLock();
+    } catch (e) {
+      console.warn(`ロック解除に失敗しました（処理には影響しません）: ${e}`);
+    }
+  }
+}
+
+// 「業者依頼済」の印を見て、フォームの受付を止める／再開する（手動実行・1時間ごとの定期実行はこちら）
+function closeRequestedForms() {
+  const lock = LockService.getUserLock();
+  if (!lock.tryLock(30 * 1000)) {
+    console.log("集計が処理中のためスキップしました。");
+    return;
+  }
+  try {
+    const ss = respGetSpreadsheet();
+    const listSheet = ss.getSheetByName(RESP_LIST_SHEET_NAME);
+    if (!listSheet) {
+      throw new Error(`シート「${RESP_LIST_SHEET_NAME}」が見つかりません。`);
+    }
+    respApplyRequestedStatus(ss, respGroupFormsFromList(listSheet.getDataRange().getDisplayValues()));
+  } finally {
+    try {
+      lock.releaseLock();
+    } catch (e) {
+      console.warn(`ロック解除に失敗しました（処理には影響しません）: ${e}`);
+    }
+  }
+}
+
+// 「回答集計」シートの見出し（日付の列は、「リスト」の見出しのうち空でないもの）
+function respBuildOutputHeader(headers) {
+  return ["店舗名", "回答日時", "特別回収"].concat(headers.filter(h => h),
+    ["ご担当者名", "電話番号", "コメント", "メールアドレス", "フォームID", "回答回数", "再回答", "依頼後の回答"],
+    RESP_KEEP_HEADERS);
+}
+
+// 見出しから、店舗ごとの行のうち「フォームの回答から作る部分」の列数を求める（店舗名〜再回答）
+function respBaseLength(outputHeader) {
+  return outputHeader.length - 1 - RESP_KEEP_HEADERS.length;
+}
+
+// 「リスト」から、フォームごとの店舗（と、設問のある日）を取り出す
+function respGroupFormsFromList(data) {
+  const formsById = {};
+  const forms = [];
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const formId = row[RESP_COL_FORM_ID];
+    if (!formId || row[RESP_COL_STATUS] !== RESP_STATUS_SENT) continue;
+
+    if (!formsById[formId]) {
+      formsById[formId] = { formId: formId, formUrl: row[RESP_COL_FORM_URL], stores: [] };
+      forms.push(formsById[formId]);
+    }
+    formsById[formId].stores.push({
+      name: row[RESP_COL_STORE],
+      email: row[RESP_COL_EMAIL],
+      address: String(row[RESP_COL_ADDRESS] || "").trim(),
+      offered: row.slice(RESP_COL_DATE_START, RESP_COL_DATE_END + 1).map(mark => mark === "○")
+    });
+  }
+  return forms;
+}
+
+// フォームの回答を読み取り、店舗ごとの行（店舗名〜再回答）にする。回答が無ければ空の配列を返す
+function respReadFormResponses(form, headers) {
+  const responses = FormApp.openById(form.formId).getResponses();
+  if (responses.length === 0) return [];
+
+  const sorted = responses.slice().sort((a, b) => a.getTimestamp() - b.getTimestamp());
+  const latest = sorted[sorted.length - 1];
+  const parsed = respParseResponse(latest);
+  const previous = sorted.length > 1 ? respParseResponse(sorted[sorted.length - 2]) : null;
+  const answeredAt = Utilities.formatDate(latest.getTimestamp(), Session.getScriptTimeZone(), "yyyy/MM/dd HH:mm:ss");
+
+  return form.stores.map(store => {
+    const current = respBuildStoreAnswer(parsed, store, headers);
+
+    let reresponse = "";
+    if (previous) {
+      const before = respBuildStoreAnswer(previous, store, headers);
+      const same = before.wantLabel === current.wantLabel && before.dateCells.join("|") === current.dateCells.join("|");
+      reresponse = same ? RESP_RERESPONSE_SAME : RESP_RERESPONSE_CHANGED;
+    }
+
+    return [store.name, answeredAt, current.wantLabel].concat(current.dateCells,
+      [parsed.contactName, parsed.phone, parsed.comment, store.email, form.formId, responses.length, reresponse]);
+  });
+}
+
+// 1件の回答から、ある店舗の「特別回収の希望」と、日付ごとの「○／×」を作る
+function respBuildStoreAnswer(parsed, store, headers) {
+  const dateCells = [];
+  headers.forEach((header, i) => {
+    if (!header) return;                                    // 見出しの無い列（期間が短いときの余り）は使わない
+    if (!store.offered[i]) { dateCells.push(""); return; }  // 設問が無かった日
+    if (parsed.want === RESP_CHOICE_NOT_WANT) { dateCells.push("×"); return; }  // 旧形式のフォーム：「希望しない」で送信した場合は、全日程が「×」
+    const answer = (parsed.dateAnswers[store.name] || {})[header];
+    dateCells.push(answer === RESP_ANSWER_YES ? "○" : answer === RESP_ANSWER_NO ? "×" : "");
+  });
+
+  // 「特別回収」の列: 旧形式のフォームは最初の選択肢から、今の形式は日ごとの回答から決める（1日でも「希望する」があれば「希望する」）
+  let wantLabel = parsed.want === RESP_CHOICE_WANT ? RESP_ANSWER_YES
+    : parsed.want === RESP_CHOICE_NOT_WANT ? RESP_ANSWER_NO
+    : parsed.want;
+  if (!parsed.want) {
+    wantLabel = dateCells.indexOf("○") !== -1 ? RESP_ANSWER_YES : dateCells.indexOf("×") !== -1 ? RESP_ANSWER_NO : "";
+  }
+  return { wantLabel: wantLabel, dateCells: dateCells };
+}
+
+// 1件の回答を、質問の文言をもとに分類する
+function respParseResponse(response) {
+  const parsed = { want: "", contactName: "", phone: "", comment: "", dateAnswers: {} };
+
+  response.getItemResponses().forEach(itemResponse => {
+    const title = itemResponse.getItem().getTitle();
+    const answer = String(itemResponse.getResponse());
+
+    if (title === RESP_Q_WANT) parsed.want = answer;
+    else if (title === RESP_Q_CONTACT_NAME) parsed.contactName = answer;
+    else if (title === RESP_Q_PHONE) parsed.phone = answer;
+    else if (title === RESP_Q_COMMENT) parsed.comment = answer;
+    else {
+      const match = RESP_DATE_QUESTION_PATTERN.exec(title);
+      if (match) {
+        const storeName = match[1];
+        const dateHeader = match[2];
+        if (!parsed.dateAnswers[storeName]) parsed.dateAnswers[storeName] = {};
+        parsed.dateAnswers[storeName][dateHeader] = answer;
+      }
+    }
+  });
+  return parsed;
+}
+
+// 前回までに集計した行を、店舗名をキーにして読み込む。見出しが今と違うシートは、列がずれるので読み込まない
+function respLoadExistingRows(ss, outputHeader, quiet) {
+  const rowsByStore = {};
+  const sheet = ss.getSheetByName(RESP_OUTPUT_SHEET_NAME);
+  if (!sheet || sheet.getLastRow() < 2) return rowsByStore;
+
+  const values = sheet.getDataRange().getDisplayValues();
+  if (values[0].join("\t") !== outputHeader.join("\t")) {
+    if (!quiet) console.warn("「回答集計」シートの見出しが今のものと違うため、前回までの集計は引き継がずに作り直します。");
+    return rowsByStore;
+  }
+  for (let i = 1; i < values.length; i++) {
+    rowsByStore[values[i][0]] = values[i];
+  }
+  return rowsByStore;
+}
+
+function respWriteOutputSheet(ss, outputHeader, rowsByStore, mailedByStore) {
+  let sheet = ss.getSheetByName(RESP_OUTPUT_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(RESP_OUTPUT_SHEET_NAME);
+  }
+  const baseLength = respBaseLength(outputHeader);
+
+  // 書き込む直前のシートから、手入力・自動記録の列（業者依頼済など）を取り込む
+  const current = respLoadExistingRows(ss, outputHeader, true);
+
+  const rows = Object.keys(rowsByStore).map(store => {
+    const base = rowsByStore[store].slice(0, baseLength);
+    const kept = current[store] ? current[store].slice(baseLength + 1) : [];
+    const keep = RESP_KEEP_HEADERS.map((_, i) => kept[i] || "");
+    if (mailedByStore && mailedByStore[store]) keep[RESP_KEEP_HEADERS.indexOf(RESP_HEADER_MAILED)] = mailedByStore[store];
+    const requestedAt = keep[1];
+    const answeredAt = base[1];
+    const afterRequest = requestedAt && answeredAt > requestedAt ? "あり" : "";
+    return base.concat([afterRequest], keep);
+  }).sort((a, b) => (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0)); // 回答が古い順
+
+  sheet.clear();
+  sheet.getRange(1, 1, rows.length + 1, outputHeader.length).setValues([outputHeader].concat(rows));
+
+  if (rows.length > 0) {
+    const backgrounds = rows.map(row => {
+      const color = row[baseLength] === "あり" ? RESP_COLOR_AFTER_REQUEST
+        : row[baseLength - 1] === RESP_RERESPONSE_CHANGED ? RESP_COLOR_CHANGED
+        : RESP_COLOR_NONE;
+      return outputHeader.map(() => color);
+    });
+    sheet.getRange(2, 1, rows.length, outputHeader.length).setBackgrounds(backgrounds);
+  }
+}
+
+// 「業者依頼済」の印を見て、フォームの受付を止める／再開する。
+// 同じフォームの全店舗に印があるときだけ止め、印が外れたら再開する。受付の状態は「フォーム受付」の列に書く。
+function respApplyRequestedStatus(ss, forms) {
+  const sheet = ss.getSheetByName(RESP_OUTPUT_SHEET_NAME);
+  if (!sheet || sheet.getLastRow() < 2) return;
+  if (respIsAfterCutoff()) {
+    console.log("変更の最終日時を過ぎているため、「業者依頼済」による受付の切り替えは行いません。");
+    return;
+  }
+
+  const values = sheet.getDataRange().getDisplayValues();
+  const header = values[0];
+  const colRequested = header.indexOf(RESP_HEADER_REQUESTED);
+  const colRequestedAt = header.indexOf(RESP_HEADER_REQUESTED_AT);
+  const colAccepting = header.indexOf(RESP_HEADER_ACCEPTING);
+  if (colRequested < 0 || colRequestedAt !== colRequested + 1 || colAccepting !== colRequested + 2) {
+    throw new Error("「回答集計」シートの見出しが想定と違います。startResponseCollection を実行して作り直してください。");
+  }
+
+  const rowByStore = {};
+  for (let i = 1; i < values.length; i++) rowByStore[values[i][0]] = i;
+  const isRequested = store => String(values[rowByStore[store.name]][colRequested]).trim() !== "";
+
+  const now = respFormatNow();
+  let closedCount = 0;
+  let reopenedCount = 0;
+  let errorCount = 0;
+
+  forms.forEach(form => {
+    const stores = form.stores.filter(store => rowByStore[store.name] !== undefined); // 回答のある店舗
+    if (stores.length === 0) return;
+
+    const shouldClose = stores.length === form.stores.length && stores.every(isRequested);
+    const wasClosed = stores.some(store => values[rowByStore[store.name]][colAccepting] === RESP_STATE_CLOSED);
+
+    let failed = false;
+    if (shouldClose !== wasClosed) {
+      try {
+        const target = FormApp.openById(form.formId);
+        if (shouldClose) {
+          target.setAcceptingResponses(false);
+          target.setCustomClosedFormMessage(respClosedMessage());
+          closedCount++;
+        } else {
+          target.setAcceptingResponses(true);
+          reopenedCount++;
+        }
+      } catch (e) {
+        console.error(`フォームの受付を切り替えられませんでした: ${form.formId} / ${e}`);
+        failed = true;
+        errorCount++;
+      }
+    }
+
+    stores.forEach(store => {
+      const row = values[rowByStore[store.name]];
+      if (!isRequested(store)) {
+        row[colRequestedAt] = "";
+        row[colAccepting] = failed ? RESP_STATE_ERROR : "";
+        return;
+      }
+      row[colRequestedAt] = row[colRequestedAt] || now;   // 最初に印を確認した日時（依頼後の回答かどうかの基準）
+      row[colAccepting] = failed ? RESP_STATE_ERROR : (shouldClose ? RESP_STATE_CLOSED : RESP_STATE_WAITING);
+    });
+  });
+
+  // 自動記録の2列（依頼確認日時・フォーム受付）だけを書き戻す。手入力の「業者依頼済」の列には触れない
+  const autoColumns = values.slice(1).map(row => [row[colRequestedAt], row[colAccepting]]);
+  sheet.getRange(2, colRequestedAt + 1, autoColumns.length, 2).setValues(autoColumns);
+
+  console.log(`受付を止めたフォーム: ${closedCount} 件、再開したフォーム: ${reopenedCount} 件、失敗: ${errorCount} 件`);
+}
+
+// 控えメールの設定を読む。modeが on / test 以外のときは送らない
+function respGetMailSettings() {
+  const props = PropertiesService.getScriptProperties();
+  const rawMode = String(props.getProperty(RESP_MAIL_MODE_PROPERTY) || "off").trim().toLowerCase();
+  const testTo = String(props.getProperty(RESP_MAIL_TEST_TO_PROPERTY) || "").trim();
+  const bcc = String(props.getProperty(RESP_MAIL_BCC_PROPERTY) || "").trim();
+
+  const from = String(props.getProperty(RESP_MAIL_FROM_PROPERTY) || "").trim();
+
+  let mode = rawMode === "on" || rawMode === "test" ? rawMode : "off";
+  if (mode !== "off" && from) {
+    const own = String(Session.getEffectiveUser().getEmail() || "").toLowerCase();
+    const aliases = GmailApp.getAliases().map(alias => String(alias).toLowerCase());
+    if (from.toLowerCase() !== own && aliases.indexOf(from.toLowerCase()) === -1) {
+      console.warn(`${RESP_MAIL_FROM_PROPERTY}（${from}）はこのアカウントから送信できるアドレスではないため、控えメールは送りません。`);
+      mode = "off";
+    }
+  }
+  if (mode === "test" && !testTo) {
+    console.warn(`${RESP_MAIL_MODE_PROPERTY} が test ですが、${RESP_MAIL_TEST_TO_PROPERTY} が未設定のため、控えメールは送りません。`);
+    mode = "off";
+  }
+  return { mode: mode, testTo: testTo, bcc: bcc, from: from };
+}
+
+// 回答1件につき、控えメールを1回だけ送る。送った（または送れなかった）印の文字列を返す。何もしなかったときは空文字
+//   印: 回答日時のみ=お客様に送信済 / 「テスト:」+回答日時=テスト送信済 / 「失敗:」+回答日時=送信を試みて失敗（自動では再送しない）
+function respSendReceiptIfNeeded(form, rows, dateHeaders, previousMailed, mail) {
+  if (mail.mode === "off") return "";
+
+  const answeredAt = rows[0][1];
+  const sentMark = answeredAt;
+  const testMark = "テスト:" + answeredAt;
+  const failMark = "失敗:" + answeredAt;
+
+  if (previousMailed === sentMark || previousMailed === failMark) return "";
+  if (mail.mode === "test" && previousMailed === testMark) return "";
+
+  const customerEmail = String((form.stores[0] || {}).email || "").trim();
+  const to = mail.mode === "test" ? mail.testTo : customerEmail;
+  if (!/^[^@\s,]+@[^@\s,]+\.[^@\s,]+$/.test(to)) {
+    console.error(`控えメールの宛先が正しくありません: ${form.formId} / ${to}`);
+    return mail.mode === "test" ? "" : failMark;
+  }
+
+  const recipientCount = 1 + (mail.mode === "on" && mail.bcc ? 1 : 0);
+  if (MailApp.getRemainingDailyQuota() < recipientCount) {
+    console.warn("メールの1日の送信上限に達したため、控えメールの送信を見送りました。次の集計で送ります。");
+    return "";
+  }
+
+  const addresses = {};
+  form.stores.forEach(store => { addresses[store.name] = store.address; });
+  const message = respBuildReceiptMail(rows, dateHeaders, form.formUrl, addresses);
+  const subjectPrefix = mail.mode === "test" ? "【テスト】" : "";
+  const bodyPrefix = mail.mode === "test" ? `（テスト送信です。本来の宛先: ${customerEmail}）\n\n` : "";
+  const options = { to: to, subject: subjectPrefix + message.subject, body: bodyPrefix + message.body, name: RESP_MAIL_SENDER_NAME };
+  if (message.htmlBody) {
+    options.htmlBody = (mail.mode === "test" ? `<p>（テスト送信です。本来の宛先: ${customerEmail.replace(/&/g, "&amp;").replace(/</g, "&lt;")}）</p>` : "") + message.htmlBody;
+  }
+  if (mail.mode === "on" && mail.bcc) options.bcc = mail.bcc;
+
+  try {
+    respSendMail(options, mail.from);
+    return mail.mode === "test" ? testMark : sentMark;
+  } catch (e) {
+    console.error(`控えメールを送れませんでした: ${form.formId} / ${e}`);
+    return mail.mode === "test" ? "" : failMark;
+  }
+}
+
+// メールを送る。送信元アドレスがあれば Gmail から（別のアドレスとして登録済みのもの）、無ければ実行アカウントから送る
+function respSendMail(options, from) {
+  if (!from) {
+    MailApp.sendEmail(options);
+    return;
+  }
+  const gmailOptions = { name: options.name, from: from };
+  if (options.bcc) gmailOptions.bcc = options.bcc;
+  if (options.htmlBody) gmailOptions.htmlBody = options.htmlBody;
+  GmailApp.sendEmail(options.to, options.subject, options.body, gmailOptions);
+}
+
+// 1つのフォームの回答（店舗ごとの行）から、控えメールの件名と本文を作る
+function respBuildReceiptMail(rows, dateHeaders, formUrl, addresses) {
+  const D = dateHeaders.length;
+  const first = rows[0];
+  const answeredAt = first[1];
+  const contactName = first[3 + D];
+  const phone = first[4 + D];
+  const comment = first[5 + D];
+  const responseCount = Number(first[8 + D]) || 1;
+
+  const notice = "※収集業者の都合などにより、回収日や料金を変更せざるを得ない場合は、改めてご連絡いたします。";
+  const esc = text => String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const mark = cell => (cell === "○" ? "○（希望する）" : "×（希望しない）");
+
+  // 店舗ごとの「聞かれた日」だけを取り出す（回収日でない日は載せない）
+  const stores = rows.map(row => ({
+    name: row[0],
+    address: (addresses || {})[row[0]] || "",
+    want: row[2],
+    days: dateHeaders.map((header, i) => ({ header: header, cell: row[3 + i] })).filter(d => d.cell === "○" || d.cell === "×")
+  }));
+
+  const lines = [];
+  lines.push(`${contactName || "ご担当者"} 様`, "");
+  lines.push("このたびは「年末年始廃棄物回収に関するアンケート」にご回答いただき、ありがとうございました。");
+  lines.push("下記の内容で承りました。ご確認ください。", "");
+  lines.push(`■回答日時：${answeredAt}`);
+  lines.push(`■特別回収期間：${RESP_MAIL_PERIOD_TEXT}`);
+  lines.push(`■ご担当者様：${contactName}`);
+  lines.push(`■お電話番号：${phone}`, "");
+  lines.push("【店舗ごとの回収のご希望】");
+  stores.forEach(store => {
+    lines.push("", `▼${store.name}`);
+    if (store.address) lines.push(`  ご住所：${store.address}`);
+    if (store.days.length === 0) lines.push(`  特別回収：${store.want}`);
+    store.days.forEach(d => lines.push(`  ${d.header}　${mark(d.cell)}`));
+  });
+  if (comment) lines.push("", `■ご不明点・ご要望：${comment}`);
+  lines.push("");
+  lines.push(notice);
+  lines.push("※本メールは、ご回答内容の控えとしてお送りしています。");
+  lines.push("※回答内容を変更する場合は、下記のフォームから再度ご回答ください。最新のご回答を有効とします。");
+  if (RESP_CUSTOMER_DEADLINE_TEXT) lines.push(`  変更のご希望は${RESP_CUSTOMER_DEADLINE_TEXT}までにお願いいたします。`);
+  if (formUrl) lines.push(`  ${formUrl}`);
+  if (RESP_MAIL_CONTACT) lines.push(`※ご不明な点は、${RESP_MAIL_CONTACT}までご連絡ください。`);
+  lines.push("", RESP_MAIL_SENDER_NAME);
+
+  // HTML版: 店舗ごとに、日付を横に並べた表にする（○＝希望する、×＝希望しない）
+  const cellStyle = "border:1px solid #999;padding:6px 14px;text-align:center;";
+  const h = [];
+  h.push('<div style="font-family:sans-serif;font-size:14px;line-height:1.7;color:#222;">');
+  h.push(`<p>${esc(contactName || "ご担当者")} 様</p>`);
+  h.push("<p>このたびは「年末年始廃棄物回収に関するアンケート」にご回答いただき、ありがとうございました。<br>下記の内容で承りました。ご確認ください。</p>");
+  h.push(`<p>■回答日時：${esc(answeredAt)}<br>■特別回収期間：${esc(RESP_MAIL_PERIOD_TEXT)}<br>■ご担当者様：${esc(contactName)}<br>■お電話番号：${esc(phone)}</p>`);
+  h.push("<p><b>【店舗ごとの回収のご希望】</b><br>○＝回収を希望する　／　×＝回収を希望しない</p>");
+  stores.forEach(store => {
+    h.push(`<p style="margin:16px 0 4px;"><b>▼${esc(store.name)}</b>${store.address ? `<br><span style="font-size:13px;">ご住所：${esc(store.address)}</span>` : ""}</p>`);
+    if (store.days.length === 0) {
+      h.push(`<p>特別回収：${esc(store.want)}</p>`);
+      return;
+    }
+    h.push('<table style="border-collapse:collapse;">');
+    h.push("<tr>" + store.days.map(d => `<th style="${cellStyle}background:#eee;">${esc(d.header)}</th>`).join("") + "</tr>");
+    h.push("<tr>" + store.days.map(d => `<td style="${cellStyle}font-size:18px;${d.cell === "○" ? "font-weight:bold;color:#1a7f37;" : "color:#666;"}">${d.cell}</td>`).join("") + "</tr>");
+    h.push("</table>");
+  });
+  if (comment) h.push(`<p>■ご不明点・ご要望：${esc(comment)}</p>`);
+  h.push(`<p style="margin-top:20px;">${esc(notice)}<br>※本メールは、ご回答内容の控えとしてお送りしています。<br>※回答内容を変更する場合は、下記のフォームから再度ご回答ください。最新のご回答を有効とします。`);
+  if (RESP_CUSTOMER_DEADLINE_TEXT) h.push(`<br>　変更のご希望は${esc(RESP_CUSTOMER_DEADLINE_TEXT)}までにお願いいたします。`);
+  if (formUrl) h.push(`<br>　<a href="${esc(formUrl)}">${esc(formUrl)}</a>`);
+  if (RESP_MAIL_CONTACT) h.push(`<br>※ご不明な点は、${esc(RESP_MAIL_CONTACT)}までご連絡ください。`);
+  h.push(`</p><p>${esc(RESP_MAIL_SENDER_NAME)}</p></div>`);
+
+  const subject = responseCount > 1 ? RESP_MAIL_SUBJECT.replace("の控え", "の控え（再回答）") : RESP_MAIL_SUBJECT;
+  return { subject: subject, body: lines.join("\n"), htmlBody: h.join("") };
+}
+
+// 控えメールの文面を確かめるため、サンプルのメールを RESP_MAIL_TEST_TO に送る（お客様には送らない）
+function sendSampleReceiptMail() {
+  const testTo = String(PropertiesService.getScriptProperties().getProperty(RESP_MAIL_TEST_TO_PROPERTY) || "").trim();
+  if (!testTo) {
+    throw new Error(`スクリプトプロパティ ${RESP_MAIL_TEST_TO_PROPERTY} にテスト用のメールアドレスを設定してください。`);
+  }
+  const dateHeaders = ["12月30日(水)", "12月31日(木)", "1月2日(土)", "1月3日(日)"];
+  const rows = [
+    ["サンプル店A", "2026/11/01 10:00:00", RESP_ANSWER_YES, "○", "×", "", "○", "山田 太郎", "03-0000-0000", "朝に来ますか？", "sample@example.com", "FORMID", 1, ""],
+    ["サンプル店B", "2026/11/01 10:00:00", RESP_ANSWER_NO, "×", "×", "", "", "山田 太郎", "03-0000-0000", "朝に来ますか？", "sample@example.com", "FORMID", 1, ""]
+  ];
+  const message = respBuildReceiptMail(rows, dateHeaders, "https://docs.google.com/forms/d/e/（サンプル）/viewform",
+    { "サンプル店A": "〒130-0013 東京都墨田区錦糸1-2-3 サンプルビル1F", "サンプル店B": "〒130-0022 東京都墨田区江東橋4-5-6" });
+  const from = String(PropertiesService.getScriptProperties().getProperty(RESP_MAIL_FROM_PROPERTY) || "").trim();
+  respSendMail({ to: testTo, subject: "【テスト】" + message.subject, body: "（サンプルです。実際の回答ではありません）\n\n" + message.body,
+    htmlBody: "<p>（サンプルです。実際の回答ではありません）</p>" + message.htmlBody, name: RESP_MAIL_SENDER_NAME }, from);
+  console.log(`サンプルのメールを ${testTo} に送りました。`);
+}
+
+// 変更の最終日時を Date にする。未設定・形式が違うときは null
+function respParseCutoff() {
+  const text = String(RESP_CUTOFF_AT).trim();
+  if (!text) return null;
+  const m = /^(\d{4})\/(\d{1,2})\/(\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?$/.exec(text);
+  if (!m) {
+    console.warn(`RESP_CUTOFF_AT の形式が違います（例: 2026/11/30 23:59）: ${text}`);
+    return null;
+  }
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4] || 23), Number(m[5] || 59));
+}
+
+function respIsAfterCutoff() {
+  const cutoff = respParseCutoff();
+  return !!cutoff && new Date() >= cutoff;
+}
+
+function respClosedMessage() {
+  return RESP_CLOSED_MESSAGE + (RESP_CLOSED_CONTACT ? "\n" + RESP_CLOSED_CONTACT : "");
+}
+
+// 変更の最終日時を過ぎたら、作成済みの全フォームの受付を止める（1時間ごとの定期実行。時間切れは自動で続行する）
+function closeAllFormsAtCutoff() {
+  const cutoff = respParseCutoff();
+  if (!cutoff || new Date() < cutoff) return;
+
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty(RESP_CUTOFF_DONE_PROPERTY) === RESP_CUTOFF_AT) return; // この日時の分は完了済み
+
+  const lock = LockService.getUserLock();
+  if (!lock.tryLock(30 * 1000)) {
+    console.log("別の処理が動いているためスキップしました。");
+    return;
+  }
+
+  const startTime = Date.now();
+  let closedCount = 0;
+  const failedIds = [];
+  let nextIndex = 0;
+  let totalForms = 0;
+
+  try {
+    deleteTriggersByHandler(RESP_CUTOFF_CONTINUE_HANDLER);
+
+    const ss = respGetSpreadsheet();
+    const listSheet = ss.getSheetByName(RESP_LIST_SHEET_NAME);
+    if (!listSheet) {
+      throw new Error(`シート「${RESP_LIST_SHEET_NAME}」が見つかりません。`);
+    }
+    const forms = respGroupFormsFromList(listSheet.getDataRange().getDisplayValues());
+    totalForms = forms.length;
+
+    nextIndex = Number(props.getProperty(RESP_CUTOFF_CURSOR_PROPERTY) || 0);
+    if (nextIndex >= totalForms) nextIndex = 0;
+
+    while (nextIndex < totalForms) {
+      if (Date.now() - startTime > RESP_TIME_LIMIT_MS) break;
+
+      try {
+        const target = FormApp.openById(forms[nextIndex].formId);
+        if (target.isAcceptingResponses()) {
+          target.setAcceptingResponses(false);
+          target.setCustomClosedFormMessage(respClosedMessage());
+          closedCount++;
+        }
+      } catch (e) {
+        console.error(`フォームの受付を止められませんでした: ${forms[nextIndex].formId} / ${e}`);
+        failedIds.push(forms[nextIndex].formId);
+      }
+      nextIndex++;
+    }
+
+    if (nextIndex < totalForms) {
+      props.setProperty(RESP_CUTOFF_CURSOR_PROPERTY, String(nextIndex));
+      ScriptApp.newTrigger(RESP_CUTOFF_CONTINUE_HANDLER).timeBased().after(RESP_RETRY_DELAY_MS).create();
+      console.log(`変更の最終日時を過ぎたため受付を止めています: ${nextIndex} / ${totalForms} 件（今回 ${closedCount} 件を停止）。残りは自動で続行します。`);
+    } else {
+      props.deleteProperty(RESP_CUTOFF_CURSOR_PROPERTY);
+      props.setProperty(RESP_CUTOFF_DONE_PROPERTY, RESP_CUTOFF_AT);
+      console.log(`変更の最終日時を過ぎたため、全 ${totalForms} 件のフォームの受付を止めました（今回 ${closedCount} 件、失敗 ${failedIds.length} 件）。`);
+      if (failedIds.length > 0) console.warn(`止められなかったフォーム: ${failedIds.join(", ")}`);
+    }
+  } finally {
+    try {
+      lock.releaseLock();
+    } catch (e) {
+      console.warn(`ロック解除に失敗しました（処理には影響しません）: ${e}`);
+    }
+  }
+}
+
+// 時間切れで残ったときの続き（自動で呼ばれる）
+function continueCloseAllFormsAtCutoff() {
+  closeAllFormsAtCutoff();
+}
+
+// kintoneリスト作成.js があれば、集計が一巡したときに「契約状況一覧」の回答状況を最新にする
+function respRefreshContractStatusList() {
+  try {
+    if (typeof updateContractStatusList === "function") {
+      updateContractStatusList();
+    }
+  } catch (e) {
+    console.warn(`契約状況一覧の更新に失敗しました: ${e}`);
+  }
+}
+
+function deleteTriggersByHandler(handlerName) {
+  ScriptApp.getProjectTriggers().forEach(trigger => {
+    if (trigger.getHandlerFunction() === handlerName) {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+}
+
+
+================================================================
+ファイル名: 検証.gs
+役割: リスト・フォームを二重に検証する
+================================================================
+
+// ===== 二重チェック：kintoneのデータと作成したリスト・フォームを、別の処理で照合する =====
+// リスト作成.js とは別の処理で、kintoneの契約管理をもう一度読み直し、アドレス・回収曜日・店舗名などを独立に判定して、
+// 「リスト」（または「リスト_kintone」）と食い違いがないかを調べる。何も書き換えず、結果は「検証結果」シートに出す。
+//
+// 使い方:
+//   1. verifyKintoneListData … 「リスト_kintone」を調べる（リストを差し替える前に実行）
+//   2. verifyListData        … 「リスト」を調べる（差し替えたあと、フォームを作る前に実行）
+//   3. verifyCreatedForms    … 作成したフォームを抜き取りで調べ、フォルダの中身とも照合する（フォームを作ったあと）
+//   結果は「検証結果_○○」シート（対象ごとに別のタブ）の「重大度」で見る。エラー = 直してから進める、警告 = 内容を見て判断、情報 = 参考
+//
+// スクリプトプロパティ（リスト作成.js と同じ）: KINTONE_SUBDOMAIN / KINTONE_KEIYAKU_APP_ID / KINTONE_KEIYAKU_API_TOKEN
+// 項目名の対応は、KLIST_FIELD_CODES（あれば）を優先して使う。
+// スプレッドシートの指定は フォーム作成.js と同じ。このファイルだけで動く。
+
+const VER_RESULT_SHEET_NAME = "検証結果";
+const VER_REVIEW_SHEET_NAME = "要確認";
+const VER_LIST_SHEET_NAME = "リスト";
+const VER_KINTONE_LIST_SHEET_NAME = "リスト_kintone";
+const VER_TARGET_CONTRACT_TYPE = "契約中";
+
+// 照合の条件（リスト作成.js の設定と同じ内容を、ここにも書いて独立に判定する）
+const VER_DATES = [[2026, 12, 30], [2026, 12, 31], [2027, 1, 1], [2027, 1, 2], [2027, 1, 3]];
+const VER_NO_COLLECTION = ["2027-1-1"];
+const VER_WEEKDAYS = "日月火水木金土";
+const VER_L_CONTRACT_TYPE = "契約種別";
+const VER_L_STORE = "契約店舗名称";
+const VER_L_CUSTOMER = "顧客名称";
+const VER_L_VENDOR = "収集業者：名称";
+const VER_L_BURNABLE = "可燃収集日";
+const VER_L_EMAILS = [
+  "年末年始　回答アドレス①",
+  "年末年始　回答アドレス②",
+  "案内等送付先メールアドレス:(to)",
+  "送付先別：e-mail",
+  "契約時の顧客担当：メールアドレス"
+];
+
+// 名前では見つけにくい項目は、フィールドコードで指定する（項目名 → フィールドコード）
+const VER_EMAIL_CODES = {
+  "送付先別：e-mail": "送付先別mail1"
+};
+
+// 送信先に使わないアドレス（リスト作成.js の KLIST_EXCLUDED_EMAIL_PATTERNS と同じ内容）
+const VER_EXCLUDED_EMAIL_PATTERNS = [/^dummy/];
+
+// 「リスト」の列（0始まり）
+const VER_COL_STORE = 0;
+const VER_COL_EMAIL = 1;
+const VER_COL_VENDOR = 2;
+const VER_COL_MARK_START = 3;   // D〜H列
+const VER_COL_MARK_END = 7;
+const VER_COL_URL = 8;
+const VER_COL_ID = 9;
+const VER_COL_STATUS = 10;
+const VER_COL_CUSTOMER = 16;   // Q列: 契約者
+const VER_COL_ADDRESS = 17;    // R列: 店舗住所
+
+// 店舗の住所の項目（フィールドコード）
+const VER_ADDRESS_CODES = { postal: "契約郵便番号", address: "契約住所連結", prefecture: "契約都道府県", city: "契約市区町村", building: "契約ビル名ほか" };
+
+const VER_MAX_STORES_PER_FORM = 30;     // 1フォームの店舗数がこれを超えたら警告
+const VER_FORM_SAMPLE_COUNT = 20;       // フォームの抜き取り件数
+const VER_TYPO_DOMAINS = ["gmial.com", "gmai.com", "gmail.co", "gmail.con", "gmaill.com", "gamil.com", "yahoo.co.jo",
+  "yahoo.cojp", "yahho.co.jp", "yahoo.ne.jp.", "hotmial.com", "hotmail.co", "outlok.com", "icloud.co", "docomo.ne.j", "ocn.ne.jo"];
+
+function verifyKintoneListData() {
+  verifyListSheet_(VER_KINTONE_LIST_SHEET_NAME);
+}
+
+function verifyListData() {
+  verifyListSheet_(VER_LIST_SHEET_NAME);
+}
+
+function verGetSpreadsheet_() {
+  const url = PropertiesService.getScriptProperties().getProperty("FORM_SPREADSHEET_URL");
+  if (url) return SpreadsheetApp.openByUrl(url);
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) throw new Error("スクリプトプロパティ FORM_SPREADSHEET_URL を設定してください。");
+  return ss;
+}
+
+function verNormalize_(s) {
+  return String(s).normalize("NFKC").replace(/\s/g, "");
+}
+
+function verFetchJson_(url, token) {
+  const res = UrlFetchApp.fetch(url, { method: "get", headers: { "X-Cybozu-API-Token": token }, muteHttpExceptions: true });
+  if (res.getResponseCode() !== 200) throw new Error(`kintone取得失敗 (HTTP ${res.getResponseCode()})`);
+  return JSON.parse(res.getContentText());
+}
+
+// kintoneから、契約中の契約を読み直す（リスト作成.js とは別の読み方）
+function verLoadKintone_() {
+  const props = PropertiesService.getScriptProperties();
+  const sub = props.getProperty("KINTONE_SUBDOMAIN");
+  const app = props.getProperty("KINTONE_KEIYAKU_APP_ID");
+  const token = props.getProperty("KINTONE_KEIYAKU_API_TOKEN");
+  if (!sub || !app || !token) throw new Error("kintone用のスクリプトプロパティが未設定です。");
+
+  const labelToCode = {};
+  const fields = verFetchJson_(`https://${sub}.cybozu.com/k/v1/app/form/fields.json?app=${app}`, token).properties || {};
+  Object.keys(fields).forEach(code => {
+    const key = verNormalize_(fields[code].label);
+    if (!(key in labelToCode)) labelToCode[key] = code;
+  });
+  const override = props.getProperty("KLIST_FIELD_CODES");
+  if (override) {
+    const parsed = JSON.parse(override);
+    Object.keys(parsed).forEach(label => { labelToCode[verNormalize_(label)] = parsed[label]; });
+  }
+  const code = label => VER_EMAIL_CODES[label] || labelToCode[verNormalize_(label)];
+
+  const required = [VER_L_CONTRACT_TYPE, VER_L_STORE, VER_L_CUSTOMER, VER_L_VENDOR, VER_L_BURNABLE];
+  const missing = required.filter(label => !code(label));
+  if (missing.length > 0) throw new Error(`項目が見つかりません: ${missing.join(" / ")}`);
+  const emailLabels = VER_L_EMAILS.filter(label => code(label));
+  const notFound = VER_L_EMAILS.filter(label => !code(label));
+
+  const wanted = ["$id", code(VER_L_CONTRACT_TYPE), code(VER_L_STORE), code(VER_L_CUSTOMER), code(VER_L_VENDOR), code(VER_L_BURNABLE)]
+    .concat(emailLabels.map(code))
+    .concat(Object.keys(VER_ADDRESS_CODES).map(key => VER_ADDRESS_CODES[key]));
+  const fieldsParam = wanted.map((c, i) => `fields%5B${i}%5D=${encodeURIComponent(c)}`).join("&");
+
+  const records = [];
+  let lastId = 0;
+  while (true) {
+    const query = encodeURIComponent(`$id > ${lastId} order by $id asc limit 500`);
+    const page = verFetchJson_(`https://${sub}.cybozu.com/k/v1/records.json?app=${app}&query=${query}&${fieldsParam}`, token).records || [];
+    if (page.length === 0) break;
+    page.forEach(r => records.push(r));
+    lastId = Number(page[page.length - 1].$id.value);
+    if (page.length < 500) break;
+  }
+
+  const text = (record, c) => {
+    const f = record[c];
+    if (!f || f.value === null || f.value === undefined) return "";
+    return Array.isArray(f.value) ? f.value.map(v => (typeof v === "object" ? (v.name || v.code || "") : String(v))).join(",") : String(f.value);
+  };
+
+  const contracts = [];
+  records.forEach(record => {
+    if (text(record, code(VER_L_CONTRACT_TYPE)) !== VER_TARGET_CONTRACT_TYPE) return;
+    const burnable = record[code(VER_L_BURNABLE)];
+    const options = burnable && Array.isArray(burnable.value) ? burnable.value.map(String) : [];
+    contracts.push({
+      id: record.$id.value,
+      store: text(record, code(VER_L_STORE)),
+      customer: text(record, code(VER_L_CUSTOMER)),
+      vendor: text(record, code(VER_L_VENDOR)),
+      weekdays: options.map(o => verNormalize_(o).charAt(0)),
+      address: verBuildAddress_(record, text),
+      emailFields: emailLabels.map(label => ({ label: label, raw: text(record, code(label)) }))
+    });
+  });
+  return { contracts: contracts, notFoundEmailLabels: notFound };
+}
+
+// 店舗の住所（「〒郵便番号 住所」）。リスト作成.js とは別に書いた判定
+function verBuildAddress_(record, text) {
+  const get = key => text(record, VER_ADDRESS_CODES[key]).normalize("NFKC").trim();
+  const postal = get("postal");
+  let address = get("address");
+  if (!address) address = [get("prefecture"), get("city"), get("building")].filter(Boolean).join("");
+  if (!address) return "";
+  const digits = postal.replace(/\D/g, "");
+  const hasPostal = digits !== "" && address.replace(/\D/g, "").indexOf(digits) === 0;
+  return postal && !hasPostal ? `〒${postal} ${address}` : address;
+}
+
+// 優先順位の順にアドレスを集める。独立した判定（リスト作成.js とは別の書き方）
+function verCollectEmails_(emailFields) {
+  const valid = [];
+  const bad = [];
+  emailFields.forEach(f => {
+    String(f.raw).normalize("NFKC").toLowerCase().split(/[\s,;、，；]+/).filter(Boolean).forEach(item => {
+      const a = item.replace(/^mailto:/, "");
+      if (VER_EXCLUDED_EMAIL_PATTERNS.some(pattern => pattern.test(a))) {
+        bad.push(`${f.label}: ${a}（ダミーなど）`);
+      } else if (/^[a-z0-9._%+\-]+@[a-z0-9\-]+(\.[a-z0-9\-]+)*\.[a-z]{2,}$/.test(a)) {
+        if (valid.indexOf(a) === -1) valid.push(a);
+      } else {
+        bad.push(`${f.label}: ${a}`);
+      }
+    });
+  });
+  return { valid: valid, bad: bad };
+}
+
+function verExpectedMarks_(weekdays) {
+  return VER_DATES.map(d => {
+    const key = `${d[0]}-${d[1]}-${d[2]}`;
+    if (VER_NO_COLLECTION.indexOf(key) !== -1) return "";
+    const w = VER_WEEKDAYS.charAt(new Date(d[0], d[1] - 1, d[2]).getDay());
+    return weekdays.indexOf(w) !== -1 ? "○" : "";
+  });
+}
+
+function verifyListSheet_(sheetName) {
+  const ss = verGetSpreadsheet_();
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet) throw new Error(`シート「${sheetName}」が見つかりません。`);
+  const data = sheet.getDataRange().getDisplayValues();
+  const results = [];
+  const add = (level, kind, store, message, ref) => results.push([level, kind, store || "", message, ref || ""]);
+
+  const kintone = verLoadKintone_();
+  kintone.notFoundEmailLabels.forEach(label => add("警告", "項目", "", `アドレスの項目「${label}」がkintoneに見つかりません（この項目は照合していません）`));
+
+  // 1. kintone側で、店舗名の重複・記号の問題を調べる
+  const byStore = {};
+  kintone.contracts.forEach(c => {
+    (byStore[c.store] = byStore[c.store] || []).push(c);
+    if (!c.store) add("エラー", "店舗名", "", `店舗名が空の契約があります（レコード番号 ${c.id}）`);
+    if (/[【】]/.test(c.store)) add("エラー", "店舗名", c.store, "店舗名に【 または 】が含まれています。回答の読み取りができなくなります", `レコード番号 ${c.id}`);
+  });
+  Object.keys(byStore).forEach(store => {
+    if (store && byStore[store].length > 1) {
+      add("エラー", "店舗名の重複", store, `同じ店舗名の契約が ${byStore[store].length} 件あります。回答集計が混ざります`,
+        byStore[store].map(c => "レコード番号 " + c.id).join(" / "));
+    }
+  });
+
+  // 2. 各契約の「あるべき姿」を独立に判定する
+  const expectedList = {};   // 店舗名 → { email, marks }
+  const expectedReview = {}; // 店舗名 → 理由
+  kintone.contracts.forEach(c => {
+    const emails = verCollectEmails_(c.emailFields);
+    if (emails.valid.length === 0) {
+      expectedReview[c.store] = emails.bad.length > 0 ? "アドレスの形式が正しくない" : "アドレスなし";
+      return;
+    }
+    if (c.weekdays.length === 0 || !VER_WEEKDAYS.split("").some(w => c.weekdays.indexOf(w) !== -1)) {
+      expectedReview[c.store] = "可燃の回収曜日なし";
+      return;
+    }
+    const marks = verExpectedMarks_(c.weekdays);
+    if (marks.indexOf("○") === -1) {
+      expectedReview[c.store] = "期間中に回収できる日なし";
+      return;
+    }
+    expectedList[c.store] = { email: emails.valid[0], marks: marks, contract: c, emails: emails };
+  });
+
+  // 3. リストの各行を照合する
+  const listed = {};
+  const emailGroups = {};
+  const formGroups = {};   // アドレスと契約者の組 → 店舗数
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const store = row[VER_COL_STORE];
+    if (!store) continue;
+    const rowLabel = `${i + 1}行目`;
+    if (listed[store]) add("エラー", "リスト", store, "リストに同じ店舗が2行あります", rowLabel);
+    listed[store] = true;
+
+    const email = String(row[VER_COL_EMAIL]).trim();
+    (emailGroups[email] = emailGroups[email] || []).push(store);
+    const expected = expectedList[store];
+    const formKey = email + "\u0001" + String(row[VER_COL_CUSTOMER] || "").trim();
+    formGroups[formKey] = (formGroups[formKey] || 0) + 1;
+
+    if (!expected) {
+      add("エラー", "リスト", store, expectedReview[store]
+        ? `リストにありますが、kintoneの内容では対象外のはずです（${expectedReview[store]}）`
+        : "リストにありますが、kintoneの契約中に見つかりません", rowLabel);
+      continue;
+    }
+    if (email !== expected.email) {
+      add("エラー", "アドレス", store, `送信先が、優先順位で選ぶ結果と違います。リスト: ${email} / 期待: ${expected.email}`, rowLabel);
+    }
+    const actualMarks = row.slice(VER_COL_MARK_START, VER_COL_MARK_END + 1).map(m => (m === "○" ? "○" : m === "" ? "" : "?"));
+    const expectedMarks = expected.marks.concat(Array(Math.max(0, actualMarks.length - expected.marks.length)).fill(""));
+    if (actualMarks.join("|") !== expectedMarks.join("|")) {
+      add("エラー", "回収曜日", store, `希望日の「○」が、回収曜日から求めた結果と違います。リスト: ${actualMarks.join("")} / 期待: ${expectedMarks.join("")}`, rowLabel);
+    }
+    if (expected.marks.length >= 3 && row[VER_COL_MARK_START + 2] === "○") {
+      add("エラー", "回収曜日", store, "回収できない日（1/1）に「○」が付いています", rowLabel);
+    }
+    if (String(row[VER_COL_CUSTOMER] || "").trim() !== String(expected.contract.customer).trim()) {
+      add("エラー", "契約者", store, `契約者がkintoneと違います。リスト: ${row[VER_COL_CUSTOMER]} / kintone: ${expected.contract.customer}（Q列を確認）`, rowLabel);
+    }
+    const listedAddress = String(row[VER_COL_ADDRESS] || "").trim();
+    if (!expected.contract.address) {
+      add("警告", "住所", store, "kintoneに店舗の住所がありません。フォームの店舗ページに住所が出ません", rowLabel);
+    } else if (listedAddress !== expected.contract.address) {
+      add("エラー", "住所", store, `店舗住所がkintoneと違います。リスト: ${listedAddress || "（空）"} / kintone: ${expected.contract.address}（R列を確認）`, rowLabel);
+    }
+    if (String(row[VER_COL_VENDOR]).trim() !== String(expected.contract.vendor).trim()) {
+      add("警告", "業者", store, `業者名がkintoneと違います。リスト: ${row[VER_COL_VENDOR]} / kintone: ${expected.contract.vendor}`, rowLabel);
+    }
+    if (!expected.contract.vendor) add("情報", "業者", store, "業者名が空です（料金は標準額になります）", rowLabel);
+    if (expected.emails.bad.length > 0) {
+      add("情報", "アドレス", store, `形式が正しくない入力があります（使用していません）: ${expected.emails.bad.join(" / ")}`, rowLabel);
+    }
+  }
+  Object.keys(expectedList).forEach(store => {
+    if (!listed[store]) add("エラー", "リスト", store, "kintoneの内容では対象のはずですが、リストにありません");
+  });
+
+  // 4. 要確認シートとの突き合わせ
+  const review = ss.getSheetByName(VER_REVIEW_SHEET_NAME);
+  const reviewed = {};
+  if (review && review.getLastRow() > 1) {
+    review.getDataRange().getDisplayValues().slice(1).forEach(row => { reviewed[row[1]] = row[2]; });
+  }
+  const reviewStores = Object.keys(expectedReview);
+  reviewStores.forEach(store => {
+    if (!(store in reviewed)) add("警告", "要確認", store, `対象外（${expectedReview[store]}）ですが、「要確認」シートにありません`);
+  });
+  Object.keys(reviewed).forEach(store => {
+    if (!(store in expectedReview) && !listed[store]) add("警告", "要確認", store, "「要確認」にありますが、今の照合では対象外の理由が見つかりません（kintoneが更新された可能性）");
+  });
+
+  // 5. アドレス単位のチェック
+  Object.keys(emailGroups).forEach(email => {
+    const stores = emailGroups[email];
+    const customers = {};
+    stores.forEach(store => {
+      const exp = expectedList[store];
+      if (exp) customers[exp.contract.customer] = true;
+    });
+    const customerNames = Object.keys(customers);
+    if (customerNames.length > 1) {
+      add("情報", "複数の契約者", "", `同じアドレス ${email} に ${customerNames.length} 社の契約者があります。契約者ごとに別のフォーム・別のメールになります`, customerNames.join(" / "));
+    }
+    const domain = email.split("@")[1] || "";
+    if (VER_TYPO_DOMAINS.indexOf(domain) !== -1 || /\.(con|cojp|c0m|comm)$/.test(domain)) {
+      add("警告", "アドレス", stores.join(" / "), `アドレスの入力ミスの疑い: ${email}`);
+    }
+    if (!/^[\x21-\x7e]+$/.test(email)) {
+      add("エラー", "アドレス", stores.join(" / "), `アドレスに全角や使えない文字が含まれています: ${email}`);
+    }
+  });
+
+  Object.keys(formGroups).forEach(key => {
+    if (formGroups[key] > VER_MAX_STORES_PER_FORM) {
+      add("警告", "フォーム", "", `アドレスと契約者の組 ${key.replace("\u0001", " / ")} に ${formGroups[key]} 店舗が入っています。1つのフォームに入る質問が多くなります`);
+    }
+  });
+
+  verWriteResult_(ss, sheetName, `kintoneの契約中: ${kintone.contracts.length} 件 / リストの店舗: ${Object.keys(listed).length} 件 / 作成されるフォーム: ${Object.keys(formGroups).length} 件`, results);
+}
+
+function verWriteResult_(ss, sheetName, countLine, results) {
+  const order = { "エラー": 0, "警告": 1, "情報": 2 };
+  results.sort((a, b) => order[a[0]] - order[b[0]]);
+  const counts = { "エラー": 0, "警告": 0, "情報": 0 };
+  results.forEach(r => { counts[r[0]]++; });
+
+  // 検証の対象ごとに別のタブに出す（「リスト」の検証結果を、フォームの検証結果で上書きしないため）
+  const tabName = sheetName.indexOf("作成済みフォーム") === 0 ? VER_RESULT_SHEET_NAME + "_フォーム" : VER_RESULT_SHEET_NAME + "_" + sheetName;
+  let out = ss.getSheetByName(tabName);
+  if (!out) out = ss.insertSheet(tabName);
+  out.clear();
+  const summary = [`検証した対象: 「${sheetName}」`, `日時: ${Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy/MM/dd HH:mm:ss")}`,
+    countLine, `エラー ${counts["エラー"]} 件 / 警告 ${counts["警告"]} 件 / 情報 ${counts["情報"]} 件`];
+  const header = ["重大度", "区分", "店舗名", "内容", "参考"];
+  const rows = summary.map(s => [s, "", "", "", ""]).concat([header], results.length > 0 ? results : [["問題なし", "", "", "検出された食い違いはありません", ""]]);
+  out.getRange(1, 1, rows.length, 5).setValues(rows);
+  out.getRange(summary.length + 1, 1, 1, 5).setFontWeight("bold");
+  console.log(`検証結果（${sheetName}）: エラー ${counts["エラー"]} 件 / 警告 ${counts["警告"]} 件 / 情報 ${counts["情報"]} 件。シート「${tabName}」を確認してください。`);
+}
+
+// 作成したフォームの抜き取り検査と、フォルダとの照合。フォームを作ったあとに実行する
+function verifyCreatedForms() {
+  const ss = verGetSpreadsheet_();
+  const sheet = ss.getSheetByName(VER_LIST_SHEET_NAME);
+  if (!sheet) throw new Error(`シート「${VER_LIST_SHEET_NAME}」が見つかりません。`);
+  const data = sheet.getDataRange().getDisplayValues();
+  const headers = data[0];
+  const results = [];
+  const add = (level, kind, store, message, ref) => results.push([level, kind, store || "", message, ref || ""]);
+
+  const formsById = {};
+  const forms = [];
+  let sentRows = 0;
+  let pendingRows = 0;
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const status = row[VER_COL_STATUS];
+    if (status === "送信済") {
+      sentRows++;
+      if (!row[VER_COL_ID] || !row[VER_COL_URL]) {
+        add("エラー", "フォーム", row[VER_COL_STORE], "フォーム作成状況は「送信済」ですが、URLまたはIDが空です", `${i + 1}行目`);
+        continue;
+      }
+      if (!formsById[row[VER_COL_ID]]) {
+        formsById[row[VER_COL_ID]] = { id: row[VER_COL_ID], email: row[VER_COL_EMAIL], stores: [] };
+        forms.push(formsById[row[VER_COL_ID]]);
+      }
+      formsById[row[VER_COL_ID]].stores.push({
+        name: row[VER_COL_STORE],
+        address: String(row[VER_COL_ADDRESS] || "").trim(),
+        dates: row.slice(VER_COL_MARK_START, VER_COL_MARK_END + 1).map((m, k) => (m === "○" ? headers[VER_COL_MARK_START + k] : "")).filter(Boolean)
+      });
+    } else if (status === "エラー") {
+      add("エラー", "フォーム", row[VER_COL_STORE], "フォーム作成がエラーになっています", `${i + 1}行目`);
+    } else if (row[VER_COL_STORE]) {
+      pendingRows++;
+    }
+  }
+  if (pendingRows > 0) add("情報", "進捗", "", `フォームがまだ作られていない店舗が ${pendingRows} 件あります`);
+
+  // 抜き取り検査（先頭・末尾と、ランダムに選んだもの）
+  const picked = [];
+  if (forms.length > 0) {
+    picked.push(forms[0], forms[forms.length - 1]);
+    const shuffled = forms.slice(1, -1).sort(() => Math.random() - 0.5);
+    shuffled.slice(0, Math.max(0, VER_FORM_SAMPLE_COUNT - picked.length)).forEach(f => picked.push(f));
+  }
+  const startTime = Date.now();
+  let checked = 0;
+  picked.forEach(f => {
+    if (Date.now() - startTime > 4 * 60 * 1000) return;
+    try {
+      const form = FormApp.openById(f.id);
+      checked++;
+      const label = f.stores.map(s => s.name).join("・");
+      if (!form.isAcceptingResponses()) add("警告", "フォーム", label, "フォームの受付が止まっています", f.id);
+      const description = form.getDescription();
+      f.stores.forEach(s => {
+        if (description.indexOf(s.name) === -1) add("エラー", "フォーム", s.name, "フォームの説明文に店舗名がありません", f.id);
+      });
+      const items = form.getItems();
+      const titles = items.map(item => item.getTitle());
+      f.stores.forEach(s => {
+        const header = items.filter(item => item.getTitle() === `【${s.name}】の収集希望について`)[0];
+        if (header && s.address && header.getHelpText().indexOf(s.address) === -1) {
+          add("エラー", "フォーム", s.name, "店舗ページの見出しに、住所が入っていません", f.id);
+        }
+      });
+      f.stores.forEach(s => {
+        if (!titles.some(t => t === `【${s.name}】の収集希望について`)) add("エラー", "フォーム", s.name, "店舗の見出しがフォームにありません", f.id);
+        s.dates.forEach(d => {
+          if (titles.indexOf(`【${s.name}】${d}の収集を希望しますか？`) === -1) add("エラー", "フォーム", s.name, `「${d}」の質問がフォームにありません`, f.id);
+        });
+      });
+      const expectedQuestions = f.stores.reduce((sum, s) => sum + s.dates.length, 0);
+      const actualQuestions = titles.filter(t => /^【.+】.+の収集を希望しますか？$/.test(t)).length;
+      if (expectedQuestions !== actualQuestions) {
+        add("エラー", "フォーム", label, `日付の質問の数が違います。期待 ${expectedQuestions} / 実際 ${actualQuestions}`, f.id);
+      }
+    } catch (e) {
+      add("エラー", "フォーム", f.stores.map(s => s.name).join("・"), `フォームを開けません: ${e}`, f.id);
+    }
+  });
+
+  // フォルダとの照合
+  const folderId = PropertiesService.getScriptProperties().getProperty("FORM_FOLDER_ID");
+  if (folderId) {
+    try {
+      const folder = DriveApp.getFolderById(folderId.trim());
+      const inFolder = {};
+      const files = folder.getFilesByType(MimeType.GOOGLE_FORMS);
+      while (files.hasNext()) inFolder[files.next().getId()] = true;
+      forms.forEach(f => {
+        if (!inFolder[f.id]) add("エラー", "フォルダ", f.stores.map(s => s.name).join("・"), "フォームが指定のフォルダにありません", f.id);
+      });
+      Object.keys(inFolder).forEach(id => {
+        if (!formsById[id]) add("警告", "フォルダ", "", "リストにないフォームがフォルダにあります（テストで作ったものなど）。不要なら削除してください", id);
+      });
+    } catch (e) {
+      add("警告", "フォルダ", "", `フォルダを確認できませんでした: ${e}`);
+    }
+  } else {
+    add("情報", "フォルダ", "", "FORM_FOLDER_ID が未設定のため、フォルダとの照合はしていません");
+  }
+
+  verWriteResult_(ss, `作成済みフォーム（抜き取り ${checked} 件）`, `フォーム作成済みの店舗: ${sentRows} 件 / フォーム数: ${forms.length} 件`, results);
+}
+
+
+================================================================
+ファイル名: 設定確認.gs
+役割: 設定と接続の確認（削除してよい）
+================================================================
+
+// ===== 設定の確認（テスト用。確認が済んだら、このファイルごと削除してよい） =====
+// スクリプトプロパティと接続を確認する。値の中身（APIトークンなど）はログに出さず、○（OK）か×（要確認）だけを出す。
+// このファイルだけで動く。ほかのファイルには影響しない（消しても、ほかのファイルは動く）。
+//
+// 使い方: checkSettings を実行して、実行ログの「○」「×」を見る。「×」のものを直す。
+
+function checkSettings() {
+  const props = PropertiesService.getScriptProperties();
+  const log = (ok, name, detail) => console.log(`${ok ? "○" : "×"} ${name}: ${detail}`);
+  const get = name => String(props.getProperty(name) || "");
+  const spaceNote = value => (value !== value.trim() ? "（前後にスペースが入っています）" : "");
+  const normalize = s => String(s).normalize("NFKC").replace(/\s/g, "");
+
+  // kintone の3項目
+  const sub = get("KINTONE_SUBDOMAIN");
+  const app = get("KINTONE_KEIYAKU_APP_ID");
+  const token = get("KINTONE_KEIYAKU_API_TOKEN");
+  log(!!sub && sub === sub.trim() && !/[\/.:]/.test(sub), "KINTONE_SUBDOMAIN",
+    !sub ? "未設定" : /[\/.:]/.test(sub) ? "https:// や .cybozu.com を含めず、先頭の名前だけにしてください" : `設定あり（${sub}）${spaceNote(sub)}`);
+  log(/^\d+$/.test(app), "KINTONE_KEIYAKU_APP_ID", !app ? "未設定" : /^\d+$/.test(app) ? `設定あり（${app}）` : "数字だけにしてください" + spaceNote(app));
+  log(!!token && token === token.trim(), "KINTONE_KEIYAKU_API_TOKEN", !token ? "未設定" : `設定あり（${token.length}文字）${spaceNote(token)}`);
+
+  if (sub && app && token) {
+    try {
+      const response = UrlFetchApp.fetch(`https://${sub.trim()}.cybozu.com/k/v1/app/form/fields.json?app=${app.trim()}`,
+        { method: "get", headers: { "X-Cybozu-API-Token": token.trim() }, muteHttpExceptions: true });
+      if (response.getResponseCode() !== 200) throw new Error(`HTTP ${response.getResponseCode()}`);
+      const fields = JSON.parse(response.getContentText()).properties || {};
+      log(true, "kintoneへの接続（項目の取得）", `成功（項目 ${Object.keys(fields).length} 件）`);
+      const labels = Object.keys(fields).map(code => normalize(fields[code].label));
+      const codeOverrides = { "送付先別：e-mail": "送付先別mail1" };   // リスト作成.js の KLIST_EMAIL_CODES と同じ
+      [
+        "契約種別", "契約店舗名称", "顧客名称", "収集業者：名称", "可燃収集日",
+        "年末年始　回答アドレス①", "年末年始　回答アドレス②", "案内等送付先メールアドレス:(to)",
+        "送付先別：e-mail", "契約時の顧客担当：メールアドレス"
+      ].forEach(label => {
+        const byCode = codeOverrides[label] && fields[codeOverrides[label]];
+        const found = labels.indexOf(normalize(label)) !== -1 || !!byCode;
+        log(found, `項目「${label}」`, found ? (byCode ? `あり（コード ${codeOverrides[label]}）` : "あり") : "見つかりません");
+      });
+    } catch (e) {
+      log(false, "kintoneへの接続", `失敗: ${e}（サブドメイン・アプリID・トークン・「アプリ管理」の権限を確認）`);
+    }
+  }
+
+  // フォームの保存先フォルダ
+  const folderId = get("FORM_FOLDER_ID");
+  if (!folderId) {
+    log(false, "FORM_FOLDER_ID", "未設定（フォームがマイドライブ直下にできます）");
+  } else {
+    try {
+      log(true, "FORM_FOLDER_ID", `フォルダを開けました（${DriveApp.getFolderById(folderId.trim()).getName()}）${spaceNote(folderId)}`);
+    } catch (e) {
+      log(false, "FORM_FOLDER_ID", "フォルダを開けません。IDと共有設定を確認してください");
+    }
+  }
+
+  // スプレッドシート
+  try {
+    const url = get("FORM_SPREADSHEET_URL");
+    const ss = url ? SpreadsheetApp.openByUrl(url) : SpreadsheetApp.getActiveSpreadsheet();
+    log(!!ss, "スプレッドシート", ss ? `「${ss.getName()}」を使います` : "見つかりません。FORM_SPREADSHEET_URL を設定してください");
+  } catch (e) {
+    log(false, "スプレッドシート", String(e));
+  }
+
+  // 送信元・テスト用アドレス
+  const from = get("MAIL_FROM").trim();
+  if (!from) {
+    log(true, "MAIL_FROM", "未設定（実行アカウントのアドレスから送ります）");
+  } else {
+    const own = String(Session.getEffectiveUser().getEmail() || "").toLowerCase();
+    const aliases = GmailApp.getAliases().map(a => String(a).toLowerCase());
+    const ok = from.toLowerCase() === own || aliases.indexOf(from.toLowerCase()) !== -1;
+    log(ok, "MAIL_FROM", ok ? `${from} から送信できます` : `${from} は、このアカウントから送信できるアドレスとして登録されていません`);
+  }
+  ["INVITE_TEST_TO", "RESP_MAIL_TEST_TO"].forEach(name => {
+    const value = get(name).trim();
+    log(!value || /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(value), name, !value ? "未設定" : `設定あり（${value}）`);
+  });
+  console.log(`参考: FORM_TEST_LIMIT=${get("FORM_TEST_LIMIT") || "未設定"} / RESP_MAIL_MODE=${get("RESP_MAIL_MODE") || "未設定（off）"} / INVITE_MODE=${get("INVITE_MODE") || "未設定（送信しない）"}`);
+}
+
+// アドレスに関係しそうな項目（名前に「メール」「mail」「アドレス」「送付」を含むもの）を、テーブルの中の項目も含めて一覧にする。
+// 項目名と種類だけを出し、個人情報（実際のアドレス）は出さない。
+function findEmailFields() {
+  const props = PropertiesService.getScriptProperties();
+  const sub = String(props.getProperty("KINTONE_SUBDOMAIN") || "").trim();
+  const app = String(props.getProperty("KINTONE_KEIYAKU_APP_ID") || "").trim();
+  const token = String(props.getProperty("KINTONE_KEIYAKU_API_TOKEN") || "").trim();
+  const response = UrlFetchApp.fetch(`https://${sub}.cybozu.com/k/v1/app/form/fields.json?app=${app}`,
+    { method: "get", headers: { "X-Cybozu-API-Token": token }, muteHttpExceptions: true });
+  if (response.getResponseCode() !== 200) throw new Error(`HTTP ${response.getResponseCode()}`);
+  const properties = JSON.parse(response.getContentText()).properties || {};
+
+  const pattern = /メール|mail|アドレス|送付/i;
+  let count = 0;
+  const show = (code, field, tableLabel) => {
+    if (!pattern.test(String(field.label)) && !(tableLabel && pattern.test(tableLabel))) return;
+    console.log(`${tableLabel ? "【テーブル「" + tableLabel + "」の中】" : "【通常の項目】"} 項目名=「${field.label}」 コード=${code} 種類=${field.type}`);
+    count++;
+  };
+  Object.keys(properties).forEach(code => {
+    const field = properties[code];
+    show(code, field, "");
+    if (field.type === "SUBTABLE" && field.fields) {
+      Object.keys(field.fields).forEach(innerCode => show(innerCode, field.fields[innerCode], field.label || code));
+    }
+  });
+  console.log(`該当した項目: ${count} 件`);
+}
+
+// 店舗の住所に関係しそうな項目（名前に「住所」「所在地」「郵便」「都道府県」「市区」「番地」「ビル」を含むもの）を一覧にする。
+// 項目名・コード・種類と、最初の契約中の1件の値の例を出す（住所の入っている項目を探すため。アドレスなどは出さない）
+function findAddressFields() {
+  const props = PropertiesService.getScriptProperties();
+  const sub = String(props.getProperty("KINTONE_SUBDOMAIN") || "").trim();
+  const app = String(props.getProperty("KINTONE_KEIYAKU_APP_ID") || "").trim();
+  const token = String(props.getProperty("KINTONE_KEIYAKU_API_TOKEN") || "").trim();
+  const headers = { "X-Cybozu-API-Token": token };
+  const response = UrlFetchApp.fetch(`https://${sub}.cybozu.com/k/v1/app/form/fields.json?app=${app}`,
+    { method: "get", headers: headers, muteHttpExceptions: true });
+  if (response.getResponseCode() !== 200) throw new Error(`HTTP ${response.getResponseCode()}`);
+  const properties = JSON.parse(response.getContentText()).properties || {};
+
+  const pattern = /住所|所在地|郵便|都道府県|市区|番地|ビル|地番|アドレス（住所）/;
+  const found = [];
+  Object.keys(properties).forEach(code => {
+    const field = properties[code];
+    if (pattern.test(String(field.label))) found.push({ code: code, label: field.label, type: field.type });
+  });
+  if (found.length === 0) {
+    console.log("該当する項目が見つかりませんでした。");
+    return;
+  }
+
+  // 値の例（契約中の1件目）
+  const fieldsParam = found.map((f, i) => `fields%5B${i}%5D=${encodeURIComponent(f.code)}`).join("&");
+  const query = encodeURIComponent('契約種別 = "契約中" limit 1');
+  const sample = UrlFetchApp.fetch(`https://${sub}.cybozu.com/k/v1/records.json?app=${app}&query=${query}&${fieldsParam}`,
+    { method: "get", headers: headers, muteHttpExceptions: true });
+  const record = sample.getResponseCode() === 200 ? (JSON.parse(sample.getContentText()).records || [])[0] : null;
+
+  found.forEach(f => {
+    const value = record && record[f.code] ? record[f.code].value : "";
+    console.log(`項目名=「${f.label}」 コード=${f.code} 種類=${f.type} 値の例=「${Array.isArray(value) ? value.join(",") : value}」`);
+  });
+  console.log(`該当した項目: ${found.length} 件`);
+}
