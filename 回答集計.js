@@ -91,6 +91,7 @@ const RESP_COL_DATE_END = 7;
 const RESP_COL_FORM_URL = 8;    // I列: フォームURL
 const RESP_COL_FORM_ID = 9;     // J列: フォームID
 const RESP_COL_STATUS = 10;     // K列: フォーム作成状況
+const RESP_COL_ADDRESS = 17;    // R列: 店舗の住所（控えメールに載せる）
 
 // 「回答集計」シートの、手入力・自動記録の列（集計のたびに書き換えず、前の値を引き継ぐ）
 const RESP_HEADER_REQUESTED = "業者依頼済";
@@ -287,6 +288,7 @@ function respGroupFormsFromList(data) {
     formsById[formId].stores.push({
       name: row[RESP_COL_STORE],
       email: row[RESP_COL_EMAIL],
+      address: String(row[RESP_COL_ADDRESS] || "").trim(),
       offered: row.slice(RESP_COL_DATE_START, RESP_COL_DATE_END + 1).map(mark => mark === "○")
     });
   }
@@ -541,7 +543,9 @@ function respSendReceiptIfNeeded(form, rows, dateHeaders, previousMailed, mail) 
     return "";
   }
 
-  const message = respBuildReceiptMail(rows, dateHeaders, form.formUrl);
+  const addresses = {};
+  form.stores.forEach(store => { addresses[store.name] = store.address; });
+  const message = respBuildReceiptMail(rows, dateHeaders, form.formUrl, addresses);
   const subjectPrefix = mail.mode === "test" ? "【テスト】" : "";
   const bodyPrefix = mail.mode === "test" ? `（テスト送信です。本来の宛先: ${customerEmail}）\n\n` : "";
   const options = { to: to, subject: subjectPrefix + message.subject, body: bodyPrefix + message.body, name: RESP_MAIL_SENDER_NAME };
@@ -572,7 +576,7 @@ function respSendMail(options, from) {
 }
 
 // 1つのフォームの回答（店舗ごとの行）から、控えメールの件名と本文を作る
-function respBuildReceiptMail(rows, dateHeaders, formUrl) {
+function respBuildReceiptMail(rows, dateHeaders, formUrl, addresses) {
   const D = dateHeaders.length;
   const first = rows[0];
   const answeredAt = first[1];
@@ -588,6 +592,7 @@ function respBuildReceiptMail(rows, dateHeaders, formUrl) {
   // 店舗ごとの「聞かれた日」だけを取り出す（回収日でない日は載せない）
   const stores = rows.map(row => ({
     name: row[0],
+    address: (addresses || {})[row[0]] || "",
     want: row[2],
     days: dateHeaders.map((header, i) => ({ header: header, cell: row[3 + i] })).filter(d => d.cell === "○" || d.cell === "×")
   }));
@@ -603,6 +608,7 @@ function respBuildReceiptMail(rows, dateHeaders, formUrl) {
   lines.push("【店舗ごとの回収のご希望】");
   stores.forEach(store => {
     lines.push("", `▼${store.name}`);
+    if (store.address) lines.push(`  ご住所：${store.address}`);
     if (store.days.length === 0) lines.push(`  特別回収：${store.want}`);
     store.days.forEach(d => lines.push(`  ${d.header}　${mark(d.cell)}`));
   });
@@ -625,7 +631,7 @@ function respBuildReceiptMail(rows, dateHeaders, formUrl) {
   h.push(`<p>■回答日時：${esc(answeredAt)}<br>■特別回収期間：${esc(RESP_MAIL_PERIOD_TEXT)}<br>■ご担当者様：${esc(contactName)}<br>■お電話番号：${esc(phone)}</p>`);
   h.push("<p><b>【店舗ごとの回収のご希望】</b><br>○＝回収を希望する　／　×＝回収を希望しない</p>");
   stores.forEach(store => {
-    h.push(`<p style="margin:16px 0 4px;"><b>▼${esc(store.name)}</b></p>`);
+    h.push(`<p style="margin:16px 0 4px;"><b>▼${esc(store.name)}</b>${store.address ? `<br><span style="font-size:13px;">ご住所：${esc(store.address)}</span>` : ""}</p>`);
     if (store.days.length === 0) {
       h.push(`<p>特別回収：${esc(store.want)}</p>`);
       return;
@@ -657,7 +663,8 @@ function sendSampleReceiptMail() {
     ["サンプル店A", "2026/11/01 10:00:00", RESP_ANSWER_YES, "○", "×", "", "○", "山田 太郎", "03-0000-0000", "朝に来ますか？", "sample@example.com", "FORMID", 1, ""],
     ["サンプル店B", "2026/11/01 10:00:00", RESP_ANSWER_NO, "×", "×", "", "", "山田 太郎", "03-0000-0000", "朝に来ますか？", "sample@example.com", "FORMID", 1, ""]
   ];
-  const message = respBuildReceiptMail(rows, dateHeaders, "https://docs.google.com/forms/d/e/（サンプル）/viewform");
+  const message = respBuildReceiptMail(rows, dateHeaders, "https://docs.google.com/forms/d/e/（サンプル）/viewform",
+    { "サンプル店A": "〒130-0013 東京都墨田区錦糸1-2-3 サンプルビル1F", "サンプル店B": "〒130-0022 東京都墨田区江東橋4-5-6" });
   const from = String(PropertiesService.getScriptProperties().getProperty(RESP_MAIL_FROM_PROPERTY) || "").trim();
   respSendMail({ to: testTo, subject: "【テスト】" + message.subject, body: "（サンプルです。実際の回答ではありません）\n\n" + message.body,
     htmlBody: "<p>（サンプルです。実際の回答ではありません）</p>" + message.htmlBody, name: RESP_MAIL_SENDER_NAME }, from);

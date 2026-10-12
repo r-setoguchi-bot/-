@@ -40,6 +40,9 @@ const FORM_COL_EMAIL_END = 15;
 // 契約者（顧客名称）の列（0始まり、Q列）。フォームは、メールアドレスと契約者の組ごとに作る（同じアドレスに複数の契約者がいれば、フォームも別々）
 const FORM_COL_CUSTOMER = 16;
 
+// 店舗の住所（0始まり、R列）。各店舗のページの見出しに載せる（店名が変わっていたり、同じ屋号の店舗がある場合に、どの店舗か分かるように）
+const FORM_COL_ADDRESS = 17;
+
 // 希望日の列（0始まり、D〜H列）
 const FORM_DATE_COL_START = 3;
 const FORM_DATE_COL_END = 7;
@@ -295,9 +298,10 @@ ${deadlineText}◆ 次の画面で、店舗ごとに、各日の回収を「希�
         ? `希望日の選択（${index + 1}/${stores.length}店舗目）`
         : '希望日の選択');
 
+      const address = String(store.rowData[FORM_COL_ADDRESS] || "").trim();
       form.addSectionHeaderItem()
           .setTitle(`【${store.storeName}】の収集希望について`)
-          .setHelpText(`特別回収料金：${fee}/1日`);
+          .setHelpText(`ご住所：${address || "（登録がありません）"}\n特別回収料金：${fee}/1日`);
 
       for (let col = FORM_DATE_COL_START; col <= FORM_DATE_COL_END; col++) {
         if (store.rowData[col] === "○") {

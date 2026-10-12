@@ -1,6 +1,6 @@
 // ===== kintone契約管理 → フォーム作成用リストの作成 =====
 // kintoneの契約管理アプリから「契約中」の契約を取得し、次のシートを作る。フォームは作らない（メールも送らない）。
-//   ・リスト_kintone … フォーム作成用（フォーム作成側の「リスト」と同じ形）
+//   ・リスト_kintone … フォーム作成用（フォーム作成側の「リスト」と同じ形。R列は店舗の住所）
 //   ・要確認       … フォームを作れない契約と、その理由
 //   ・契約状況一覧 … 人が見る管理用。契約中の全件について、フォーム作成の状況を一覧にする
 //
@@ -60,6 +60,15 @@ const KLIST_EMAIL_LABELS = [
 // 「送付先別：e-mail」の本当の項目名は「送付先別：e-mail　※アドレスをここに複数入力しない！」と注意書きが付いている
 const KLIST_EMAIL_CODES = {
   "送付先別：e-mail": "送付先別mail1"
+};
+// 店舗の住所（契約の住所）。フォームの各店舗のページと、控えメールに載せる。フィールドコードで指定する
+// （顧客住所は契約者の住所、送付先別は請求書などの送付先なので、使わない）
+const KLIST_ADDRESS_CODES = {
+  postal: "契約郵便番号",
+  address: "契約住所連結",
+  prefecture: "契約都道府県",
+  city: "契約市区町村",
+  building: "契約ビル名ほか"
 };
 // 可燃の回収曜日は、チェックボックス1項目（選択肢が曜日）に入っている
 const KLIST_BURNABLE_LABEL = "可燃収集日";
@@ -179,6 +188,7 @@ function klistFetchRecords(config, fieldCodes) {
   const wanted = ["$id"].concat(
     [fieldCodes.contractType, fieldCodes.storeName, fieldCodes.customer, fieldCodes.vendor, fieldCodes.burnable]
       .concat(fieldCodes.emails.map(e => e.code))
+      .concat(Object.keys(KLIST_ADDRESS_CODES).map(key => KLIST_ADDRESS_CODES[key]))
   );
   const fieldsParam = wanted.map((code, i) => `fields%5B${i}%5D=${encodeURIComponent(code)}`).join("&");
 
@@ -255,6 +265,18 @@ function klistPickEmail(sources) {
     others: valid.slice(1).map(v => `${v.email}（${v.label}）`).join(" / "),
     invalid: invalid.join(" / ")
   };
+}
+
+// 店舗の住所を、「〒郵便番号 住所」の形にする。「住所連結」が空なら、都道府県・市区町村・ビル名ほかをつなぐ
+function klistBuildAddress(record) {
+  const get = key => klistValue(record, KLIST_ADDRESS_CODES[key]).normalize("NFKC").trim();
+  const postal = get("postal");
+  let address = get("address");
+  if (!address) address = [get("prefecture"), get("city"), get("building")].filter(Boolean).join("");
+  if (!address) return "";
+  const postalDigits = postal.replace(/\D/g, "");
+  const alreadyHasPostal = postalDigits && address.replace(/\D/g, "").indexOf(postalDigits) === 0;
+  return postal && !alreadyHasPostal ? `〒${postal} ${address}` : address;
 }
 
 // 期間中の各日について、見出しと「回収できる曜日か」を作る
@@ -395,7 +417,7 @@ function klistCollect(ss) {
     } else {
       addStatus("未作成", picked.email, "", picked);
     }
-    listRows.push([storeName, picked.email, vendor].concat(marks, carried, rawEmails, [customer])); // Q列: 契約者（顧客名称）
+    listRows.push([storeName, picked.email, vendor].concat(marks, carried, rawEmails, [customer, klistBuildAddress(record)])); // Q列: 契約者（顧客名称）、R列: 店舗の住所
   });
 
   // 全件で曜日が読み取れなかった場合は、選択肢の名前が想定と違うので、シートを作らずに止める
@@ -429,13 +451,15 @@ function buildListFromKintone() {
   const dateHeaders = result.dates.map(date => date.header);
   while (dateHeaders.length < KLIST_DATE_SLOTS) dateHeaders.push("");
   const listHeader = ["店舗名", "メールアドレス", "業者名"]
-    .concat(dateHeaders, ["フォームURL", "フォームID", "フォーム作成状況"], KLIST_EMAIL_LABELS, ["契約者"]);
+    .concat(dateHeaders, ["フォームURL", "フォームID", "フォーム作成状況"], KLIST_EMAIL_LABELS, ["契約者", "店舗住所"]);
   klistWriteSheet(ss, KLIST_OUTPUT_SHEET_NAME, listHeader, result.listRows);
   klistWriteSheet(ss, KLIST_REVIEW_SHEET_NAME, ["レコード番号", "契約店舗名称", "理由", "アドレス欄の内容"], result.reviewRows);
   klistWriteStatusSheet(ss, result.statusRows);
 
   const emailCount = new Set(result.listRows.map(row => row[1])).size;
   const formCount = new Set(result.listRows.map(row => row[1] + "\u0001" + row[16])).size;  // フォームは、アドレスと契約者の組ごと
+  const noAddress = result.listRows.filter(row => !row[17]).length;
+  if (noAddress > 0) console.warn(`店舗の住所が空の店舗が ${noAddress} 件あります（フォームの各店舗のページに住所が出ません）。「${KLIST_OUTPUT_SHEET_NAME}」のR列が空の行を確認してください。`);
   console.log(
     `契約中 ${result.targetCount} 件 → リスト ${result.listRows.length} 件（送信先アドレス ${emailCount} 件、作成するフォーム ${formCount} 件、うち作成済みを引き継ぎ ${result.carriedCount} 件）、` +
     `要確認 ${result.reviewRows.length} 件。シート「${KLIST_OUTPUT_SHEET_NAME}」「${KLIST_REVIEW_SHEET_NAME}」「${KLIST_STATUS_SHEET_NAME}」を確認してください。`

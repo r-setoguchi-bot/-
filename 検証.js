@@ -53,6 +53,10 @@ const VER_COL_URL = 8;
 const VER_COL_ID = 9;
 const VER_COL_STATUS = 10;
 const VER_COL_CUSTOMER = 16;   // Q列: 契約者
+const VER_COL_ADDRESS = 17;    // R列: 店舗住所
+
+// 店舗の住所の項目（フィールドコード）
+const VER_ADDRESS_CODES = { postal: "契約郵便番号", address: "契約住所連結", prefecture: "契約都道府県", city: "契約市区町村", building: "契約ビル名ほか" };
 
 const VER_MAX_STORES_PER_FORM = 30;     // 1フォームの店舗数がこれを超えたら警告
 const VER_FORM_SAMPLE_COUNT = 20;       // フォームの抜き取り件数
@@ -113,7 +117,8 @@ function verLoadKintone_() {
   const notFound = VER_L_EMAILS.filter(label => !code(label));
 
   const wanted = ["$id", code(VER_L_CONTRACT_TYPE), code(VER_L_STORE), code(VER_L_CUSTOMER), code(VER_L_VENDOR), code(VER_L_BURNABLE)]
-    .concat(emailLabels.map(code));
+    .concat(emailLabels.map(code))
+    .concat(Object.keys(VER_ADDRESS_CODES).map(key => VER_ADDRESS_CODES[key]));
   const fieldsParam = wanted.map((c, i) => `fields%5B${i}%5D=${encodeURIComponent(c)}`).join("&");
 
   const records = [];
@@ -144,10 +149,23 @@ function verLoadKintone_() {
       customer: text(record, code(VER_L_CUSTOMER)),
       vendor: text(record, code(VER_L_VENDOR)),
       weekdays: options.map(o => verNormalize_(o).charAt(0)),
+      address: verBuildAddress_(record, text),
       emailFields: emailLabels.map(label => ({ label: label, raw: text(record, code(label)) }))
     });
   });
   return { contracts: contracts, notFoundEmailLabels: notFound };
+}
+
+// 店舗の住所（「〒郵便番号 住所」）。リスト作成.js とは別に書いた判定
+function verBuildAddress_(record, text) {
+  const get = key => text(record, VER_ADDRESS_CODES[key]).normalize("NFKC").trim();
+  const postal = get("postal");
+  let address = get("address");
+  if (!address) address = [get("prefecture"), get("city"), get("building")].filter(Boolean).join("");
+  if (!address) return "";
+  const digits = postal.replace(/\D/g, "");
+  const hasPostal = digits !== "" && address.replace(/\D/g, "").indexOf(digits) === 0;
+  return postal && !hasPostal ? `〒${postal} ${address}` : address;
 }
 
 // 優先順位の順にアドレスを集める。独立した判定（リスト作成.js とは別の書き方）
@@ -262,6 +280,12 @@ function verifyListSheet_(sheetName) {
     if (String(row[VER_COL_CUSTOMER] || "").trim() !== String(expected.contract.customer).trim()) {
       add("エラー", "契約者", store, `契約者がkintoneと違います。リスト: ${row[VER_COL_CUSTOMER]} / kintone: ${expected.contract.customer}（Q列を確認）`, rowLabel);
     }
+    const listedAddress = String(row[VER_COL_ADDRESS] || "").trim();
+    if (!expected.contract.address) {
+      add("警告", "住所", store, "kintoneに店舗の住所がありません。フォームの店舗ページに住所が出ません", rowLabel);
+    } else if (listedAddress !== expected.contract.address) {
+      add("エラー", "住所", store, `店舗住所がkintoneと違います。リスト: ${listedAddress || "（空）"} / kintone: ${expected.contract.address}（R列を確認）`, rowLabel);
+    }
     if (String(row[VER_COL_VENDOR]).trim() !== String(expected.contract.vendor).trim()) {
       add("警告", "業者", store, `業者名がkintoneと違います。リスト: ${row[VER_COL_VENDOR]} / kintone: ${expected.contract.vendor}`, rowLabel);
     }
@@ -367,6 +391,7 @@ function verifyCreatedForms() {
       }
       formsById[row[VER_COL_ID]].stores.push({
         name: row[VER_COL_STORE],
+        address: String(row[VER_COL_ADDRESS] || "").trim(),
         dates: row.slice(VER_COL_MARK_START, VER_COL_MARK_END + 1).map((m, k) => (m === "○" ? headers[VER_COL_MARK_START + k] : "")).filter(Boolean)
       });
     } else if (status === "エラー") {
@@ -397,7 +422,14 @@ function verifyCreatedForms() {
       f.stores.forEach(s => {
         if (description.indexOf(s.name) === -1) add("エラー", "フォーム", s.name, "フォームの説明文に店舗名がありません", f.id);
       });
-      const titles = form.getItems().map(item => item.getTitle());
+      const items = form.getItems();
+      const titles = items.map(item => item.getTitle());
+      f.stores.forEach(s => {
+        const header = items.filter(item => item.getTitle() === `【${s.name}】の収集希望について`)[0];
+        if (header && s.address && header.getHelpText().indexOf(s.address) === -1) {
+          add("エラー", "フォーム", s.name, "店舗ページの見出しに、住所が入っていません", f.id);
+        }
+      });
       f.stores.forEach(s => {
         if (!titles.some(t => t === `【${s.name}】の収集希望について`)) add("エラー", "フォーム", s.name, "店舗の見出しがフォームにありません", f.id);
         s.dates.forEach(d => {
