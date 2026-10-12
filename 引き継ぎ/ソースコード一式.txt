@@ -1,7 +1,7 @@
 年末年始アンケート自動化システム ソースコード一式（Google Apps Script）
 各ファイルの先頭に、ファイル名と、役割を書いています。Apps Script 上のファイル名は、拡張子 .gs です。
 APIトークンなどの秘密の値は、コードに含まれていません（スクリプトプロパティに保存）。
-作成時点: 2026年10月12日
+作成時点: 2026年10月13日（最終更新）
 
 
 
@@ -633,7 +633,7 @@ function createFormsInBatches() {
     }
 
     // 準備が終わったら、保険の再開トリガーを予約しておく。6分制限などで強制終了しても、これで処理が再開する
-    scheduleFormBatch(FORM_SAFETY_DELAY_MS);
+    const safetyTrigger = scheduleFormBatch(FORM_SAFETY_DELAY_MS);
 
     for (let n = 0; n < emails.length; n++) {
       if (Date.now() - startTime > FORM_TIME_LIMIT_MS) {
@@ -646,7 +646,7 @@ function createFormsInBatches() {
       const stores = group.stores;
 
       try {
-        const result = createFormForStores(stores, headers, folder, group.customer);
+        const result = createFormWithRetry(stores, headers, folder, group.customer);
 
         // 1件ごとに書き込み、途中で止まっても同じフォームを二重に作らないようにする
         stores.forEach(store => {
@@ -671,11 +671,17 @@ function createFormsInBatches() {
       }
     }
 
-    deleteFormBatchTriggers();
     if (remaining > 0) {
+      // 先に続きの予約を作る（失敗しても、保険の予約が残っているので、処理が途切れない）。そのあとで、保険の予約を消す
       scheduleFormBatch(FORM_RETRY_DELAY_MS);
+      try {
+        ScriptApp.deleteTrigger(safetyTrigger);
+      } catch (e) {
+        console.warn(`保険の予約を消せませんでした（処理には影響しません）: ${e}`);
+      }
       console.log(`今回 ${formCount} 件作成（エラー ${errorCount} 件）。残り ${remaining} 件は自動で続行します。`);
     } else {
+      deleteFormBatchTriggers();
       console.log(`今回 ${formCount} 件作成（エラー ${errorCount} 件）。すべて完了しました。`);
       refreshContractStatusList();
     }
@@ -759,6 +765,22 @@ function groupUnsentRowsByForm(data) {
   return groupedData;
 }
 
+// フォーム作成は、Googleの一時的なエラー（Failed to retrieve form data など）で失敗することがある。
+// 少し待って、数回やり直す（失敗した回の作りかけのフォームは、createFormForStores の中でゴミ箱へ移される）。それでも失敗したら、例外にする
+function createFormWithRetry(stores, headers, folder, customer) {
+  let lastError;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return createFormForStores(stores, headers, folder, customer);
+    } catch (e) {
+      lastError = e;
+      console.warn(`フォーム作成をやり直します（${attempt + 1}回目の失敗）: ${stores[0].storeName} / ${e}`);
+      Utilities.sleep(3000 * (attempt + 1));   // 3, 6, 9秒
+    }
+  }
+  throw lastError;
+}
+
 function createFormForStores(stores, headers, folder, customer) {
   const storeNamesText = stores.map(store => store.storeName).join('・');
 
@@ -836,8 +858,19 @@ ${deadlineText}◆ 次の画面で、店舗ごとに、各日の回収を「希�
   }
 }
 
+// 続きの実行を予約する。Googleの一時的なサーバーエラーで失敗することがあるので、少し待って、数回やり直す
 function scheduleFormBatch(delayMs) {
-  ScriptApp.newTrigger(FORM_BATCH_HANDLER).timeBased().after(delayMs).create();
+  let lastError;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      return ScriptApp.newTrigger(FORM_BATCH_HANDLER).timeBased().after(delayMs).create();
+    } catch (e) {
+      lastError = e;
+      console.warn(`続きの予約に失敗しました（${attempt + 1}回目）: ${e}`);
+      Utilities.sleep(2000 * Math.pow(2, attempt));   // 2, 4, 8, 16, 32秒
+    }
+  }
+  throw lastError;
 }
 
 // このフォーム作成処理用のトリガーだけを削除する（リマインド・日報などのトリガーは残す）
@@ -893,6 +926,7 @@ const INV_BATCH_HANDLER = "continueInvitations";
 const INV_TIME_LIMIT_MS = 4.5 * 60 * 1000;
 const INV_RETRY_DELAY_MS = 60 * 1000;          // 続きを実行するまでの待ち時間
 const INV_QUOTA_WAIT_MS = 3 * 60 * 60 * 1000;  // 1日の送信上限に達したときに、再開するまでの待ち時間
+const INV_SAFETY_DELAY_MS = 7 * 60 * 1000;     // 実行が強制終了した場合に再開するまでの待ち時間（6分制限より長く）
 const INV_TEST_COUNT = 3;                      // テスト送信で送る件数
 
 // この日時より前は、本番送信しない（誤って早く送らないための安全装置）
@@ -1065,6 +1099,8 @@ function runInvitationBatch() {
 
   try {
     deleteInvitationTriggers();
+    // 強制終了や、続きの予約の失敗に備えた、保険の再開トリガー
+    const safetyTrigger = invScheduleBatch(INV_SAFETY_DELAY_MS);
 
     const from = invGetFrom();
     const ss = invGetSpreadsheet();
@@ -1118,11 +1154,17 @@ function runInvitationBatch() {
     }
 
     if (remaining > 0) {
-      ScriptApp.newTrigger(INV_BATCH_HANDLER).timeBased()
-        .after(stoppedByQuota ? INV_QUOTA_WAIT_MS : INV_RETRY_DELAY_MS).create();
+      // 先に続きの予約を作る（失敗しても、保険の予約が残る）。そのあとで、保険の予約を消す
+      invScheduleBatch(stoppedByQuota ? INV_QUOTA_WAIT_MS : INV_RETRY_DELAY_MS);
+      try {
+        ScriptApp.deleteTrigger(safetyTrigger);
+      } catch (e) {
+        console.warn(`保険の予約を消せませんでした（処理には影響しません）: ${e}`);
+      }
       console.log(`今回 ${sentCount} 通送信（失敗 ${failedCount} 件）。残り ${remaining} 件は` +
         (stoppedByQuota ? "1日の送信上限に達したため、しばらく待ってから" : "") + "自動で続行します。");
     } else {
+      deleteInvitationTriggers();
       console.log(`今回 ${sentCount} 通送信（失敗 ${failedCount} 件）。すべて完了しました。送信記録は「${INV_LOG_SHEET_NAME}」シートにあります。`);
     }
   } finally {
@@ -1132,6 +1174,21 @@ function runInvitationBatch() {
       console.warn(`ロック解除に失敗しました（処理には影響しません）: ${e}`);
     }
   }
+}
+
+// 続きの実行を予約する。Googleの一時的なサーバーエラーで失敗することがあるので、少し待って、数回やり直す
+function invScheduleBatch(delayMs) {
+  let lastError;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      return ScriptApp.newTrigger(INV_BATCH_HANDLER).timeBased().after(delayMs).create();
+    } catch (e) {
+      lastError = e;
+      console.warn(`続きの予約に失敗しました（${attempt + 1}回目）: ${e}`);
+      Utilities.sleep(2000 * Math.pow(2, attempt));   // 2, 4, 8, 16, 32秒
+    }
+  }
+  throw lastError;
 }
 
 function deleteInvitationTriggers() {
@@ -1193,6 +1250,7 @@ const RESP_STATUS_SENT = "送信済";
 const RESP_INTERVAL_HOURS = 2;                // 自動で集計する間隔（時間）
 const RESP_TIME_LIMIT_MS = 4.5 * 60 * 1000;   // 1回あたりの処理時間上限（6分制限対策）
 const RESP_RETRY_DELAY_MS = 60 * 1000;        // 続きを実行するまでの待ち時間
+const RESP_SAFETY_DELAY_MS = 7 * 60 * 1000;   // 実行が強制終了した場合に再開するまでの待ち時間（6分制限より長く）
 const RESP_CURSOR_PROPERTY = "RESP_CURSOR";   // 何番目のフォームまで読んだか
 const RESP_START_HANDLER = "startResponseCollection";
 const RESP_CONTINUE_HANDLER = "collectFormResponses";
@@ -1321,6 +1379,8 @@ function collectFormResponses() {
 
   try {
     deleteTriggersByHandler(RESP_CONTINUE_HANDLER);
+    // 強制終了や、続きの予約の失敗に備えた、保険の再開トリガー
+    const safetyTrigger = respScheduleTrigger(RESP_CONTINUE_HANDLER, RESP_SAFETY_DELAY_MS);
 
     const ss = respGetSpreadsheet();
     const listSheet = ss.getSheetByName(RESP_LIST_SHEET_NAME);
@@ -1370,9 +1430,16 @@ function collectFormResponses() {
 
     if (nextIndex < forms.length) {
       props.setProperty(RESP_CURSOR_PROPERTY, String(nextIndex));
-      ScriptApp.newTrigger(RESP_CONTINUE_HANDLER).timeBased().after(RESP_RETRY_DELAY_MS).create();
+      // 先に続きの予約を作る（失敗しても、保険の予約が残る）。そのあとで、保険の予約を消す
+      respScheduleTrigger(RESP_CONTINUE_HANDLER, RESP_RETRY_DELAY_MS);
+      try {
+        ScriptApp.deleteTrigger(safetyTrigger);
+      } catch (e) {
+        console.warn(`保険の予約を消せませんでした（処理には影響しません）: ${e}`);
+      }
       console.log(`${nextIndex} / ${totalForms} 件のフォームを確認しました（エラー ${errorCount} 件）。残りは自動で続行します。`);
     } else {
+      deleteTriggersByHandler(RESP_CONTINUE_HANDLER);
       props.deleteProperty(RESP_CURSOR_PROPERTY);
       console.log(`全 ${totalForms} 件のフォームを確認しました（今回 ${processedCount} 件、エラー ${errorCount} 件）。回答のある店舗: ${Object.keys(rowsByStore).length} 件`);
       respApplyRequestedStatus(ss, forms);
@@ -1864,6 +1931,7 @@ function closeAllFormsAtCutoff() {
 
   try {
     deleteTriggersByHandler(RESP_CUTOFF_CONTINUE_HANDLER);
+    const cutoffSafetyTrigger = respScheduleTrigger(RESP_CUTOFF_CONTINUE_HANDLER, RESP_SAFETY_DELAY_MS);
 
     const ss = respGetSpreadsheet();
     const listSheet = ss.getSheetByName(RESP_LIST_SHEET_NAME);
@@ -1895,9 +1963,15 @@ function closeAllFormsAtCutoff() {
 
     if (nextIndex < totalForms) {
       props.setProperty(RESP_CUTOFF_CURSOR_PROPERTY, String(nextIndex));
-      ScriptApp.newTrigger(RESP_CUTOFF_CONTINUE_HANDLER).timeBased().after(RESP_RETRY_DELAY_MS).create();
+      respScheduleTrigger(RESP_CUTOFF_CONTINUE_HANDLER, RESP_RETRY_DELAY_MS);
+      try {
+        ScriptApp.deleteTrigger(cutoffSafetyTrigger);
+      } catch (e) {
+        console.warn(`保険の予約を消せませんでした（処理には影響しません）: ${e}`);
+      }
       console.log(`変更の最終日時を過ぎたため受付を止めています: ${nextIndex} / ${totalForms} 件（今回 ${closedCount} 件を停止）。残りは自動で続行します。`);
     } else {
+      deleteTriggersByHandler(RESP_CUTOFF_CONTINUE_HANDLER);
       props.deleteProperty(RESP_CUTOFF_CURSOR_PROPERTY);
       props.setProperty(RESP_CUTOFF_DONE_PROPERTY, RESP_CUTOFF_AT);
       console.log(`変更の最終日時を過ぎたため、全 ${totalForms} 件のフォームの受付を止めました（今回 ${closedCount} 件、失敗 ${failedIds.length} 件）。`);
@@ -1928,6 +2002,21 @@ function respRefreshContractStatusList() {
   }
 }
 
+// 続きの実行を予約する。Googleの一時的なサーバーエラーで失敗することがあるので、少し待って、数回やり直す
+function respScheduleTrigger(handlerName, delayMs) {
+  let lastError;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      return ScriptApp.newTrigger(handlerName).timeBased().after(delayMs).create();
+    } catch (e) {
+      lastError = e;
+      console.warn(`続きの予約に失敗しました（${attempt + 1}回目）: ${e}`);
+      Utilities.sleep(2000 * Math.pow(2, attempt));   // 2, 4, 8, 16, 32秒
+    }
+  }
+  throw lastError;
+}
+
 function deleteTriggersByHandler(handlerName) {
   ScriptApp.getProjectTriggers().forEach(trigger => {
     if (trigger.getHandlerFunction() === handlerName) {
@@ -1939,7 +2028,7 @@ function deleteTriggersByHandler(handlerName) {
 
 ================================================================
 ファイル名: 検証.gs
-役割: リスト・フォームを二重に検証する
+役割: リスト・フォームを二重に検証する（全件検証を含む）
 ================================================================
 
 // ===== 二重チェック：kintoneのデータと作成したリスト・フォームを、別の処理で照合する =====
@@ -2465,6 +2554,21 @@ function stopFullFormVerification() {
   console.log("全件検証を停止しました。");
 }
 
+// 続きの実行を予約する。Googleの一時的なサーバーエラーで失敗することがあるので、少し待って、数回やり直す
+function verScheduleFullTrigger_(delayMs) {
+  let lastError;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      return ScriptApp.newTrigger(VER_FULL_HANDLER).timeBased().after(delayMs).create();
+    } catch (e) {
+      lastError = e;
+      console.warn(`続きの予約に失敗しました（${attempt + 1}回目）: ${e}`);
+      Utilities.sleep(2000 * Math.pow(2, attempt));   // 2, 4, 8, 16, 32秒
+    }
+  }
+  throw lastError;
+}
+
 function verDeleteFullTriggers_() {
   ScriptApp.getProjectTriggers().forEach(trigger => {
     if (trigger.getHandlerFunction() === VER_FULL_HANDLER) ScriptApp.deleteTrigger(trigger);
@@ -2510,8 +2614,8 @@ function continueFullFormVerification() {
     const data = listSheet.getDataRange().getDisplayValues();
     const forms = verGroupFormsForFull_(data);
 
-    // 強制終了に備えた、保険の再開トリガー
-    ScriptApp.newTrigger(VER_FULL_HANDLER).timeBased().after(VER_FULL_SAFETY_DELAY_MS).create();
+    // 強制終了や、続きの予約の失敗に備えた、保険の再開トリガー
+    const safetyTrigger = verScheduleFullTrigger_(VER_FULL_SAFETY_DELAY_MS);
 
     const props = PropertiesService.getScriptProperties();
     let index = Number(props.getProperty(VER_FULL_CURSOR_PROPERTY) || 0);
@@ -2523,13 +2627,18 @@ function continueFullFormVerification() {
       index++;
     }
     verAppendFullRows_(sheet, rows);
-    verDeleteFullTriggers_();
 
     if (index < forms.length) {
       props.setProperty(VER_FULL_CURSOR_PROPERTY, String(index));
-      ScriptApp.newTrigger(VER_FULL_HANDLER).timeBased().after(VER_FULL_RETRY_DELAY_MS).create();
+      verScheduleFullTrigger_(VER_FULL_RETRY_DELAY_MS);
+      try {
+        ScriptApp.deleteTrigger(safetyTrigger);
+      } catch (e) {
+        console.warn(`保険の予約を消せませんでした（処理には影響しません）: ${e}`);
+      }
       console.log(`${index} / ${forms.length} 件のフォームを確認しました。残りは自動で続行します。`);
     } else {
+      verDeleteFullTriggers_();
       props.deleteProperty(VER_FULL_CURSOR_PROPERTY);
       verFinishFull_(ss, sheet, data, forms);
     }
