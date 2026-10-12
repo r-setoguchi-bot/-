@@ -1,5 +1,6 @@
 // ===== 年末年始回収アンケート フォーム一括作成 =====
-// 「リスト」シートの未送信行をメールアドレスごとにまとめてフォームを作成する。
+// 「リスト」シートの未送信行を、メールアドレスと契約者（Q列）の組ごとにまとめてフォームを作成する。
+// 同じメールアドレスに複数の契約者（会社）がある場合は、会社ごとに別のフォームを作る。
 // 1回の実行は FORM_TIME_LIMIT_MS で打ち切り、残りがあれば時間主導トリガーで自動的に続きを実行する。
 //
 // 使い方:
@@ -35,6 +36,9 @@ const FORM_COL_STATUS = 11; // K列: フォーム作成状況
 // 各アドレス項目の内容（0始まり、L〜P列）。「メール送信用」シートに並べる
 const FORM_COL_EMAIL_START = 11;
 const FORM_COL_EMAIL_END = 15;
+
+// 契約者（顧客名称）の列（0始まり、Q列）。フォームは、メールアドレスと契約者の組ごとに作る（同じアドレスに複数の契約者がいれば、フォームも別々）
+const FORM_COL_CUSTOMER = 16;
 
 // 希望日の列（0始まり、D〜H列）
 const FORM_DATE_COL_START = 3;
@@ -102,7 +106,7 @@ function createFormsInBatches() {
 
     const folder = getFormFolder();
 
-    const groupedData = groupUnsentRowsByEmail(data);
+    const groupedData = groupUnsentRowsByForm(data);
     let emails = Object.keys(groupedData);
 
     // 動作確認用: スクリプトプロパティ FORM_TEST_LIMIT に件数（例: 5）を入れると、その件数だけ作って止まる。本番の前に消すこと
@@ -121,11 +125,12 @@ function createFormsInBatches() {
         break;
       }
 
-      const email = emails[n];
-      const stores = groupedData[email];
+      const group = groupedData[emails[n]];
+      const email = group.email;
+      const stores = group.stores;
 
       try {
-        const result = createFormForStores(stores, headers, folder);
+        const result = createFormForStores(stores, headers, folder, group.customer);
 
         // 1件ごとに書き込み、途中で止まっても同じフォームを二重に作らないようにする
         stores.forEach(store => {
@@ -135,7 +140,7 @@ function createFormsInBatches() {
         // 店舗ごとに1行。各アドレス項目の内容と、フォームURL、実際にフォームの送信先にしたアドレスを並べる
         stores.forEach(store => {
           sendSheet.appendRow([store.storeName]
-            .concat(store.rowData.slice(FORM_COL_EMAIL_START, FORM_COL_EMAIL_END + 1), [result.formUrl, email]));
+            .concat(store.rowData.slice(FORM_COL_EMAIL_START, FORM_COL_EMAIL_END + 1), [result.formUrl, email, group.customer]));
         });
         SpreadsheetApp.flush();
         formCount++;
@@ -209,12 +214,13 @@ function getFormSendSheet(ss, headers) {
   }
   if (sendSheet.getLastRow() === 0) {
     const emailHeaders = headers.slice(FORM_COL_EMAIL_START, FORM_COL_EMAIL_END + 1);
-    sendSheet.appendRow(["店名"].concat(emailHeaders, ["フォームURL", "送信先アドレス"]));
+    sendSheet.appendRow(["店名"].concat(emailHeaders, ["フォームURL", "送信先アドレス", "契約者"]));
   }
   return sendSheet;
 }
 
-function groupUnsentRowsByEmail(data) {
+// 未作成の店舗を、メールアドレスと契約者の組ごとにまとめる（組ごとに1つのフォーム）
+function groupUnsentRowsByForm(data) {
   const groupedData = {};
   for (let i = 1; i < data.length; i++) {
     const row = data[i];
@@ -222,10 +228,12 @@ function groupUnsentRowsByEmail(data) {
     const status = row[FORM_COL_STATUS - 1];   // K列
     if (status === FORM_STATUS_SENT || status === FORM_STATUS_ERROR || !email) continue;
 
-    if (!groupedData[email]) {
-      groupedData[email] = [];
+    const customer = String(row[FORM_COL_CUSTOMER] || "").trim();
+    const key = email + "\u0001" + customer;
+    if (!groupedData[key]) {
+      groupedData[key] = { email: email, customer: customer, stores: [] };
     }
-    groupedData[email].push({
+    groupedData[key].stores.push({
       storeName: row[0], // A列
       vendor: row[2],    // C列
       rowNumber: i + 1,
@@ -235,7 +243,7 @@ function groupUnsentRowsByEmail(data) {
   return groupedData;
 }
 
-function createFormForStores(stores, headers, folder) {
+function createFormForStores(stores, headers, folder, customer) {
   const storeNamesText = stores.map(store => store.storeName).join('・');
 
   const form = FormApp.create(FORM_TITLE);
@@ -248,7 +256,9 @@ function createFormForStores(stores, headers, folder) {
     const changeDeadlineText = FORM_CHANGE_DEADLINE_TEXT ? `\n　変更のご希望は${FORM_CHANGE_DEADLINE_TEXT}までにお願いいたします。` : "";
     const deadlineText = FORM_DEADLINE_TEXT ? `◆ご回答期限：${FORM_DEADLINE_TEXT}まで\n\n` : "";
 
-    form.setDescription(`【対象店舗】
+    const customerText = customer ? `【ご契約者】\n${customer}\n\n` : "";
+
+    form.setDescription(`${customerText}【対象店舗】
 ${storeNamesText}
 
 特別回収期間：${FORM_PERIOD_TEXT}

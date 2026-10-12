@@ -360,7 +360,7 @@ function klistCollect(ss) {
 
     const emailSources = fieldCodes.emails.map(e => ({ label: e.label, raw: klistValue(record, e.code) }));
     const picked = klistPickEmail(emailSources);
-    // 各アドレス項目に入っている内容をそのまま並べる（L〜P列。「メール送信用」シートに使う）。見つからない項目の列は空
+    // 各アドレス項目に入っている内容をそのまま並べる（L〜P列。「メール送信用」シートに使う。Q列は契約者）。見つからない項目の列は空
     const rawEmails = KLIST_EMAIL_LABELS.map(label => {
       const found = emailSources.filter(e => e.label === label)[0];
       return found ? found.raw : "";
@@ -395,7 +395,7 @@ function klistCollect(ss) {
     } else {
       addStatus("未作成", picked.email, "", picked);
     }
-    listRows.push([storeName, picked.email, vendor].concat(marks, carried, rawEmails));
+    listRows.push([storeName, picked.email, vendor].concat(marks, carried, rawEmails, [customer])); // Q列: 契約者（顧客名称）
   });
 
   // 全件で曜日が読み取れなかった場合は、選択肢の名前が想定と違うので、シートを作らずに止める
@@ -403,7 +403,8 @@ function klistCollect(ss) {
     throw new Error(`「${KLIST_BURNABLE_LABEL}」の選択肢を曜日として読み取れませんでした。選択肢: ${Array.from(seenBurnableOptions).join(" / ") || "（なし）"}`);
   }
 
-  listRows.sort((a, b) => (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0)); // 同じアドレスが並ぶように
+  // 同じアドレス・同じ契約者の店舗が並ぶように（フォームは、アドレスと契約者の組ごとに作る）
+  listRows.sort((a, b) => (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : (a[16] < b[16] ? -1 : a[16] > b[16] ? 1 : 0)));
 
   return {
     dates: dates,
@@ -428,14 +429,15 @@ function buildListFromKintone() {
   const dateHeaders = result.dates.map(date => date.header);
   while (dateHeaders.length < KLIST_DATE_SLOTS) dateHeaders.push("");
   const listHeader = ["店舗名", "メールアドレス", "業者名"]
-    .concat(dateHeaders, ["フォームURL", "フォームID", "フォーム作成状況"], KLIST_EMAIL_LABELS);
+    .concat(dateHeaders, ["フォームURL", "フォームID", "フォーム作成状況"], KLIST_EMAIL_LABELS, ["契約者"]);
   klistWriteSheet(ss, KLIST_OUTPUT_SHEET_NAME, listHeader, result.listRows);
   klistWriteSheet(ss, KLIST_REVIEW_SHEET_NAME, ["レコード番号", "契約店舗名称", "理由", "アドレス欄の内容"], result.reviewRows);
   klistWriteStatusSheet(ss, result.statusRows);
 
   const emailCount = new Set(result.listRows.map(row => row[1])).size;
+  const formCount = new Set(result.listRows.map(row => row[1] + "\u0001" + row[16])).size;  // フォームは、アドレスと契約者の組ごと
   console.log(
-    `契約中 ${result.targetCount} 件 → リスト ${result.listRows.length} 件（送信先 ${emailCount} 件、うち作成済みを引き継ぎ ${result.carriedCount} 件）、` +
+    `契約中 ${result.targetCount} 件 → リスト ${result.listRows.length} 件（送信先アドレス ${emailCount} 件、作成するフォーム ${formCount} 件、うち作成済みを引き継ぎ ${result.carriedCount} 件）、` +
     `要確認 ${result.reviewRows.length} 件。シート「${KLIST_OUTPUT_SHEET_NAME}」「${KLIST_REVIEW_SHEET_NAME}」「${KLIST_STATUS_SHEET_NAME}」を確認してください。`
   );
 }

@@ -1,6 +1,7 @@
 // ===== フォームの案内メールを、顧客ごとに1通ずつ送る =====
 // 「リスト」シートで作成済み（フォーム作成状況が「送信済」）のフォームごとに、案内メールを1通送る。
 // 宛先は「リスト」のB列のアドレス。同じフォームの店舗は、1通にまとめて書く。
+// 同じアドレスに複数の契約者（会社）がある場合は、会社ごとのフォームなので、同じアドレスに会社の数だけメールが届く。
 // 1回の実行は INV_TIME_LIMIT_MS で打ち切り、残りがあれば時間主導トリガーで自動的に続きを実行する。
 // 送った結果は「案内メール送信記録」シートに残り、同じフォームには二重に送らない（「リスト」を作り直しても記録は残る）。
 //
@@ -46,6 +47,7 @@ const INV_COL_EMAIL = 1;     // B列: メールアドレス
 const INV_COL_FORM_URL = 8;  // I列: フォームURL
 const INV_COL_FORM_ID = 9;   // J列: フォームID
 const INV_COL_STATUS = 10;   // K列: フォーム作成状況
+const INV_COL_CUSTOMER = 16; // Q列: 契約者（顧客名称）
 
 // 案内メールの文面
 const INV_SENDER_NAME = "株式会社クリメン";
@@ -105,7 +107,8 @@ function invGroupFormsFromList(data) {
     if (!formId || row[INV_COL_STATUS] !== INV_STATUS_SENT) continue;
 
     if (!formsById[formId]) {
-      formsById[formId] = { formId: formId, formUrl: row[INV_COL_FORM_URL], email: String(row[INV_COL_EMAIL]).trim(), stores: [] };
+      formsById[formId] = { formId: formId, formUrl: row[INV_COL_FORM_URL], email: String(row[INV_COL_EMAIL]).trim(),
+        customer: String(row[INV_COL_CUSTOMER] || "").trim(), stores: [] };
       forms.push(formsById[formId]);
     }
     formsById[formId].stores.push(row[INV_COL_STORE]);
@@ -119,6 +122,7 @@ function invBuildMail(form) {
   lines.push("ご担当者様", "");
   lines.push("平素より大変お世話になっております。株式会社クリメンです。");
   lines.push("年末年始の特別回収につきまして、ご希望をお伺いするアンケートをお送りします。", "");
+  if (form.customer) lines.push("【ご契約者】", form.customer, "");
   lines.push("【対象店舗】");
   form.stores.forEach(store => lines.push(`・${store}`));
   lines.push("");

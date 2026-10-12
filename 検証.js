@@ -52,6 +52,7 @@ const VER_COL_MARK_END = 7;
 const VER_COL_URL = 8;
 const VER_COL_ID = 9;
 const VER_COL_STATUS = 10;
+const VER_COL_CUSTOMER = 16;   // Q列: 契約者
 
 const VER_MAX_STORES_PER_FORM = 30;     // 1フォームの店舗数がこれを超えたら警告
 const VER_FORM_SAMPLE_COUNT = 20;       // フォームの抜き取り件数
@@ -226,6 +227,7 @@ function verifyListSheet_(sheetName) {
   // 3. リストの各行を照合する
   const listed = {};
   const emailGroups = {};
+  const formGroups = {};   // アドレスと契約者の組 → 店舗数
   for (let i = 1; i < data.length; i++) {
     const row = data[i];
     const store = row[VER_COL_STORE];
@@ -237,6 +239,8 @@ function verifyListSheet_(sheetName) {
     const email = String(row[VER_COL_EMAIL]).trim();
     (emailGroups[email] = emailGroups[email] || []).push(store);
     const expected = expectedList[store];
+    const formKey = email + "\u0001" + String(row[VER_COL_CUSTOMER] || "").trim();
+    formGroups[formKey] = (formGroups[formKey] || 0) + 1;
 
     if (!expected) {
       add("エラー", "リスト", store, expectedReview[store]
@@ -254,6 +258,9 @@ function verifyListSheet_(sheetName) {
     }
     if (expected.marks.length >= 3 && row[VER_COL_MARK_START + 2] === "○") {
       add("エラー", "回収曜日", store, "回収できない日（1/1）に「○」が付いています", rowLabel);
+    }
+    if (String(row[VER_COL_CUSTOMER] || "").trim() !== String(expected.contract.customer).trim()) {
+      add("エラー", "契約者", store, `契約者がkintoneと違います。リスト: ${row[VER_COL_CUSTOMER]} / kintone: ${expected.contract.customer}（Q列を確認）`, rowLabel);
     }
     if (String(row[VER_COL_VENDOR]).trim() !== String(expected.contract.vendor).trim()) {
       add("警告", "業者", store, `業者名がkintoneと違います。リスト: ${row[VER_COL_VENDOR]} / kintone: ${expected.contract.vendor}`, rowLabel);
@@ -284,9 +291,6 @@ function verifyListSheet_(sheetName) {
   // 5. アドレス単位のチェック
   Object.keys(emailGroups).forEach(email => {
     const stores = emailGroups[email];
-    if (stores.length > VER_MAX_STORES_PER_FORM) {
-      add("警告", "フォーム", "", `同じアドレス ${email} に ${stores.length} 店舗が入っています。1つのフォームに入る質問が多くなります`);
-    }
     const customers = {};
     stores.forEach(store => {
       const exp = expectedList[store];
@@ -294,7 +298,7 @@ function verifyListSheet_(sheetName) {
     });
     const customerNames = Object.keys(customers);
     if (customerNames.length > 1) {
-      add("警告", "別の契約者", "", `同じアドレス ${email} に、別の契約者（${customerNames.join(" / ")}）の店舗が入っています。ほかの契約者の店舗が見えます`, stores.join(" / "));
+      add("情報", "複数の契約者", "", `同じアドレス ${email} に ${customerNames.length} 社の契約者があります。契約者ごとに別のフォーム・別のメールになります`, customerNames.join(" / "));
     }
     const domain = email.split("@")[1] || "";
     if (VER_TYPO_DOMAINS.indexOf(domain) !== -1 || /\.(con|cojp|c0m|comm)$/.test(domain)) {
@@ -305,7 +309,13 @@ function verifyListSheet_(sheetName) {
     }
   });
 
-  verWriteResult_(ss, sheetName, `kintoneの契約中: ${kintone.contracts.length} 件 / リストの店舗: ${Object.keys(listed).length} 件`, results);
+  Object.keys(formGroups).forEach(key => {
+    if (formGroups[key] > VER_MAX_STORES_PER_FORM) {
+      add("警告", "フォーム", "", `アドレスと契約者の組 ${key.replace("\u0001", " / ")} に ${formGroups[key]} 店舗が入っています。1つのフォームに入る質問が多くなります`);
+    }
+  });
+
+  verWriteResult_(ss, sheetName, `kintoneの契約中: ${kintone.contracts.length} 件 / リストの店舗: ${Object.keys(listed).length} 件 / 作成されるフォーム: ${Object.keys(formGroups).length} 件`, results);
 }
 
 function verWriteResult_(ss, sheetName, countLine, results) {
