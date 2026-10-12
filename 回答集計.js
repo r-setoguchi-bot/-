@@ -545,6 +545,9 @@ function respSendReceiptIfNeeded(form, rows, dateHeaders, previousMailed, mail) 
   const subjectPrefix = mail.mode === "test" ? "【テスト】" : "";
   const bodyPrefix = mail.mode === "test" ? `（テスト送信です。本来の宛先: ${customerEmail}）\n\n` : "";
   const options = { to: to, subject: subjectPrefix + message.subject, body: bodyPrefix + message.body, name: RESP_MAIL_SENDER_NAME };
+  if (message.htmlBody) {
+    options.htmlBody = (mail.mode === "test" ? `<p>（テスト送信です。本来の宛先: ${customerEmail.replace(/&/g, "&amp;").replace(/</g, "&lt;")}）</p>` : "") + message.htmlBody;
+  }
   if (mail.mode === "on" && mail.bcc) options.bcc = mail.bcc;
 
   try {
@@ -564,6 +567,7 @@ function respSendMail(options, from) {
   }
   const gmailOptions = { name: options.name, from: from };
   if (options.bcc) gmailOptions.bcc = options.bcc;
+  if (options.htmlBody) gmailOptions.htmlBody = options.htmlBody;
   GmailApp.sendEmail(options.to, options.subject, options.body, gmailOptions);
 }
 
@@ -577,6 +581,17 @@ function respBuildReceiptMail(rows, dateHeaders, formUrl) {
   const comment = first[5 + D];
   const responseCount = Number(first[8 + D]) || 1;
 
+  const notice = "※収集業者の都合などにより、回収日や料金を変更せざるを得ない場合は、改めてご連絡いたします。";
+  const esc = text => String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const mark = cell => (cell === "○" ? "○（希望する）" : "×（希望しない）");
+
+  // 店舗ごとの「聞かれた日」だけを取り出す（回収日でない日は載せない）
+  const stores = rows.map(row => ({
+    name: row[0],
+    want: row[2],
+    days: dateHeaders.map((header, i) => ({ header: header, cell: row[3 + i] })).filter(d => d.cell === "○" || d.cell === "×")
+  }));
+
   const lines = [];
   lines.push(`${contactName || "ご担当者"} 様`, "");
   lines.push("このたびは「年末年始廃棄物回収に関するアンケート」にご回答いただき、ありがとうございました。");
@@ -585,30 +600,15 @@ function respBuildReceiptMail(rows, dateHeaders, formUrl) {
   lines.push(`■特別回収期間：${RESP_MAIL_PERIOD_TEXT}`);
   lines.push(`■ご担当者様：${contactName}`);
   lines.push(`■お電話番号：${phone}`, "");
-  lines.push("【店舗ごとのご回答】");
-
-  rows.forEach(row => {
-    lines.push(`▼${row[0]}`);
-    const want = row[2];
-    if (want === RESP_ANSWER_YES) {
-      lines.push("  特別回収：希望する");
-      dateHeaders.forEach((header, i) => {
-        const cell = row[3 + i];
-        if (cell === "○") lines.push(`    ${header}：希望する`);
-        else if (cell === "×") lines.push(`    ${header}：希望しない`);
-      });
-    } else if (want === RESP_ANSWER_NO) {
-      lines.push("  特別回収：希望しない");
-      dateHeaders.forEach((header, i) => {
-        if (row[3 + i] === "×") lines.push(`    ${header}：希望しない`);
-      });
-    } else {
-      lines.push(`  特別回収：${want}`);
-    }
+  lines.push("【店舗ごとの回収のご希望】");
+  stores.forEach(store => {
+    lines.push("", `▼${store.name}`);
+    if (store.days.length === 0) lines.push(`  特別回収：${store.want}`);
+    store.days.forEach(d => lines.push(`  ${d.header}　${mark(d.cell)}`));
   });
-
   if (comment) lines.push("", `■ご不明点・ご要望：${comment}`);
   lines.push("");
+  lines.push(notice);
   lines.push("※本メールは、ご回答内容の控えとしてお送りしています。");
   lines.push("※回答内容を変更する場合は、下記のフォームから再度ご回答ください。最新のご回答を有効とします。");
   if (RESP_CUSTOMER_DEADLINE_TEXT) lines.push(`  変更のご希望は${RESP_CUSTOMER_DEADLINE_TEXT}までにお願いいたします。`);
@@ -616,8 +616,34 @@ function respBuildReceiptMail(rows, dateHeaders, formUrl) {
   if (RESP_MAIL_CONTACT) lines.push(`※ご不明な点は、${RESP_MAIL_CONTACT}までご連絡ください。`);
   lines.push("", RESP_MAIL_SENDER_NAME);
 
+  // HTML版: 店舗ごとに、日付を横に並べた表にする（○＝希望する、×＝希望しない）
+  const cellStyle = "border:1px solid #999;padding:6px 14px;text-align:center;";
+  const h = [];
+  h.push('<div style="font-family:sans-serif;font-size:14px;line-height:1.7;color:#222;">');
+  h.push(`<p>${esc(contactName || "ご担当者")} 様</p>`);
+  h.push("<p>このたびは「年末年始廃棄物回収に関するアンケート」にご回答いただき、ありがとうございました。<br>下記の内容で承りました。ご確認ください。</p>");
+  h.push(`<p>■回答日時：${esc(answeredAt)}<br>■特別回収期間：${esc(RESP_MAIL_PERIOD_TEXT)}<br>■ご担当者様：${esc(contactName)}<br>■お電話番号：${esc(phone)}</p>`);
+  h.push("<p><b>【店舗ごとの回収のご希望】</b><br>○＝回収を希望する　／　×＝回収を希望しない</p>");
+  stores.forEach(store => {
+    h.push(`<p style="margin:16px 0 4px;"><b>▼${esc(store.name)}</b></p>`);
+    if (store.days.length === 0) {
+      h.push(`<p>特別回収：${esc(store.want)}</p>`);
+      return;
+    }
+    h.push('<table style="border-collapse:collapse;">');
+    h.push("<tr>" + store.days.map(d => `<th style="${cellStyle}background:#eee;">${esc(d.header)}</th>`).join("") + "</tr>");
+    h.push("<tr>" + store.days.map(d => `<td style="${cellStyle}font-size:18px;${d.cell === "○" ? "font-weight:bold;color:#1a7f37;" : "color:#666;"}">${d.cell}</td>`).join("") + "</tr>");
+    h.push("</table>");
+  });
+  if (comment) h.push(`<p>■ご不明点・ご要望：${esc(comment)}</p>`);
+  h.push(`<p style="margin-top:20px;">${esc(notice)}<br>※本メールは、ご回答内容の控えとしてお送りしています。<br>※回答内容を変更する場合は、下記のフォームから再度ご回答ください。最新のご回答を有効とします。`);
+  if (RESP_CUSTOMER_DEADLINE_TEXT) h.push(`<br>　変更のご希望は${esc(RESP_CUSTOMER_DEADLINE_TEXT)}までにお願いいたします。`);
+  if (formUrl) h.push(`<br>　<a href="${esc(formUrl)}">${esc(formUrl)}</a>`);
+  if (RESP_MAIL_CONTACT) h.push(`<br>※ご不明な点は、${esc(RESP_MAIL_CONTACT)}までご連絡ください。`);
+  h.push(`</p><p>${esc(RESP_MAIL_SENDER_NAME)}</p></div>`);
+
   const subject = responseCount > 1 ? RESP_MAIL_SUBJECT.replace("の控え", "の控え（再回答）") : RESP_MAIL_SUBJECT;
-  return { subject: subject, body: lines.join("\n") };
+  return { subject: subject, body: lines.join("\n"), htmlBody: h.join("") };
 }
 
 // 控えメールの文面を確かめるため、サンプルのメールを RESP_MAIL_TEST_TO に送る（お客様には送らない）
@@ -633,7 +659,8 @@ function sendSampleReceiptMail() {
   ];
   const message = respBuildReceiptMail(rows, dateHeaders, "https://docs.google.com/forms/d/e/（サンプル）/viewform");
   const from = String(PropertiesService.getScriptProperties().getProperty(RESP_MAIL_FROM_PROPERTY) || "").trim();
-  respSendMail({ to: testTo, subject: "【テスト】" + message.subject, body: "（サンプルです。実際の回答ではありません）\n\n" + message.body, name: RESP_MAIL_SENDER_NAME }, from);
+  respSendMail({ to: testTo, subject: "【テスト】" + message.subject, body: "（サンプルです。実際の回答ではありません）\n\n" + message.body,
+    htmlBody: "<p>（サンプルです。実際の回答ではありません）</p>" + message.htmlBody, name: RESP_MAIL_SENDER_NAME }, from);
   console.log(`サンプルのメールを ${testTo} に送りました。`);
 }
 
