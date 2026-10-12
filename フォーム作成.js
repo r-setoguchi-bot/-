@@ -139,7 +139,7 @@ function createFormsInBatches() {
       const stores = group.stores;
 
       try {
-        const result = createFormForStores(stores, headers, folder, group.customer);
+        const result = createFormWithRetry(stores, headers, folder, group.customer);
 
         // 1件ごとに書き込み、途中で止まっても同じフォームを二重に作らないようにする
         stores.forEach(store => {
@@ -256,6 +256,22 @@ function groupUnsentRowsByForm(data) {
     });
   }
   return groupedData;
+}
+
+// フォーム作成は、Googleの一時的なエラー（Failed to retrieve form data など）で失敗することがある。
+// 少し待って、数回やり直す（失敗した回の作りかけのフォームは、createFormForStores の中でゴミ箱へ移される）。それでも失敗したら、例外にする
+function createFormWithRetry(stores, headers, folder, customer) {
+  let lastError;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return createFormForStores(stores, headers, folder, customer);
+    } catch (e) {
+      lastError = e;
+      console.warn(`フォーム作成をやり直します（${attempt + 1}回目の失敗）: ${stores[0].storeName} / ${e}`);
+      Utilities.sleep(3000 * (attempt + 1));   // 3, 6, 9秒
+    }
+  }
+  throw lastError;
 }
 
 function createFormForStores(stores, headers, folder, customer) {
