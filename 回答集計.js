@@ -65,6 +65,7 @@ const RESP_CLOSED_CONTACT = "";               // 連絡先（電話番号など�
 // 控えメール
 const RESP_MAIL_MODE_PROPERTY = "RESP_MAIL_MODE";           // off / test / on
 const RESP_MAIL_TEST_TO_PROPERTY = "RESP_MAIL_TEST_TO";     // test のときの宛先
+const RESP_MAIL_FROM_PROPERTY = "MAIL_FROM";                // 送信元アドレス（会社のアドレス。案内メールと共通）。未設定なら実行アカウントのアドレス
 const RESP_MAIL_BCC_PROPERTY = "RESP_MAIL_BCC";             // on のときに、社内の控えとして同じメールを送るアドレス（任意）
 const RESP_MAIL_SENDER_NAME = "株式会社クリメン";
 const RESP_MAIL_SUBJECT = "【株式会社クリメン】年末年始廃棄物回収アンケート ご回答内容の控え";
@@ -492,12 +493,22 @@ function respGetMailSettings() {
   const testTo = String(props.getProperty(RESP_MAIL_TEST_TO_PROPERTY) || "").trim();
   const bcc = String(props.getProperty(RESP_MAIL_BCC_PROPERTY) || "").trim();
 
+  const from = String(props.getProperty(RESP_MAIL_FROM_PROPERTY) || "").trim();
+
   let mode = rawMode === "on" || rawMode === "test" ? rawMode : "off";
+  if (mode !== "off" && from) {
+    const own = String(Session.getEffectiveUser().getEmail() || "").toLowerCase();
+    const aliases = GmailApp.getAliases().map(alias => String(alias).toLowerCase());
+    if (from.toLowerCase() !== own && aliases.indexOf(from.toLowerCase()) === -1) {
+      console.warn(`${RESP_MAIL_FROM_PROPERTY}（${from}）はこのアカウントから送信できるアドレスではないため、控えメールは送りません。`);
+      mode = "off";
+    }
+  }
   if (mode === "test" && !testTo) {
     console.warn(`${RESP_MAIL_MODE_PROPERTY} が test ですが、${RESP_MAIL_TEST_TO_PROPERTY} が未設定のため、控えメールは送りません。`);
     mode = "off";
   }
-  return { mode: mode, testTo: testTo, bcc: bcc };
+  return { mode: mode, testTo: testTo, bcc: bcc, from: from };
 }
 
 // 回答1件につき、控えメールを1回だけ送る。送った（または送れなかった）印の文字列を返す。何もしなかったときは空文字
@@ -533,12 +544,23 @@ function respSendReceiptIfNeeded(form, rows, dateHeaders, previousMailed, mail) 
   if (mail.mode === "on" && mail.bcc) options.bcc = mail.bcc;
 
   try {
-    MailApp.sendEmail(options);
+    respSendMail(options, mail.from);
     return mail.mode === "test" ? testMark : sentMark;
   } catch (e) {
     console.error(`控えメールを送れませんでした: ${form.formId} / ${e}`);
     return mail.mode === "test" ? "" : failMark;
   }
+}
+
+// メールを送る。送信元アドレスがあれば Gmail から（別のアドレスとして登録済みのもの）、無ければ実行アカウントから送る
+function respSendMail(options, from) {
+  if (!from) {
+    MailApp.sendEmail(options);
+    return;
+  }
+  const gmailOptions = { name: options.name, from: from };
+  if (options.bcc) gmailOptions.bcc = options.bcc;
+  GmailApp.sendEmail(options.to, options.subject, options.body, gmailOptions);
 }
 
 // 1つのフォームの回答（店舗ごとの行）から、控えメールの件名と本文を作る
@@ -603,7 +625,8 @@ function sendSampleReceiptMail() {
     ["サンプル店B", "2026/11/01 10:00:00", RESP_ANSWER_NO, "×", "×", "", "", "山田 太郎", "03-0000-0000", "朝に来ますか？", "sample@example.com", "FORMID", 1, ""]
   ];
   const message = respBuildReceiptMail(rows, dateHeaders, "https://docs.google.com/forms/d/e/（サンプル）/viewform");
-  MailApp.sendEmail({ to: testTo, subject: "【テスト】" + message.subject, body: "（サンプルです。実際の回答ではありません）\n\n" + message.body, name: RESP_MAIL_SENDER_NAME });
+  const from = String(PropertiesService.getScriptProperties().getProperty(RESP_MAIL_FROM_PROPERTY) || "").trim();
+  respSendMail({ to: testTo, subject: "【テスト】" + message.subject, body: "（サンプルです。実際の回答ではありません）\n\n" + message.body, name: RESP_MAIL_SENDER_NAME }, from);
   console.log(`サンプルのメールを ${testTo} に送りました。`);
 }
 
