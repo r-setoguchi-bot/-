@@ -25,16 +25,16 @@ const FORM_STATUS_SENT = "送信済";
 const FORM_STATUS_ERROR = "エラー";
 
 // 列番号（1始まり）
-const FORM_COL_URL = 12;    // L列: フォームURL
-const FORM_COL_STATUS = 14; // N列: 送信状況
+const FORM_COL_URL = 9;     // I列: フォームURL
+const FORM_COL_STATUS = 11; // K列: 送信状況
 
-// 各アドレス項目の内容（0始まり、O〜S列）。「メール送信用」シートに並べる
-const FORM_COL_EMAIL_START = 14;
-const FORM_COL_EMAIL_END = 18;
+// 各アドレス項目の内容（0始まり、L〜P列）。「メール送信用」シートに並べる
+const FORM_COL_EMAIL_START = 11;
+const FORM_COL_EMAIL_END = 15;
 
-// 希望日の列（0始まり、D〜K列）
+// 希望日の列（0始まり、D〜H列）
 const FORM_DATE_COL_START = 3;
-const FORM_DATE_COL_END = 10;
+const FORM_DATE_COL_END = 7;
 
 const FORM_TITLE = '【株式会社クリメン】2026年～2027年 年末年始廃棄物回収に関するアンケート';
 const FORM_PERIOD_TEXT = '2026年12月30日(水)から2027年1月3日(日)';
@@ -208,7 +208,7 @@ function groupUnsentRowsByEmail(data) {
   for (let i = 1; i < data.length; i++) {
     const row = data[i];
     const email = row[1].trim();               // B列
-    const status = row[FORM_COL_STATUS - 1];   // N列
+    const status = row[FORM_COL_STATUS - 1];   // K列
     if (status === FORM_STATUS_SENT || status === FORM_STATUS_ERROR || !email) continue;
 
     if (!groupedData[email]) {

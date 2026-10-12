@@ -35,8 +35,9 @@ const KLIST_DATES = [
   [2026, 12, 30], [2026, 12, 31], [2027, 1, 1], [2027, 1, 2], [2027, 1, 3]
 ];
 const KLIST_NO_COLLECTION_DATES = ["2027-1-1"];
-// フォーム作成用リストの日付の列数（D〜K列の8列）。期間が短いときは、余った列を空にする
-const KLIST_DATE_SLOTS = 8;
+// フォーム作成用リストの日付の列数（D〜H列の5列）。フォーム作成.js・回答集計.js の列の位置と合わせてある。
+// 期間の日数を変えるときは、そちらの列の位置も直すこと
+const KLIST_DATE_SLOTS = 5;
 
 const KLIST_WEEKDAYS = "日月火水木金土"; // Date#getDay() の順
 
@@ -267,11 +268,15 @@ function klistLoadSourceStatus(ss) {
   if (!sheet) return { sentByStore: sentByStore, errorStores: errorStores };
 
   const data = sheet.getDataRange().getDisplayValues();
+  // フォームURL・フォームID・送信状況の列は、見出しから探す（見つからなければ I, J, K列）
+  const urlCol = data[0].indexOf("フォームURL") >= 0 ? data[0].indexOf("フォームURL") : 8;
+  const idCol = urlCol + 1;
+  const statusCol = urlCol + 2;
   for (let i = 1; i < data.length; i++) {
     const row = data[i];
-    if (row[13] === KLIST_STATUS_SENT) {
-      sentByStore[row[0]] = [row[11], row[12], row[13]]; // L, M, N列
-    } else if (row[13] === KLIST_STATUS_ERROR) {
+    if (row[statusCol] === KLIST_STATUS_SENT) {
+      sentByStore[row[0]] = [row[urlCol], row[idCol], row[statusCol]];
+    } else if (row[statusCol] === KLIST_STATUS_ERROR) {
       errorStores.add(row[0]);
     }
   }
@@ -345,7 +350,7 @@ function klistCollect(ss) {
 
     const emailSources = fieldCodes.emails.map(e => ({ label: e.label, raw: klistValue(record, e.code) }));
     const picked = klistPickEmail(emailSources);
-    // 各アドレス項目に入っている内容をそのまま並べる（O〜S列。「メール送信用」シートに使う）。見つからない項目の列は空
+    // 各アドレス項目に入っている内容をそのまま並べる（L〜P列。「メール送信用」シートに使う）。見つからない項目の列は空
     const rawEmails = KLIST_EMAIL_LABELS.map(label => {
       const found = emailSources.filter(e => e.label === label)[0];
       return found ? found.raw : "";
@@ -369,7 +374,7 @@ function klistCollect(ss) {
       addReview("期間中に回収できる日がありません（回収曜日が期間外の曜日のみ、など）", "", picked);
       return;
     }
-    while (marks.length < KLIST_DATE_SLOTS) marks.push(""); // 列 D〜K の8列に合わせる
+    while (marks.length < KLIST_DATE_SLOTS) marks.push(""); // 列 D〜H の5列に合わせる
 
     const carried = source.sentByStore[storeName] || ["", "", ""];
     if (carried[2]) {
