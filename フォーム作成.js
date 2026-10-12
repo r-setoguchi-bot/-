@@ -126,7 +126,7 @@ function createFormsInBatches() {
     }
 
     // 準備が終わったら、保険の再開トリガーを予約しておく。6分制限などで強制終了しても、これで処理が再開する
-    scheduleFormBatch(FORM_SAFETY_DELAY_MS);
+    const safetyTrigger = scheduleFormBatch(FORM_SAFETY_DELAY_MS);
 
     for (let n = 0; n < emails.length; n++) {
       if (Date.now() - startTime > FORM_TIME_LIMIT_MS) {
@@ -164,11 +164,17 @@ function createFormsInBatches() {
       }
     }
 
-    deleteFormBatchTriggers();
     if (remaining > 0) {
+      // 先に続きの予約を作る（失敗しても、保険の予約が残っているので、処理が途切れない）。そのあとで、保険の予約を消す
       scheduleFormBatch(FORM_RETRY_DELAY_MS);
+      try {
+        ScriptApp.deleteTrigger(safetyTrigger);
+      } catch (e) {
+        console.warn(`保険の予約を消せませんでした（処理には影響しません）: ${e}`);
+      }
       console.log(`今回 ${formCount} 件作成（エラー ${errorCount} 件）。残り ${remaining} 件は自動で続行します。`);
     } else {
+      deleteFormBatchTriggers();
       console.log(`今回 ${formCount} 件作成（エラー ${errorCount} 件）。すべて完了しました。`);
       refreshContractStatusList();
     }
@@ -329,8 +335,19 @@ ${deadlineText}◆ 次の画面で、店舗ごとに、各日の回収を「希�
   }
 }
 
+// 続きの実行を予約する。Googleの一時的なサーバーエラーで失敗することがあるので、少し待って、数回やり直す
 function scheduleFormBatch(delayMs) {
-  ScriptApp.newTrigger(FORM_BATCH_HANDLER).timeBased().after(delayMs).create();
+  let lastError;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      return ScriptApp.newTrigger(FORM_BATCH_HANDLER).timeBased().after(delayMs).create();
+    } catch (e) {
+      lastError = e;
+      console.warn(`続きの予約に失敗しました（${attempt + 1}回目）: ${e}`);
+      Utilities.sleep(2000 * Math.pow(2, attempt));   // 2, 4, 8, 16, 32秒
+    }
+  }
+  throw lastError;
 }
 
 // このフォーム作成処理用のトリガーだけを削除する（リマインド・日報などのトリガーは残す）

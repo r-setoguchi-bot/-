@@ -36,6 +36,7 @@ const INV_BATCH_HANDLER = "continueInvitations";
 const INV_TIME_LIMIT_MS = 4.5 * 60 * 1000;
 const INV_RETRY_DELAY_MS = 60 * 1000;          // 続きを実行するまでの待ち時間
 const INV_QUOTA_WAIT_MS = 3 * 60 * 60 * 1000;  // 1日の送信上限に達したときに、再開するまでの待ち時間
+const INV_SAFETY_DELAY_MS = 7 * 60 * 1000;     // 実行が強制終了した場合に再開するまでの待ち時間（6分制限より長く）
 const INV_TEST_COUNT = 3;                      // テスト送信で送る件数
 
 // この日時より前は、本番送信しない（誤って早く送らないための安全装置）
@@ -208,6 +209,8 @@ function runInvitationBatch() {
 
   try {
     deleteInvitationTriggers();
+    // 強制終了や、続きの予約の失敗に備えた、保険の再開トリガー
+    const safetyTrigger = invScheduleBatch(INV_SAFETY_DELAY_MS);
 
     const from = invGetFrom();
     const ss = invGetSpreadsheet();
@@ -261,11 +264,17 @@ function runInvitationBatch() {
     }
 
     if (remaining > 0) {
-      ScriptApp.newTrigger(INV_BATCH_HANDLER).timeBased()
-        .after(stoppedByQuota ? INV_QUOTA_WAIT_MS : INV_RETRY_DELAY_MS).create();
+      // 先に続きの予約を作る（失敗しても、保険の予約が残る）。そのあとで、保険の予約を消す
+      invScheduleBatch(stoppedByQuota ? INV_QUOTA_WAIT_MS : INV_RETRY_DELAY_MS);
+      try {
+        ScriptApp.deleteTrigger(safetyTrigger);
+      } catch (e) {
+        console.warn(`保険の予約を消せませんでした（処理には影響しません）: ${e}`);
+      }
       console.log(`今回 ${sentCount} 通送信（失敗 ${failedCount} 件）。残り ${remaining} 件は` +
         (stoppedByQuota ? "1日の送信上限に達したため、しばらく待ってから" : "") + "自動で続行します。");
     } else {
+      deleteInvitationTriggers();
       console.log(`今回 ${sentCount} 通送信（失敗 ${failedCount} 件）。すべて完了しました。送信記録は「${INV_LOG_SHEET_NAME}」シートにあります。`);
     }
   } finally {
@@ -275,6 +284,21 @@ function runInvitationBatch() {
       console.warn(`ロック解除に失敗しました（処理には影響しません）: ${e}`);
     }
   }
+}
+
+// 続きの実行を予約する。Googleの一時的なサーバーエラーで失敗することがあるので、少し待って、数回やり直す
+function invScheduleBatch(delayMs) {
+  let lastError;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      return ScriptApp.newTrigger(INV_BATCH_HANDLER).timeBased().after(delayMs).create();
+    } catch (e) {
+      lastError = e;
+      console.warn(`続きの予約に失敗しました（${attempt + 1}回目）: ${e}`);
+      Utilities.sleep(2000 * Math.pow(2, attempt));   // 2, 4, 8, 16, 32秒
+    }
+  }
+  throw lastError;
 }
 
 function deleteInvitationTriggers() {

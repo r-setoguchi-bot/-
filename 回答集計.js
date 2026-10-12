@@ -43,6 +43,7 @@ const RESP_STATUS_SENT = "送信済";
 const RESP_INTERVAL_HOURS = 2;                // 自動で集計する間隔（時間）
 const RESP_TIME_LIMIT_MS = 4.5 * 60 * 1000;   // 1回あたりの処理時間上限（6分制限対策）
 const RESP_RETRY_DELAY_MS = 60 * 1000;        // 続きを実行するまでの待ち時間
+const RESP_SAFETY_DELAY_MS = 7 * 60 * 1000;   // 実行が強制終了した場合に再開するまでの待ち時間（6分制限より長く）
 const RESP_CURSOR_PROPERTY = "RESP_CURSOR";   // 何番目のフォームまで読んだか
 const RESP_START_HANDLER = "startResponseCollection";
 const RESP_CONTINUE_HANDLER = "collectFormResponses";
@@ -171,6 +172,8 @@ function collectFormResponses() {
 
   try {
     deleteTriggersByHandler(RESP_CONTINUE_HANDLER);
+    // 強制終了や、続きの予約の失敗に備えた、保険の再開トリガー
+    const safetyTrigger = respScheduleTrigger(RESP_CONTINUE_HANDLER, RESP_SAFETY_DELAY_MS);
 
     const ss = respGetSpreadsheet();
     const listSheet = ss.getSheetByName(RESP_LIST_SHEET_NAME);
@@ -220,9 +223,16 @@ function collectFormResponses() {
 
     if (nextIndex < forms.length) {
       props.setProperty(RESP_CURSOR_PROPERTY, String(nextIndex));
-      ScriptApp.newTrigger(RESP_CONTINUE_HANDLER).timeBased().after(RESP_RETRY_DELAY_MS).create();
+      // 先に続きの予約を作る（失敗しても、保険の予約が残る）。そのあとで、保険の予約を消す
+      respScheduleTrigger(RESP_CONTINUE_HANDLER, RESP_RETRY_DELAY_MS);
+      try {
+        ScriptApp.deleteTrigger(safetyTrigger);
+      } catch (e) {
+        console.warn(`保険の予約を消せませんでした（処理には影響しません）: ${e}`);
+      }
       console.log(`${nextIndex} / ${totalForms} 件のフォームを確認しました（エラー ${errorCount} 件）。残りは自動で続行します。`);
     } else {
+      deleteTriggersByHandler(RESP_CONTINUE_HANDLER);
       props.deleteProperty(RESP_CURSOR_PROPERTY);
       console.log(`全 ${totalForms} 件のフォームを確認しました（今回 ${processedCount} 件、エラー ${errorCount} 件）。回答のある店舗: ${Object.keys(rowsByStore).length} 件`);
       respApplyRequestedStatus(ss, forms);
@@ -714,6 +724,7 @@ function closeAllFormsAtCutoff() {
 
   try {
     deleteTriggersByHandler(RESP_CUTOFF_CONTINUE_HANDLER);
+    const cutoffSafetyTrigger = respScheduleTrigger(RESP_CUTOFF_CONTINUE_HANDLER, RESP_SAFETY_DELAY_MS);
 
     const ss = respGetSpreadsheet();
     const listSheet = ss.getSheetByName(RESP_LIST_SHEET_NAME);
@@ -745,9 +756,15 @@ function closeAllFormsAtCutoff() {
 
     if (nextIndex < totalForms) {
       props.setProperty(RESP_CUTOFF_CURSOR_PROPERTY, String(nextIndex));
-      ScriptApp.newTrigger(RESP_CUTOFF_CONTINUE_HANDLER).timeBased().after(RESP_RETRY_DELAY_MS).create();
+      respScheduleTrigger(RESP_CUTOFF_CONTINUE_HANDLER, RESP_RETRY_DELAY_MS);
+      try {
+        ScriptApp.deleteTrigger(cutoffSafetyTrigger);
+      } catch (e) {
+        console.warn(`保険の予約を消せませんでした（処理には影響しません）: ${e}`);
+      }
       console.log(`変更の最終日時を過ぎたため受付を止めています: ${nextIndex} / ${totalForms} 件（今回 ${closedCount} 件を停止）。残りは自動で続行します。`);
     } else {
+      deleteTriggersByHandler(RESP_CUTOFF_CONTINUE_HANDLER);
       props.deleteProperty(RESP_CUTOFF_CURSOR_PROPERTY);
       props.setProperty(RESP_CUTOFF_DONE_PROPERTY, RESP_CUTOFF_AT);
       console.log(`変更の最終日時を過ぎたため、全 ${totalForms} 件のフォームの受付を止めました（今回 ${closedCount} 件、失敗 ${failedIds.length} 件）。`);
@@ -776,6 +793,21 @@ function respRefreshContractStatusList() {
   } catch (e) {
     console.warn(`契約状況一覧の更新に失敗しました: ${e}`);
   }
+}
+
+// 続きの実行を予約する。Googleの一時的なサーバーエラーで失敗することがあるので、少し待って、数回やり直す
+function respScheduleTrigger(handlerName, delayMs) {
+  let lastError;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      return ScriptApp.newTrigger(handlerName).timeBased().after(delayMs).create();
+    } catch (e) {
+      lastError = e;
+      console.warn(`続きの予約に失敗しました（${attempt + 1}回目）: ${e}`);
+      Utilities.sleep(2000 * Math.pow(2, attempt));   // 2, 4, 8, 16, 32秒
+    }
+  }
+  throw lastError;
 }
 
 function deleteTriggersByHandler(handlerName) {

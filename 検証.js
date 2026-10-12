@@ -521,6 +521,21 @@ function stopFullFormVerification() {
   console.log("全件検証を停止しました。");
 }
 
+// 続きの実行を予約する。Googleの一時的なサーバーエラーで失敗することがあるので、少し待って、数回やり直す
+function verScheduleFullTrigger_(delayMs) {
+  let lastError;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      return ScriptApp.newTrigger(VER_FULL_HANDLER).timeBased().after(delayMs).create();
+    } catch (e) {
+      lastError = e;
+      console.warn(`続きの予約に失敗しました（${attempt + 1}回目）: ${e}`);
+      Utilities.sleep(2000 * Math.pow(2, attempt));   // 2, 4, 8, 16, 32秒
+    }
+  }
+  throw lastError;
+}
+
 function verDeleteFullTriggers_() {
   ScriptApp.getProjectTriggers().forEach(trigger => {
     if (trigger.getHandlerFunction() === VER_FULL_HANDLER) ScriptApp.deleteTrigger(trigger);
@@ -566,8 +581,8 @@ function continueFullFormVerification() {
     const data = listSheet.getDataRange().getDisplayValues();
     const forms = verGroupFormsForFull_(data);
 
-    // 強制終了に備えた、保険の再開トリガー
-    ScriptApp.newTrigger(VER_FULL_HANDLER).timeBased().after(VER_FULL_SAFETY_DELAY_MS).create();
+    // 強制終了や、続きの予約の失敗に備えた、保険の再開トリガー
+    const safetyTrigger = verScheduleFullTrigger_(VER_FULL_SAFETY_DELAY_MS);
 
     const props = PropertiesService.getScriptProperties();
     let index = Number(props.getProperty(VER_FULL_CURSOR_PROPERTY) || 0);
@@ -579,13 +594,18 @@ function continueFullFormVerification() {
       index++;
     }
     verAppendFullRows_(sheet, rows);
-    verDeleteFullTriggers_();
 
     if (index < forms.length) {
       props.setProperty(VER_FULL_CURSOR_PROPERTY, String(index));
-      ScriptApp.newTrigger(VER_FULL_HANDLER).timeBased().after(VER_FULL_RETRY_DELAY_MS).create();
+      verScheduleFullTrigger_(VER_FULL_RETRY_DELAY_MS);
+      try {
+        ScriptApp.deleteTrigger(safetyTrigger);
+      } catch (e) {
+        console.warn(`保険の予約を消せませんでした（処理には影響しません）: ${e}`);
+      }
       console.log(`${index} / ${forms.length} 件のフォームを確認しました。残りは自動で続行します。`);
     } else {
+      verDeleteFullTriggers_();
       props.deleteProperty(VER_FULL_CURSOR_PROPERTY);
       verFinishFull_(ss, sheet, data, forms);
     }
