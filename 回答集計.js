@@ -17,7 +17,7 @@
 //     test … お客様には送らず、RESP_MAIL_TEST_TO のアドレスだけに送る（動作確認用）
 //     on   … お客様へ送る。RESP_MAIL_BCC があれば、そのアドレスにも同じメールを送る（社内の控え）
 //   同じ回答には1回だけ送る。再回答があれば、その回答の分をもう一度送る。送信の結果は「控えメール」の列に残る。
-//   メールには、変更するためのフォームのURLと、変更できる最終日時（RESP_CUTOFF_AT）を書く。
+//   メールには、変更するためのフォームのURLと、お客様に案内する変更の期限（RESP_CUSTOMER_DEADLINE_TEXT）を書く。
 //   社内の控え（RESP_MAIL_BCC）は、必要なときだけ設定する。回答はフォームの中に日時つきで全件残る。
 //   メールはスクリプトを実行しているアカウントから送られ、送信できる数には1日の上限がある。
 //
@@ -31,6 +31,7 @@
 // 変更の最終日時:
 //   RESP_CUTOFF_AT に日時を入れると、その日時を過ぎたあと、全フォームの受付を自動で止める（1時間ごとに確認）。
 //   お客様は、それまでは同じフォームから何度でも回答し直せる（最新の回答が有効）。空のままなら自動では止めない。
+//   お客様に案内する期限（RESP_CUSTOMER_DEADLINE_TEXT / FORM_CHANGE_DEADLINE_TEXT）より後ろの日時にしておくと、少し余裕が持てる。
 //
 // スプレッドシートの指定は フォーム作成.js と同じ（FORM_SPREADSHEET_URL、無ければ紐づいているスプレッドシート）。
 // このファイルだけで動く（質問文は フォーム作成.js と同じものを下に書いている）。
@@ -47,9 +48,11 @@ const RESP_START_HANDLER = "startResponseCollection";
 const RESP_CONTINUE_HANDLER = "collectFormResponses";
 const RESP_CLOSE_HANDLER = "closeRequestedForms";
 
-// 回答を変更できる最終日時（例: "2026/11/30 23:59"）。過ぎたら全フォームの受付を止める。空のままなら止めない。
-// フォーム作成.js の FORM_CHANGE_DEADLINE_TEXT と同じ日時にしておくこと
-const RESP_CUTOFF_AT = "";
+// 実際にフォームの受付を止める日時（例: "2026/11/30 23:59"）。過ぎたら全フォームの受付を止める。空のままなら止めない。
+const RESP_CUTOFF_AT = "2026/11/30 23:59";
+// お客様に案内する「変更の期限」の表記（控えメールに書く）。受付を止める日時とは別。フォーム作成.js の FORM_CHANGE_DEADLINE_TEXT と同じにしておくこと。
+// 空のままなら、メールに期限の文を入れない
+const RESP_CUSTOMER_DEADLINE_TEXT = "2026年11月15日(日)";
 const RESP_CUTOFF_HANDLER = "closeAllFormsAtCutoff";
 const RESP_CUTOFF_CONTINUE_HANDLER = "continueCloseAllFormsAtCutoff";
 const RESP_CUTOFF_CURSOR_PROPERTY = "RESP_CUTOFF_CURSOR";
@@ -578,9 +581,8 @@ function respBuildReceiptMail(rows, dateHeaders, formUrl) {
   if (comment) lines.push("", `■ご不明点・ご要望：${comment}`);
   lines.push("");
   lines.push("※本メールは、ご回答内容の控えとしてお送りしています。");
-  const cutoffText = respFormatCutoff();
   lines.push("※回答内容を変更する場合は、下記のフォームから再度ご回答ください。最新のご回答を有効とします。");
-  if (cutoffText) lines.push(`  変更は${cutoffText}までとなります。それ以降は変更できません。`);
+  if (RESP_CUSTOMER_DEADLINE_TEXT) lines.push(`  変更のご希望は${RESP_CUSTOMER_DEADLINE_TEXT}までにお願いいたします。`);
   if (formUrl) lines.push(`  ${formUrl}`);
   if (RESP_MAIL_CONTACT) lines.push(`※ご不明な点は、${RESP_MAIL_CONTACT}までご連絡ください。`);
   lines.push("", RESP_MAIL_SENDER_NAME);
@@ -620,16 +622,6 @@ function respParseCutoff() {
 function respIsAfterCutoff() {
   const cutoff = respParseCutoff();
   return !!cutoff && new Date() >= cutoff;
-}
-
-// 「2026年11月30日(月)23:59」の形にする。未設定なら空文字
-function respFormatCutoff() {
-  const cutoff = respParseCutoff();
-  if (!cutoff) return "";
-  const weekday = "日月火水木金土"[cutoff.getDay()];
-  const hh = ("0" + cutoff.getHours()).slice(-2);
-  const mm = ("0" + cutoff.getMinutes()).slice(-2);
-  return `${cutoff.getFullYear()}年${cutoff.getMonth() + 1}月${cutoff.getDate()}日(${weekday}) ${hh}:${mm}`;
 }
 
 function respClosedMessage() {

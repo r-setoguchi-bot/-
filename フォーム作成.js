@@ -38,9 +38,9 @@ const FORM_PERIOD_TEXT = '2026年12月30日(水)から2027年1月3日(日)';
 // 回答期限（例: '2026年11月13日(金)'）。空のままなら説明文に期限の行を入れない
 const FORM_DEADLINE_TEXT = '2026年11月15日(日)';
 
-// 回答内容を変更できる最終日時（例: '2026年11月30日(月) 23:59'）。回答集計.js の RESP_CUTOFF_AT と同じ日時にしておくこと。
-// 空のままなら、説明文に期限の文を入れない
-const FORM_CHANGE_DEADLINE_TEXT = "";
+// お客様に案内する「回答内容を変更する期限」（例: '2026年11月15日(日)'）。説明文に書くだけで、受付は止めない。
+// 実際にフォームの受付を止める日時は、回答集計.js の RESP_CUTOFF_AT で決める。空のままなら、説明文に期限の文を入れない
+const FORM_CHANGE_DEADLINE_TEXT = '2026年11月15日(日)';
 
 // 回答者への質問。回答集計.js が回答を読み取る目印にもなるので、文言を変えるときは両方そろえること
 const FORM_Q_CONTACT_NAME = "ご担当者様のお名前";
@@ -223,7 +223,7 @@ function createFormForStores(stores, headers, folder) {
       DriveApp.getFileById(form.getId()).moveTo(folder);
     }
 
-    const changeDeadlineText = FORM_CHANGE_DEADLINE_TEXT ? `\n　変更は${FORM_CHANGE_DEADLINE_TEXT}までとなります。それ以降は変更できません。` : "";
+    const changeDeadlineText = FORM_CHANGE_DEADLINE_TEXT ? `\n　変更のご希望は${FORM_CHANGE_DEADLINE_TEXT}までにお願いいたします。` : "";
     const deadlineText = FORM_DEADLINE_TEXT ? `◆ご回答期限：${FORM_DEADLINE_TEXT}まで\n\n` : "";
 
     form.setDescription(`【対象店舗】
