@@ -44,10 +44,17 @@ const KLIST_LABELS = {
   contractType: "契約種別",
   storeName: "契約店舗名称",
   customer: "顧客名称",
-  vendor: "収集業者：名称",
-  replyEmail: "年末年始　回答アドレス①",
-  guideEmail: "案内等送付先メールアドレス:(to)"
+  vendor: "収集業者：名称"
 };
+// 送信先アドレスの項目。上にあるものほど優先する（フォームの送信先は、最初に見つかった正しいアドレス）
+// 項目名が実際と違うと見つからないので、dumpKeiyakuFields で確認する。見つからない項目は飛ばす（最低1つは必要）
+const KLIST_EMAIL_LABELS = [
+  "年末年始　回答アドレス①",
+  "年末年始　回答アドレス②",
+  "案内等送付先メールアドレス:(to)",
+  "送付先別：e-mail",
+  "契約時の顧客担当：メールアドレス"
+];
 // 可燃の回収曜日は、チェックボックス1項目（選択肢が曜日）に入っている
 const KLIST_BURNABLE_LABEL = "可燃収集日";
 
@@ -132,6 +139,16 @@ function klistResolveFieldCodes(config) {
   const requiredLabels = Object.keys(KLIST_LABELS).map(key => KLIST_LABELS[key]);
   requiredLabels.push(KLIST_BURNABLE_LABEL);
 
+  const emailCodes = [];
+  KLIST_EMAIL_LABELS.forEach(label => {
+    const code = labelToCode[klistNormalizeLabel(label)];
+    if (code) emailCodes.push({ label: label, code: code });
+    else console.warn(`アドレスの項目「${label}」が見つかりません。この項目は使わずに進めます。`);
+  });
+  if (emailCodes.length === 0) {
+    throw new Error("アドレスの項目が1つも見つかりません。dumpKeiyakuFields で項目名を確認してください。");
+  }
+
   const missing = requiredLabels.filter(label => !(klistNormalizeLabel(label) in labelToCode));
   if (missing.length > 0) {
     throw new Error(`次の項目のフィールドコードが分かりません: ${missing.join(" / ")}\n` +
@@ -144,8 +161,7 @@ function klistResolveFieldCodes(config) {
     storeName: codeOf(KLIST_LABELS.storeName),
     customer: codeOf(KLIST_LABELS.customer),
     vendor: codeOf(KLIST_LABELS.vendor),
-    replyEmail: codeOf(KLIST_LABELS.replyEmail),
-    guideEmail: codeOf(KLIST_LABELS.guideEmail),
+    emails: emailCodes,
     burnable: codeOf(KLIST_BURNABLE_LABEL)
   };
 }
@@ -153,8 +169,8 @@ function klistResolveFieldCodes(config) {
 // 必要な項目だけを、$idベースのページングで全件取得する
 function klistFetchRecords(config, fieldCodes) {
   const wanted = ["$id"].concat(
-    [fieldCodes.contractType, fieldCodes.storeName, fieldCodes.customer, fieldCodes.vendor,
-      fieldCodes.replyEmail, fieldCodes.guideEmail, fieldCodes.burnable]
+    [fieldCodes.contractType, fieldCodes.storeName, fieldCodes.customer, fieldCodes.vendor, fieldCodes.burnable]
+      .concat(fieldCodes.emails.map(e => e.code))
   );
   const fieldsParam = wanted.map((code, i) => `fields%5B${i}%5D=${encodeURIComponent(code)}`).join("&");
 
@@ -199,23 +215,35 @@ function klistWeekdayFlags(selectedOptions) {
   return KLIST_WEEKDAYS.split("").map(weekday => initials.indexOf(weekday) !== -1);
 }
 
-// 送信先を決める。年末年始の回答アドレスを優先し、無ければ案内送付先(to)を使う
-function klistPickEmail(replyRaw, guideRaw) {
-  const normalize = s => String(s).normalize("NFKC").replace(/\s/g, "").toLowerCase();
-  const reply = normalize(replyRaw);
-  const guide = normalize(guideRaw);
+// 優先順位に並べた各項目から、メールアドレスを集める。
+// 1つの項目に複数のアドレスが入っていても、「,」「;」「、」・空白・改行で分けて取り出す。
+// 送信先（email）は、最初に見つかった正しいアドレス。同じアドレスは1回だけ数える。
+//   sources: [{label, raw}] 優先順位順
+function klistPickEmail(sources) {
+  const valid = [];     // {email, label}
+  const invalid = [];   // 形式が正しくなかったもの
+  sources.forEach(source => {
+    const text = String(source.raw).normalize("NFKC").toLowerCase();
+    text.split(/[,;、，；\s]+/).filter(Boolean).forEach(candidate => {
+      if (KLIST_EMAIL_PATTERN.test(candidate)) {
+        if (!valid.some(v => v.email === candidate)) valid.push({ email: candidate, label: source.label });
+      } else {
+        invalid.push(`${source.label}: ${candidate}`);
+      }
+    });
+  });
 
-  if (reply) {
-    return KLIST_EMAIL_PATTERN.test(reply)
-      ? { email: reply }
-      : { reason: "年末年始の回答アドレスがメールアドレスの形式ではありません", raw: replyRaw };
+  if (valid.length === 0) {
+    return invalid.length > 0
+      ? { reason: "メールアドレスの形式が正しいものがありません", raw: invalid.join(" / ") }
+      : { reason: "送信先アドレスがありません", raw: "" };
   }
-  if (guide) {
-    return KLIST_EMAIL_PATTERN.test(guide)
-      ? { email: guide }
-      : { reason: "案内送付先アドレスがメールアドレスの形式ではありません", raw: guideRaw };
-  }
-  return { reason: "送信先アドレスがありません", raw: "" };
+  return {
+    email: valid[0].email,
+    usedLabel: valid[0].label,
+    others: valid.slice(1).map(v => `${v.email}（${v.label}）`).join(" / "),
+    invalid: invalid.join(" / ")
+  };
 }
 
 // 期間中の各日について、見出しと「回収できる曜日か」を作る
@@ -303,21 +331,19 @@ function klistCollect(ss) {
 
     // 管理用の一覧に1行追加する。状況: フォーム作成済 / 未作成 / エラー / 要確認
     // フォーム作成済の店舗だけ、回答状況（回答済 / 未回答）と回答日時も入れる
-    const addStatus = (status, email, reason) => {
+    const addStatus = (status, email, reason, pickedInfo) => {
       const answeredAt = answeredAtByStore[storeName];
       const answerState = status === "フォーム作成済" ? (answeredAt ? "回答済" : "未回答") : "";
       statusRows.push([storeName, customer, recordUrl, status, email || "", reason || "",
-        answerState, answeredAt || ""]);
+        answerState, answeredAt || "",
+        pickedInfo ? pickedInfo.usedLabel : "", pickedInfo ? pickedInfo.others : "", pickedInfo ? pickedInfo.invalid : ""]);
     };
-    const addReview = (reason, raw, email) => {
+    const addReview = (reason, raw, pickedInfo) => {
       reviewRows.push([recordId, storeName, reason, raw || ""]);
-      addStatus("要確認", email, reason);
+      addStatus("要確認", pickedInfo && pickedInfo.email, reason, pickedInfo);
     };
 
-    const picked = klistPickEmail(
-      klistValue(record, fieldCodes.replyEmail),
-      klistValue(record, fieldCodes.guideEmail)
-    );
+    const picked = klistPickEmail(fieldCodes.emails.map(e => ({ label: e.label, raw: klistValue(record, e.code) })));
     if (picked.reason) {
       addReview(picked.reason, picked.raw);
       return;
@@ -328,13 +354,13 @@ function klistCollect(ss) {
     const burnableOn = klistWeekdayFlags(selectedOptions); // 日〜土の順
     if (burnableOn.some(Boolean)) recognizedWeekdayCount++;
     if (!burnableOn.some(Boolean)) {
-      addReview("可燃の回収曜日が登録されていません", "", picked.email);
+      addReview("可燃の回収曜日が登録されていません", "", picked);
       return;
     }
 
     const marks = dates.map(date => (date.collectable && burnableOn[date.weekdayIndex] ? "○" : ""));
     if (!marks.some(mark => mark === "○")) {
-      addReview("期間中に回収できる日がありません（回収曜日が期間外の曜日のみ、など）", "", picked.email);
+      addReview("期間中に回収できる日がありません（回収曜日が期間外の曜日のみ、など）", "", picked);
       return;
     }
     while (marks.length < KLIST_DATE_SLOTS) marks.push(""); // 列 D〜K の8列に合わせる
@@ -342,11 +368,11 @@ function klistCollect(ss) {
     const carried = source.sentByStore[storeName] || ["", "", ""];
     if (carried[2]) {
       carriedCount++;
-      addStatus("フォーム作成済", picked.email);
+      addStatus("フォーム作成済", picked.email, "", picked);
     } else if (source.errorStores.has(storeName)) {
-      addStatus(KLIST_STATUS_ERROR, picked.email, "フォーム作成でエラーになりました");
+      addStatus(KLIST_STATUS_ERROR, picked.email, "フォーム作成でエラーになりました", picked);
     } else {
-      addStatus("未作成", picked.email);
+      addStatus("未作成", picked.email, "", picked);
     }
     listRows.push([storeName, picked.email, vendor].concat(marks, carried));
   });
@@ -370,7 +396,8 @@ function klistCollect(ss) {
 
 function klistWriteStatusSheet(ss, statusRows) {
   klistWriteSheet(ss, KLIST_STATUS_SHEET_NAME,
-    ["店舗名", "契約者", "契約管理URL", "状況", "送信先アドレス", "理由", "回答状況", "回答日時"], statusRows);
+    ["店舗名", "契約者", "契約管理URL", "状況", "送信先アドレス", "理由", "回答状況", "回答日時",
+      "採用したアドレスの項目", "その他のアドレス（優先順）", "形式が正しくないもの"], statusRows);
 }
 
 function buildListFromKintone() {
