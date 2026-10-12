@@ -6,7 +6,7 @@
 //   1. verifyKintoneListData … 「リスト_kintone」を調べる（リストを差し替える前に実行）
 //   2. verifyListData        … 「リスト」を調べる（差し替えたあと、フォームを作る前に実行）
 //   3. verifyCreatedForms    … 作成したフォームを抜き取りで調べ、フォルダの中身とも照合する（フォームを作ったあと）
-//   結果は「検証結果」シートの「重大度」で見る。エラー = 直してから進める、警告 = 内容を見て判断、情報 = 参考
+//   結果は「検証結果_○○」シート（対象ごとに別のタブ）の「重大度」で見る。エラー = 直してから進める、警告 = 内容を見て判断、情報 = 参考
 //
 // スクリプトプロパティ（リスト作成.js と同じ）: KINTONE_SUBDOMAIN / KINTONE_KEIYAKU_APP_ID / KINTONE_KEIYAKU_API_TOKEN
 // 項目名の対応は、KLIST_FIELD_CODES（あれば）を優先して使う。
@@ -324,8 +324,10 @@ function verWriteResult_(ss, sheetName, countLine, results) {
   const counts = { "エラー": 0, "警告": 0, "情報": 0 };
   results.forEach(r => { counts[r[0]]++; });
 
-  let out = ss.getSheetByName(VER_RESULT_SHEET_NAME);
-  if (!out) out = ss.insertSheet(VER_RESULT_SHEET_NAME);
+  // 検証の対象ごとに別のタブに出す（「リスト」の検証結果を、フォームの検証結果で上書きしないため）
+  const tabName = sheetName.indexOf("作成済みフォーム") === 0 ? VER_RESULT_SHEET_NAME + "_フォーム" : VER_RESULT_SHEET_NAME + "_" + sheetName;
+  let out = ss.getSheetByName(tabName);
+  if (!out) out = ss.insertSheet(tabName);
   out.clear();
   const summary = [`検証した対象: 「${sheetName}」`, `日時: ${Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy/MM/dd HH:mm:ss")}`,
     countLine, `エラー ${counts["エラー"]} 件 / 警告 ${counts["警告"]} 件 / 情報 ${counts["情報"]} 件`];
@@ -333,7 +335,7 @@ function verWriteResult_(ss, sheetName, countLine, results) {
   const rows = summary.map(s => [s, "", "", "", ""]).concat([header], results.length > 0 ? results : [["問題なし", "", "", "検出された食い違いはありません", ""]]);
   out.getRange(1, 1, rows.length, 5).setValues(rows);
   out.getRange(summary.length + 1, 1, 1, 5).setFontWeight("bold");
-  console.log(`検証結果（${sheetName}）: エラー ${counts["エラー"]} 件 / 警告 ${counts["警告"]} 件 / 情報 ${counts["情報"]} 件。シート「${VER_RESULT_SHEET_NAME}」を確認してください。`);
+  console.log(`検証結果（${sheetName}）: エラー ${counts["エラー"]} 件 / 警告 ${counts["警告"]} 件 / 情報 ${counts["情報"]} 件。シート「${tabName}」を確認してください。`);
 }
 
 // 作成したフォームの抜き取り検査と、フォルダとの照合。フォームを作ったあとに実行する
