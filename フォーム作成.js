@@ -28,6 +28,10 @@ const FORM_STATUS_ERROR = "エラー";
 const FORM_COL_URL = 12;    // L列: フォームURL
 const FORM_COL_STATUS = 14; // N列: 送信状況
 
+// 各アドレス項目の内容（0始まり、O〜S列）。「メール送信用」シートに並べる
+const FORM_COL_EMAIL_START = 14;
+const FORM_COL_EMAIL_END = 18;
+
 // 希望日の列（0始まり、D〜K列）
 const FORM_DATE_COL_START = 3;
 const FORM_DATE_COL_END = 10;
@@ -90,7 +94,7 @@ function createFormsInBatches() {
     }
     const data = sheet.getDataRange().getDisplayValues();
     const headers = data[0];
-    const sendSheet = getFormSendSheet(ss);
+    const sendSheet = getFormSendSheet(ss, headers);
 
     const folder = getFormFolder();
 
@@ -117,7 +121,11 @@ function createFormsInBatches() {
           sheet.getRange(store.rowNumber, FORM_COL_URL, 1, 3)
                .setValues([[result.formUrl, result.formId, FORM_STATUS_SENT]]);
         });
-        sendSheet.appendRow([email, result.storeNamesText, result.formUrl]);
+        // 店舗ごとに1行。各アドレス項目の内容と、フォームURL、実際にフォームの送信先にしたアドレスを並べる
+        stores.forEach(store => {
+          sendSheet.appendRow([store.storeName]
+            .concat(store.rowData.slice(FORM_COL_EMAIL_START, FORM_COL_EMAIL_END + 1), [result.formUrl, email]));
+        });
         SpreadsheetApp.flush();
         formCount++;
       } catch (e) {
@@ -183,11 +191,14 @@ function getFormFolder() {
   }
 }
 
-function getFormSendSheet(ss) {
+function getFormSendSheet(ss, headers) {
   let sendSheet = ss.getSheetByName(FORM_SEND_SHEET_NAME);
   if (!sendSheet) {
     sendSheet = ss.insertSheet(FORM_SEND_SHEET_NAME);
-    sendSheet.appendRow(["メールアドレス", "対象店舗", "フォームURL"]);
+  }
+  if (sendSheet.getLastRow() === 0) {
+    const emailHeaders = headers.slice(FORM_COL_EMAIL_START, FORM_COL_EMAIL_END + 1);
+    sendSheet.appendRow(["店名"].concat(emailHeaders, ["フォームURL", "送信先アドレス"]));
   }
   return sendSheet;
 }

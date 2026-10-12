@@ -343,7 +343,13 @@ function klistCollect(ss) {
       addStatus("要確認", pickedInfo && pickedInfo.email, reason, pickedInfo);
     };
 
-    const picked = klistPickEmail(fieldCodes.emails.map(e => ({ label: e.label, raw: klistValue(record, e.code) })));
+    const emailSources = fieldCodes.emails.map(e => ({ label: e.label, raw: klistValue(record, e.code) }));
+    const picked = klistPickEmail(emailSources);
+    // 各アドレス項目に入っている内容をそのまま並べる（O〜S列。「メール送信用」シートに使う）。見つからない項目の列は空
+    const rawEmails = KLIST_EMAIL_LABELS.map(label => {
+      const found = emailSources.filter(e => e.label === label)[0];
+      return found ? found.raw : "";
+    });
     if (picked.reason) {
       addReview(picked.reason, picked.raw);
       return;
@@ -374,7 +380,7 @@ function klistCollect(ss) {
     } else {
       addStatus("未作成", picked.email, "", picked);
     }
-    listRows.push([storeName, picked.email, vendor].concat(marks, carried));
+    listRows.push([storeName, picked.email, vendor].concat(marks, carried, rawEmails));
   });
 
   // 全件で曜日が読み取れなかった場合は、選択肢の名前が想定と違うので、シートを作らずに止める
@@ -407,7 +413,7 @@ function buildListFromKintone() {
   const dateHeaders = result.dates.map(date => date.header);
   while (dateHeaders.length < KLIST_DATE_SLOTS) dateHeaders.push("");
   const listHeader = ["店舗名", "メールアドレス", "業者名"]
-    .concat(dateHeaders, ["フォームURL", "フォームID", "送信状況"]);
+    .concat(dateHeaders, ["フォームURL", "フォームID", "送信状況"], KLIST_EMAIL_LABELS);
   klistWriteSheet(ss, KLIST_OUTPUT_SHEET_NAME, listHeader, result.listRows);
   klistWriteSheet(ss, KLIST_REVIEW_SHEET_NAME, ["レコード番号", "契約店舗名称", "理由", "アドレス欄の内容"], result.reviewRows);
   klistWriteStatusSheet(ss, result.statusRows);
