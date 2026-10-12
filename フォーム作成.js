@@ -109,6 +109,12 @@ function createFormsInBatches() {
     const groupedData = groupUnsentRowsByForm(data);
     let emails = Object.keys(groupedData);
 
+    // 動作確認用: スクリプトプロパティ FORM_TEST_MULTI に on を入れると、2店舗以上のフォームだけを対象にする。本番の前に消すこと
+    if (String(PropertiesService.getScriptProperties().getProperty("FORM_TEST_MULTI") || "").trim().toLowerCase() === "on") {
+      emails = emails.filter(key => groupedData[key].stores.length >= 2);
+      console.log(`FORM_TEST_MULTI が on のため、2店舗以上のフォームだけを対象にします（${emails.length} 件）。`);
+    }
+
     // 動作確認用: スクリプトプロパティ FORM_TEST_LIMIT に件数（例: 5）を入れると、その件数だけ作って止まる。本番の前に消すこと
     const testLimit = Number(PropertiesService.getScriptProperties().getProperty("FORM_TEST_LIMIT") || 0);
     if (testLimit > 0) {
@@ -267,36 +273,23 @@ ${storeNamesText}
 ★特別回収料金：店舗ごとに異なります。各店舗の設問をご確認ください。
 ★回収対象：可燃ごみのみ
 
-${deadlineText}◆ 特別回収期間の回収を希望 される場合（※）は
-「${FORM_CHOICE_WANT}」を選択し
-次の画面にて希望日にチェックをしてください 。
+${deadlineText}◆ 次の画面で、店舗ごとに、各日の回収を「希望する」「希望しない」からお選びください。
+ ※特別回収を希望されない場合も、すべての日について「希望しない」を選択してご回答ください。
  ※通常、伺っております可燃回収曜日に準じます。予めご了承ください。
- ※通常回収日以外にチェックをされましても回収は出来かねますので、予めご留意ください。
 
 ◆希望日とは回収に伺う日付です。
  （例：12月30日営業分のゴミは、12月31日が回収日となります。）
 
-◆特別回収期間の回収を希望されない場合「${FORM_CHOICE_NOT_WANT}」を選択してください。
-
 ◆回答内容を変更する場合は、このフォームから再度ご回答ください（最新のご回答を有効とします）。${changeDeadlineText}`);
 
-    // 1ページ目：回答者の連絡先と希望の有無。「希望しない」はそのまま送信、「希望する」は次ページの希望日選択へ進む
+    // 1ページ目：回答者の連絡先
     form.addTextItem().setTitle(FORM_Q_CONTACT_NAME).setRequired(true);
     form.addTextItem().setTitle(FORM_Q_PHONE).setRequired(true);
     form.addParagraphTextItem().setTitle(FORM_Q_COMMENT);
 
-    const wantItem = form.addMultipleChoiceItem()
-        .setTitle(FORM_Q_WANT)
-        .setRequired(true);
+    form.addPageBreakItem().setTitle('希望日の選択');
 
-    const datePage = form.addPageBreakItem().setTitle('希望日の選択');
-
-    wantItem.setChoices([
-      wantItem.createChoice(FORM_CHOICE_WANT, datePage),
-      wantItem.createChoice(FORM_CHOICE_NOT_WANT, FormApp.PageNavigationType.SUBMIT)
-    ]);
-
-    // 2ページ目：店舗ごとの希望日
+    // 2ページ目：店舗ごとの希望日（希望しない場合も、各日に「希望しない」を選んでもらう）
     stores.forEach(store => {
       const fee = FORM_VENDOR_FEES[store.vendor] || FORM_DEFAULT_FEE;
 

@@ -321,18 +321,22 @@ function respReadFormResponses(form, headers) {
 
 // 1件の回答から、ある店舗の「特別回収の希望」と、日付ごとの「○／×」を作る
 function respBuildStoreAnswer(parsed, store, headers) {
-  const wantLabel = parsed.want === RESP_CHOICE_WANT ? RESP_ANSWER_YES
-    : parsed.want === RESP_CHOICE_NOT_WANT ? RESP_ANSWER_NO
-    : parsed.want;
-
   const dateCells = [];
   headers.forEach((header, i) => {
     if (!header) return;                                    // 見出しの無い列（期間が短いときの余り）は使わない
     if (!store.offered[i]) { dateCells.push(""); return; }  // 設問が無かった日
-    if (parsed.want === RESP_CHOICE_NOT_WANT) { dateCells.push("×"); return; }  // 「希望しない」で送信した場合は、全日程が「×」
+    if (parsed.want === RESP_CHOICE_NOT_WANT) { dateCells.push("×"); return; }  // 旧形式のフォーム：「希望しない」で送信した場合は、全日程が「×」
     const answer = (parsed.dateAnswers[store.name] || {})[header];
     dateCells.push(answer === RESP_ANSWER_YES ? "○" : answer === RESP_ANSWER_NO ? "×" : "");
   });
+
+  // 「特別回収」の列: 旧形式のフォームは最初の選択肢から、今の形式は日ごとの回答から決める（1日でも「希望する」があれば「希望する」）
+  let wantLabel = parsed.want === RESP_CHOICE_WANT ? RESP_ANSWER_YES
+    : parsed.want === RESP_CHOICE_NOT_WANT ? RESP_ANSWER_NO
+    : parsed.want;
+  if (!parsed.want) {
+    wantLabel = dateCells.indexOf("○") !== -1 ? RESP_ANSWER_YES : dateCells.indexOf("×") !== -1 ? RESP_ANSWER_NO : "";
+  }
   return { wantLabel: wantLabel, dateCells: dateCells };
 }
 
@@ -594,7 +598,10 @@ function respBuildReceiptMail(rows, dateHeaders, formUrl) {
         else if (cell === "×") lines.push(`    ${header}：希望しない`);
       });
     } else if (want === RESP_ANSWER_NO) {
-      lines.push("  特別回収：希望しない（すべての日程において回収を希望しない）");
+      lines.push("  特別回収：希望しない");
+      dateHeaders.forEach((header, i) => {
+        if (row[3 + i] === "×") lines.push(`    ${header}：希望しない`);
+      });
     } else {
       lines.push(`  特別回収：${want}`);
     }
