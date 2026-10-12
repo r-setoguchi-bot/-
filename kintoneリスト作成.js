@@ -268,7 +268,7 @@ function klistLoadSourceStatus(ss) {
   if (!sheet) return { sentByStore: sentByStore, errorStores: errorStores };
 
   const data = sheet.getDataRange().getDisplayValues();
-  // フォームURL・フォームID・送信状況の列は、見出しから探す（見つからなければ I, J, K列）
+  // フォームURL・フォームID・フォーム作成状況の列は、見出しから探す（見つからなければ I, J, K列）
   const urlCol = data[0].indexOf("フォームURL") >= 0 ? data[0].indexOf("フォームURL") : 8;
   const idCol = urlCol + 1;
   const statusCol = urlCol + 2;
@@ -418,7 +418,7 @@ function buildListFromKintone() {
   const dateHeaders = result.dates.map(date => date.header);
   while (dateHeaders.length < KLIST_DATE_SLOTS) dateHeaders.push("");
   const listHeader = ["店舗名", "メールアドレス", "業者名"]
-    .concat(dateHeaders, ["フォームURL", "フォームID", "送信状況"], KLIST_EMAIL_LABELS);
+    .concat(dateHeaders, ["フォームURL", "フォームID", "フォーム作成状況"], KLIST_EMAIL_LABELS);
   klistWriteSheet(ss, KLIST_OUTPUT_SHEET_NAME, listHeader, result.listRows);
   klistWriteSheet(ss, KLIST_REVIEW_SHEET_NAME, ["レコード番号", "契約店舗名称", "理由", "アドレス欄の内容"], result.reviewRows);
   klistWriteStatusSheet(ss, result.statusRows);

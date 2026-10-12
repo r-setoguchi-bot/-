@@ -89,7 +89,7 @@ const RESP_COL_DATE_START = 3;  // D列〜H列: 希望日（「○」の日だ�
 const RESP_COL_DATE_END = 7;
 const RESP_COL_FORM_URL = 8;    // I列: フォームURL
 const RESP_COL_FORM_ID = 9;     // J列: フォームID
-const RESP_COL_STATUS = 10;     // K列: 送信状況
+const RESP_COL_STATUS = 10;     // K列: フォーム作成状況
 
 // 「回答集計」シートの、手入力・自動記録の列（集計のたびに書き換えず、前の値を引き継ぐ）
 const RESP_HEADER_REQUESTED = "業者依頼済";

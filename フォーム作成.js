@@ -26,7 +26,7 @@ const FORM_STATUS_ERROR = "エラー";
 
 // 列番号（1始まり）
 const FORM_COL_URL = 9;     // I列: フォームURL
-const FORM_COL_STATUS = 11; // K列: 送信状況
+const FORM_COL_STATUS = 11; // K列: フォーム作成状況
 
 // 各アドレス項目の内容（0始まり、L〜P列）。「メール送信用」シートに並べる
 const FORM_COL_EMAIL_START = 11;
