@@ -109,3 +109,41 @@ function findEmailFields() {
   });
   console.log(`該当した項目: ${count} 件`);
 }
+
+// 店舗の住所に関係しそうな項目（名前に「住所」「所在地」「郵便」「都道府県」「市区」「番地」「ビル」を含むもの）を一覧にする。
+// 項目名・コード・種類と、最初の契約中の1件の値の例を出す（住所の入っている項目を探すため。アドレスなどは出さない）
+function findAddressFields() {
+  const props = PropertiesService.getScriptProperties();
+  const sub = String(props.getProperty("KINTONE_SUBDOMAIN") || "").trim();
+  const app = String(props.getProperty("KINTONE_KEIYAKU_APP_ID") || "").trim();
+  const token = String(props.getProperty("KINTONE_KEIYAKU_API_TOKEN") || "").trim();
+  const headers = { "X-Cybozu-API-Token": token };
+  const response = UrlFetchApp.fetch(`https://${sub}.cybozu.com/k/v1/app/form/fields.json?app=${app}`,
+    { method: "get", headers: headers, muteHttpExceptions: true });
+  if (response.getResponseCode() !== 200) throw new Error(`HTTP ${response.getResponseCode()}`);
+  const properties = JSON.parse(response.getContentText()).properties || {};
+
+  const pattern = /住所|所在地|郵便|都道府県|市区|番地|ビル|地番|アドレス（住所）/;
+  const found = [];
+  Object.keys(properties).forEach(code => {
+    const field = properties[code];
+    if (pattern.test(String(field.label))) found.push({ code: code, label: field.label, type: field.type });
+  });
+  if (found.length === 0) {
+    console.log("該当する項目が見つかりませんでした。");
+    return;
+  }
+
+  // 値の例（契約中の1件目）
+  const fieldsParam = found.map((f, i) => `fields%5B${i}%5D=${encodeURIComponent(f.code)}`).join("&");
+  const query = encodeURIComponent('契約種別 = "契約中" limit 1');
+  const sample = UrlFetchApp.fetch(`https://${sub}.cybozu.com/k/v1/records.json?app=${app}&query=${query}&${fieldsParam}`,
+    { method: "get", headers: headers, muteHttpExceptions: true });
+  const record = sample.getResponseCode() === 200 ? (JSON.parse(sample.getContentText()).records || [])[0] : null;
+
+  found.forEach(f => {
+    const value = record && record[f.code] ? record[f.code].value : "";
+    console.log(`項目名=「${f.label}」 コード=${f.code} 種類=${f.type} 値の例=「${Array.isArray(value) ? value.join(",") : value}」`);
+  });
+  console.log(`該当した項目: ${found.length} 件`);
+}
