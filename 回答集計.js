@@ -17,6 +17,8 @@
 //     test … お客様には送らず、RESP_MAIL_TEST_TO のアドレスだけに送る（動作確認用）
 //     on   … お客様へ送る。RESP_MAIL_BCC があれば、そのアドレスにも同じメールを送る（社内の控え）
 //   同じ回答には1回だけ送る。再回答があれば、その回答の分をもう一度送る。送信の結果は「控えメール」の列に残る。
+//   メールには、変更するためのフォームのURLと、変更できる最終日時（RESP_CUTOFF_AT）を書く。
+//   社内の控え（RESP_MAIL_BCC）は、必要なときだけ設定する。回答はフォームの中に日時つきで全件残る。
 //   メールはスクリプトを実行しているアカウントから送られ、送信できる数には1日の上限がある。
 //
 // 使い方:
@@ -25,6 +27,10 @@
 //   2. 今すぐ集計したいときは startResponseCollection、今すぐ受付を止めたいときは closeRequestedForms を実行
 //      控えメールの文面を確かめたいときは sendSampleReceiptMail を実行（RESP_MAIL_TEST_TO 宛てにサンプルを送る）
 //   3. 自動集計を止めるときは removeResponseCollectionTrigger を実行
+//
+// 変更の最終日時:
+//   RESP_CUTOFF_AT に日時を入れると、その日時を過ぎたあと、全フォームの受付を自動で止める（1時間ごとに確認）。
+//   お客様は、それまでは同じフォームから何度でも回答し直せる（最新の回答が有効）。空のままなら自動では止めない。
 //
 // スプレッドシートの指定は フォーム作成.js と同じ（FORM_SPREADSHEET_URL、無ければ紐づいているスプレッドシート）。
 // このファイルだけで動く（質問文は フォーム作成.js と同じものを下に書いている）。
@@ -40,6 +46,14 @@ const RESP_CURSOR_PROPERTY = "RESP_CURSOR";   // 何番目のフォームまで�
 const RESP_START_HANDLER = "startResponseCollection";
 const RESP_CONTINUE_HANDLER = "collectFormResponses";
 const RESP_CLOSE_HANDLER = "closeRequestedForms";
+
+// 回答を変更できる最終日時（例: "2026/11/30 23:59"）。過ぎたら全フォームの受付を止める。空のままなら止めない。
+// フォーム作成.js の FORM_CHANGE_DEADLINE_TEXT と同じ日時にしておくこと
+const RESP_CUTOFF_AT = "";
+const RESP_CUTOFF_HANDLER = "closeAllFormsAtCutoff";
+const RESP_CUTOFF_CONTINUE_HANDLER = "continueCloseAllFormsAtCutoff";
+const RESP_CUTOFF_CURSOR_PROPERTY = "RESP_CUTOFF_CURSOR";
+const RESP_CUTOFF_DONE_PROPERTY = "RESP_CUTOFF_DONE";
 
 // 受付を止めたフォームを開いた人に表示するメッセージ
 const RESP_CLOSED_MESSAGE = "このアンケートの回答受付は終了しました。内容の変更をご希望の場合は、お手数ですが株式会社クリメンまでご連絡ください。";
@@ -70,6 +84,7 @@ const RESP_COL_STORE = 0;   // A列: 店舗名
 const RESP_COL_EMAIL = 1;   // B列: メールアドレス
 const RESP_COL_DATE_START = 3;  // D列〜K列: 希望日（「○」の日だけ設問がある）
 const RESP_COL_DATE_END = 10;
+const RESP_COL_FORM_URL = 11;   // L列: フォームURL
 const RESP_COL_FORM_ID = 12;    // M列: フォームID
 const RESP_COL_STATUS = 13;     // N列: 送信状況
 
@@ -111,6 +126,8 @@ function setupResponseCollectionTrigger() {
   deleteTriggersByHandler(RESP_CLOSE_HANDLER);
   ScriptApp.newTrigger(RESP_START_HANDLER).timeBased().everyHours(RESP_INTERVAL_HOURS).create();
   ScriptApp.newTrigger(RESP_CLOSE_HANDLER).timeBased().everyHours(1).create();
+  deleteTriggersByHandler(RESP_CUTOFF_HANDLER);
+  ScriptApp.newTrigger(RESP_CUTOFF_HANDLER).timeBased().everyHours(1).create();
   console.log(`${RESP_INTERVAL_HOURS}時間ごとの自動集計と、1時間ごとの受付停止の確認を登録しました。`);
   startResponseCollection();
 }
@@ -120,7 +137,10 @@ function removeResponseCollectionTrigger() {
   deleteTriggersByHandler(RESP_START_HANDLER);
   deleteTriggersByHandler(RESP_CONTINUE_HANDLER);
   deleteTriggersByHandler(RESP_CLOSE_HANDLER);
+  deleteTriggersByHandler(RESP_CUTOFF_HANDLER);
+  deleteTriggersByHandler(RESP_CUTOFF_CONTINUE_HANDLER);
   PropertiesService.getScriptProperties().deleteProperty(RESP_CURSOR_PROPERTY);
+  PropertiesService.getScriptProperties().deleteProperty(RESP_CUTOFF_CURSOR_PROPERTY);
   console.log("自動集計を停止しました。");
 }
 
@@ -257,7 +277,7 @@ function respGroupFormsFromList(data) {
     if (!formId || row[RESP_COL_STATUS] !== RESP_STATUS_SENT) continue;
 
     if (!formsById[formId]) {
-      formsById[formId] = { formId: formId, stores: [] };
+      formsById[formId] = { formId: formId, formUrl: row[RESP_COL_FORM_URL], stores: [] };
       forms.push(formsById[formId]);
     }
     formsById[formId].stores.push({
@@ -394,6 +414,10 @@ function respWriteOutputSheet(ss, outputHeader, rowsByStore, mailedByStore) {
 function respApplyRequestedStatus(ss, forms) {
   const sheet = ss.getSheetByName(RESP_OUTPUT_SHEET_NAME);
   if (!sheet || sheet.getLastRow() < 2) return;
+  if (respIsAfterCutoff()) {
+    console.log("変更の最終日時を過ぎているため、「業者依頼済」による受付の切り替えは行いません。");
+    return;
+  }
 
   const values = sheet.getDataRange().getDisplayValues();
   const header = values[0];
@@ -426,7 +450,7 @@ function respApplyRequestedStatus(ss, forms) {
         const target = FormApp.openById(form.formId);
         if (shouldClose) {
           target.setAcceptingResponses(false);
-          target.setCustomClosedFormMessage(RESP_CLOSED_MESSAGE + (RESP_CLOSED_CONTACT ? "\n" + RESP_CLOSED_CONTACT : ""));
+          target.setCustomClosedFormMessage(respClosedMessage());
           closedCount++;
         } else {
           target.setAcceptingResponses(true);
@@ -499,7 +523,7 @@ function respSendReceiptIfNeeded(form, rows, dateHeaders, previousMailed, mail) 
     return "";
   }
 
-  const message = respBuildReceiptMail(rows, dateHeaders);
+  const message = respBuildReceiptMail(rows, dateHeaders, form.formUrl);
   const subjectPrefix = mail.mode === "test" ? "【テスト】" : "";
   const bodyPrefix = mail.mode === "test" ? `（テスト送信です。本来の宛先: ${customerEmail}）\n\n` : "";
   const options = { to: to, subject: subjectPrefix + message.subject, body: bodyPrefix + message.body, name: RESP_MAIL_SENDER_NAME };
@@ -515,7 +539,7 @@ function respSendReceiptIfNeeded(form, rows, dateHeaders, previousMailed, mail) 
 }
 
 // 1つのフォームの回答（店舗ごとの行）から、控えメールの件名と本文を作る
-function respBuildReceiptMail(rows, dateHeaders) {
+function respBuildReceiptMail(rows, dateHeaders, formUrl) {
   const D = dateHeaders.length;
   const first = rows[0];
   const answeredAt = first[1];
@@ -554,9 +578,11 @@ function respBuildReceiptMail(rows, dateHeaders) {
   if (comment) lines.push("", `■ご不明点・ご要望：${comment}`);
   lines.push("");
   lines.push("※本メールは、ご回答内容の控えとしてお送りしています。");
-  lines.push(RESP_MAIL_CONTACT
-    ? `※回答内容の変更をご希望の場合は、${RESP_MAIL_CONTACT}までご連絡ください。`
-    : "※回答内容の変更をご希望の場合は、お手数ですが当社までご連絡ください。");
+  const cutoffText = respFormatCutoff();
+  lines.push("※回答内容を変更する場合は、下記のフォームから再度ご回答ください。最新のご回答を有効とします。");
+  if (cutoffText) lines.push(`  変更は${cutoffText}までとなります。それ以降は変更できません。`);
+  if (formUrl) lines.push(`  ${formUrl}`);
+  if (RESP_MAIL_CONTACT) lines.push(`※ご不明な点は、${RESP_MAIL_CONTACT}までご連絡ください。`);
   lines.push("", RESP_MAIL_SENDER_NAME);
 
   const subject = responseCount > 1 ? RESP_MAIL_SUBJECT.replace("の控え", "の控え（再回答）") : RESP_MAIL_SUBJECT;
@@ -574,9 +600,115 @@ function sendSampleReceiptMail() {
     ["サンプル店A", "2026/11/01 10:00:00", RESP_ANSWER_YES, "○", "×", "", "○", "山田 太郎", "03-0000-0000", "朝に来ますか？", "sample@example.com", "FORMID", 1, ""],
     ["サンプル店B", "2026/11/01 10:00:00", RESP_ANSWER_NO, "×", "×", "", "", "山田 太郎", "03-0000-0000", "朝に来ますか？", "sample@example.com", "FORMID", 1, ""]
   ];
-  const message = respBuildReceiptMail(rows, dateHeaders);
+  const message = respBuildReceiptMail(rows, dateHeaders, "https://docs.google.com/forms/d/e/（サンプル）/viewform");
   MailApp.sendEmail({ to: testTo, subject: "【テスト】" + message.subject, body: "（サンプルです。実際の回答ではありません）\n\n" + message.body, name: RESP_MAIL_SENDER_NAME });
   console.log(`サンプルのメールを ${testTo} に送りました。`);
+}
+
+// 変更の最終日時を Date にする。未設定・形式が違うときは null
+function respParseCutoff() {
+  const text = String(RESP_CUTOFF_AT).trim();
+  if (!text) return null;
+  const m = /^(\d{4})\/(\d{1,2})\/(\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?$/.exec(text);
+  if (!m) {
+    console.warn(`RESP_CUTOFF_AT の形式が違います（例: 2026/11/30 23:59）: ${text}`);
+    return null;
+  }
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4] || 23), Number(m[5] || 59));
+}
+
+function respIsAfterCutoff() {
+  const cutoff = respParseCutoff();
+  return !!cutoff && new Date() >= cutoff;
+}
+
+// 「2026年11月30日(月)23:59」の形にする。未設定なら空文字
+function respFormatCutoff() {
+  const cutoff = respParseCutoff();
+  if (!cutoff) return "";
+  const weekday = "日月火水木金土"[cutoff.getDay()];
+  const hh = ("0" + cutoff.getHours()).slice(-2);
+  const mm = ("0" + cutoff.getMinutes()).slice(-2);
+  return `${cutoff.getFullYear()}年${cutoff.getMonth() + 1}月${cutoff.getDate()}日(${weekday}) ${hh}:${mm}`;
+}
+
+function respClosedMessage() {
+  return RESP_CLOSED_MESSAGE + (RESP_CLOSED_CONTACT ? "\n" + RESP_CLOSED_CONTACT : "");
+}
+
+// 変更の最終日時を過ぎたら、作成済みの全フォームの受付を止める（1時間ごとの定期実行。時間切れは自動で続行する）
+function closeAllFormsAtCutoff() {
+  const cutoff = respParseCutoff();
+  if (!cutoff || new Date() < cutoff) return;
+
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty(RESP_CUTOFF_DONE_PROPERTY) === RESP_CUTOFF_AT) return; // この日時の分は完了済み
+
+  const lock = LockService.getUserLock();
+  if (!lock.tryLock(30 * 1000)) {
+    console.log("別の処理が動いているためスキップしました。");
+    return;
+  }
+
+  const startTime = Date.now();
+  let closedCount = 0;
+  const failedIds = [];
+  let nextIndex = 0;
+  let totalForms = 0;
+
+  try {
+    deleteTriggersByHandler(RESP_CUTOFF_CONTINUE_HANDLER);
+
+    const ss = respGetSpreadsheet();
+    const listSheet = ss.getSheetByName(RESP_LIST_SHEET_NAME);
+    if (!listSheet) {
+      throw new Error(`シート「${RESP_LIST_SHEET_NAME}」が見つかりません。`);
+    }
+    const forms = respGroupFormsFromList(listSheet.getDataRange().getDisplayValues());
+    totalForms = forms.length;
+
+    nextIndex = Number(props.getProperty(RESP_CUTOFF_CURSOR_PROPERTY) || 0);
+    if (nextIndex >= totalForms) nextIndex = 0;
+
+    while (nextIndex < totalForms) {
+      if (Date.now() - startTime > RESP_TIME_LIMIT_MS) break;
+
+      try {
+        const target = FormApp.openById(forms[nextIndex].formId);
+        if (target.isAcceptingResponses()) {
+          target.setAcceptingResponses(false);
+          target.setCustomClosedFormMessage(respClosedMessage());
+          closedCount++;
+        }
+      } catch (e) {
+        console.error(`フォームの受付を止められませんでした: ${forms[nextIndex].formId} / ${e}`);
+        failedIds.push(forms[nextIndex].formId);
+      }
+      nextIndex++;
+    }
+
+    if (nextIndex < totalForms) {
+      props.setProperty(RESP_CUTOFF_CURSOR_PROPERTY, String(nextIndex));
+      ScriptApp.newTrigger(RESP_CUTOFF_CONTINUE_HANDLER).timeBased().after(RESP_RETRY_DELAY_MS).create();
+      console.log(`変更の最終日時を過ぎたため受付を止めています: ${nextIndex} / ${totalForms} 件（今回 ${closedCount} 件を停止）。残りは自動で続行します。`);
+    } else {
+      props.deleteProperty(RESP_CUTOFF_CURSOR_PROPERTY);
+      props.setProperty(RESP_CUTOFF_DONE_PROPERTY, RESP_CUTOFF_AT);
+      console.log(`変更の最終日時を過ぎたため、全 ${totalForms} 件のフォームの受付を止めました（今回 ${closedCount} 件、失敗 ${failedIds.length} 件）。`);
+      if (failedIds.length > 0) console.warn(`止められなかったフォーム: ${failedIds.join(", ")}`);
+    }
+  } finally {
+    try {
+      lock.releaseLock();
+    } catch (e) {
+      console.warn(`ロック解除に失敗しました（処理には影響しません）: ${e}`);
+    }
+  }
+}
+
+// 時間切れで残ったときの続き（自動で呼ばれる）
+function continueCloseAllFormsAtCutoff() {
+  closeAllFormsAtCutoff();
 }
 
 // kintoneリスト作成.js があれば、集計が一巡したときに「契約状況一覧」の回答状況を最新にする

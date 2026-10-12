@@ -38,6 +38,10 @@ const FORM_PERIOD_TEXT = '2026年12月30日(水)から2027年1月3日(日)';
 // 回答期限（例: '2026年11月13日(金)'）。空のままなら説明文に期限の行を入れない
 const FORM_DEADLINE_TEXT = '2026年11月15日(日)';
 
+// 回答内容を変更できる最終日時（例: '2026年11月30日(月) 23:59'）。回答集計.js の RESP_CUTOFF_AT と同じ日時にしておくこと。
+// 空のままなら、説明文に期限の文を入れない
+const FORM_CHANGE_DEADLINE_TEXT = "";
+
 // 回答者への質問。回答集計.js が回答を読み取る目印にもなるので、文言を変えるときは両方そろえること
 const FORM_Q_CONTACT_NAME = "ご担当者様のお名前";
 const FORM_Q_PHONE = "ご連絡可能なお電話番号";
@@ -219,6 +223,7 @@ function createFormForStores(stores, headers, folder) {
       DriveApp.getFileById(form.getId()).moveTo(folder);
     }
 
+    const changeDeadlineText = FORM_CHANGE_DEADLINE_TEXT ? `\n　変更は${FORM_CHANGE_DEADLINE_TEXT}までとなります。それ以降は変更できません。` : "";
     const deadlineText = FORM_DEADLINE_TEXT ? `◆ご回答期限：${FORM_DEADLINE_TEXT}まで\n\n` : "";
 
     form.setDescription(`【対象店舗】
@@ -239,7 +244,9 @@ ${deadlineText}◆ 特別回収期間の回収を希望 される場合（※）
 ◆希望日とは回収に伺う日付です。
  （例：12月30日営業分のゴミは、12月31日が回収日となります。）
 
-◆特別回収期間の回収を希望されない場合「${FORM_CHOICE_NOT_WANT}」を選択してください。`);
+◆特別回収期間の回収を希望されない場合「${FORM_CHOICE_NOT_WANT}」を選択してください。
+
+◆回答内容を変更する場合は、このフォームから再度ご回答ください（最新のご回答を有効とします）。${changeDeadlineText}`);
 
     // 1ページ目：回答者の連絡先と希望の有無。「希望しない」はそのまま送信、「希望する」は次ページの希望日選択へ進む
     form.addTextItem().setTitle(FORM_Q_CONTACT_NAME).setRequired(true);
