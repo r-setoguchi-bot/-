@@ -78,3 +78,32 @@ function checkSettings() {
   });
   console.log(`参考: FORM_TEST_LIMIT=${get("FORM_TEST_LIMIT") || "未設定"} / RESP_MAIL_MODE=${get("RESP_MAIL_MODE") || "未設定（off）"} / INVITE_MODE=${get("INVITE_MODE") || "未設定（送信しない）"}`);
 }
+
+// アドレスに関係しそうな項目（名前に「メール」「mail」「アドレス」「送付」を含むもの）を、テーブルの中の項目も含めて一覧にする。
+// 項目名と種類だけを出し、個人情報（実際のアドレス）は出さない。
+function findEmailFields() {
+  const props = PropertiesService.getScriptProperties();
+  const sub = String(props.getProperty("KINTONE_SUBDOMAIN") || "").trim();
+  const app = String(props.getProperty("KINTONE_KEIYAKU_APP_ID") || "").trim();
+  const token = String(props.getProperty("KINTONE_KEIYAKU_API_TOKEN") || "").trim();
+  const response = UrlFetchApp.fetch(`https://${sub}.cybozu.com/k/v1/app/form/fields.json?app=${app}`,
+    { method: "get", headers: { "X-Cybozu-API-Token": token }, muteHttpExceptions: true });
+  if (response.getResponseCode() !== 200) throw new Error(`HTTP ${response.getResponseCode()}`);
+  const properties = JSON.parse(response.getContentText()).properties || {};
+
+  const pattern = /メール|mail|アドレス|送付/i;
+  let count = 0;
+  const show = (code, field, tableLabel) => {
+    if (!pattern.test(String(field.label)) && !(tableLabel && pattern.test(tableLabel))) return;
+    console.log(`${tableLabel ? "【テーブル「" + tableLabel + "」の中】" : "【通常の項目】"} 項目名=「${field.label}」 コード=${code} 種類=${field.type}`);
+    count++;
+  };
+  Object.keys(properties).forEach(code => {
+    const field = properties[code];
+    show(code, field, "");
+    if (field.type === "SUBTABLE" && field.fields) {
+      Object.keys(field.fields).forEach(innerCode => show(innerCode, field.fields[innerCode], field.label || code));
+    }
+  });
+  console.log(`該当した項目: ${count} 件`);
+}
