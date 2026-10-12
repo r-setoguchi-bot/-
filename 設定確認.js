@@ -28,13 +28,15 @@ function checkSettings() {
       const fields = JSON.parse(response.getContentText()).properties || {};
       log(true, "kintoneへの接続（項目の取得）", `成功（項目 ${Object.keys(fields).length} 件）`);
       const labels = Object.keys(fields).map(code => normalize(fields[code].label));
+      const codeOverrides = { "送付先別：e-mail": "送付先別mail1" };   // リスト作成.js の KLIST_EMAIL_CODES と同じ
       [
         "契約種別", "契約店舗名称", "顧客名称", "収集業者：名称", "可燃収集日",
         "年末年始　回答アドレス①", "年末年始　回答アドレス②", "案内等送付先メールアドレス:(to)",
         "送付先別：e-mail", "契約時の顧客担当：メールアドレス"
       ].forEach(label => {
-        const found = labels.indexOf(normalize(label)) !== -1;
-        log(found, `項目「${label}」`, found ? "あり" : "見つかりません");
+        const byCode = codeOverrides[label] && fields[codeOverrides[label]];
+        const found = labels.indexOf(normalize(label)) !== -1 || !!byCode;
+        log(found, `項目「${label}」`, found ? (byCode ? `あり（コード ${codeOverrides[label]}）` : "あり") : "見つかりません");
       });
     } catch (e) {
       log(false, "kintoneへの接続", `失敗: ${e}（サブドメイン・アプリID・トークン・「アプリ管理」の権限を確認）`);

@@ -56,6 +56,11 @@ const KLIST_EMAIL_LABELS = [
   "送付先別：e-mail",
   "契約時の顧客担当：メールアドレス"
 ];
+// 項目名が長い・変わりやすいなどで、名前では見つけられない項目は、フィールドコードで指定する（項目名 → フィールドコード）。
+// 「送付先別：e-mail」の本当の項目名は「送付先別：e-mail　※アドレスをここに複数入力しない！」と注意書きが付いている
+const KLIST_EMAIL_CODES = {
+  "送付先別：e-mail": "送付先別mail1"
+};
 // 可燃の回収曜日は、チェックボックス1項目（選択肢が曜日）に入っている
 const KLIST_BURNABLE_LABEL = "可燃収集日";
 
@@ -142,7 +147,7 @@ function klistResolveFieldCodes(config) {
 
   const emailCodes = [];
   KLIST_EMAIL_LABELS.forEach(label => {
-    const code = labelToCode[klistNormalizeLabel(label)];
+    const code = KLIST_EMAIL_CODES[label] || labelToCode[klistNormalizeLabel(label)];
     if (code) emailCodes.push({ label: label, code: code });
     else console.warn(`アドレスの項目「${label}」が見つかりません。この項目は使わずに進めます。`);
   });

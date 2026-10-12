@@ -35,6 +35,11 @@ const VER_L_EMAILS = [
   "契約時の顧客担当：メールアドレス"
 ];
 
+// 名前では見つけにくい項目は、フィールドコードで指定する（項目名 → フィールドコード）
+const VER_EMAIL_CODES = {
+  "送付先別：e-mail": "送付先別mail1"
+};
+
 // 「リスト」の列（0始まり）
 const VER_COL_STORE = 0;
 const VER_COL_EMAIL = 1;
@@ -95,7 +100,7 @@ function verLoadKintone_() {
     const parsed = JSON.parse(override);
     Object.keys(parsed).forEach(label => { labelToCode[verNormalize_(label)] = parsed[label]; });
   }
-  const code = label => labelToCode[verNormalize_(label)];
+  const code = label => VER_EMAIL_CODES[label] || labelToCode[verNormalize_(label)];
 
   const required = [VER_L_CONTRACT_TYPE, VER_L_STORE, VER_L_CUSTOMER, VER_L_VENDOR, VER_L_BURNABLE];
   const missing = required.filter(label => !code(label));
