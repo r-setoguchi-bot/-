@@ -65,6 +65,8 @@ const KLIST_EMAIL_CODES = {
 const KLIST_BURNABLE_LABEL = "可燃収集日";
 
 const KLIST_EMAIL_PATTERN = /^[a-z0-9._%+\-]+@[a-z0-9\-]+(\.[a-z0-9\-]+)+$/;
+// 送信先に使わないアドレス（ダミーなど）。形式が正しくても、ここに当てはまるものは使わず、次の優先順位のアドレスを見る
+const KLIST_EXCLUDED_EMAIL_PATTERNS = [/^dummy/];
 
 // 項目名を比較用にそろえる（全角半角・空白の違いを無視）
 function klistNormalizeLabel(label) {
@@ -230,8 +232,11 @@ function klistPickEmail(sources) {
   const invalid = [];   // 形式が正しくなかったもの
   sources.forEach(source => {
     const text = String(source.raw).normalize("NFKC").toLowerCase();
-    text.split(/[,;、，；\s]+/).filter(Boolean).forEach(candidate => {
-      if (KLIST_EMAIL_PATTERN.test(candidate)) {
+    text.split(/[,;、，；\s]+/).filter(Boolean).forEach(rawCandidate => {
+      const candidate = rawCandidate.replace(/^mailto:/, "");   // 「mailto:」が付いて入力されているものは外す
+      if (KLIST_EXCLUDED_EMAIL_PATTERNS.some(pattern => pattern.test(candidate))) {
+        invalid.push(`${source.label}: ${candidate}（ダミーなど、使わないアドレス）`);
+      } else if (KLIST_EMAIL_PATTERN.test(candidate)) {
         if (!valid.some(v => v.email === candidate)) valid.push({ email: candidate, label: source.label });
       } else {
         invalid.push(`${source.label}: ${candidate}`);
@@ -241,7 +246,7 @@ function klistPickEmail(sources) {
 
   if (valid.length === 0) {
     return invalid.length > 0
-      ? { reason: "メールアドレスの形式が正しいものがありません", raw: invalid.join(" / ") }
+      ? { reason: "使えるメールアドレスがありません（形式が正しくない、またはダミー）", raw: invalid.join(" / ") }
       : { reason: "送信先アドレスがありません", raw: "" };
   }
   return {

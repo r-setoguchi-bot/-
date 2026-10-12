@@ -40,6 +40,9 @@ const VER_EMAIL_CODES = {
   "送付先別：e-mail": "送付先別mail1"
 };
 
+// 送信先に使わないアドレス（リスト作成.js の KLIST_EXCLUDED_EMAIL_PATTERNS と同じ内容）
+const VER_EXCLUDED_EMAIL_PATTERNS = [/^dummy/];
+
 // 「リスト」の列（0始まり）
 const VER_COL_STORE = 0;
 const VER_COL_EMAIL = 1;
@@ -151,8 +154,11 @@ function verCollectEmails_(emailFields) {
   const valid = [];
   const bad = [];
   emailFields.forEach(f => {
-    String(f.raw).normalize("NFKC").toLowerCase().split(/[\s,;、，；]+/).filter(Boolean).forEach(a => {
-      if (/^[a-z0-9._%+\-]+@[a-z0-9\-]+(\.[a-z0-9\-]+)*\.[a-z]{2,}$/.test(a)) {
+    String(f.raw).normalize("NFKC").toLowerCase().split(/[\s,;、，；]+/).filter(Boolean).forEach(item => {
+      const a = item.replace(/^mailto:/, "");
+      if (VER_EXCLUDED_EMAIL_PATTERNS.some(pattern => pattern.test(a))) {
+        bad.push(`${f.label}: ${a}（ダミーなど）`);
+      } else if (/^[a-z0-9._%+\-]+@[a-z0-9\-]+(\.[a-z0-9\-]+)*\.[a-z]{2,}$/.test(a)) {
         if (valid.indexOf(a) === -1) valid.push(a);
       } else {
         bad.push(`${f.label}: ${a}`);
