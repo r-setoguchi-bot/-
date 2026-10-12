@@ -287,11 +287,13 @@ ${deadlineText}◆ 次の画面で、店舗ごとに、各日の回収を「希�
     form.addTextItem().setTitle(FORM_Q_PHONE).setRequired(true);
     form.addParagraphTextItem().setTitle(FORM_Q_COMMENT);
 
-    form.addPageBreakItem().setTitle('希望日の選択');
-
-    // 2ページ目：店舗ごとの希望日（希望しない場合も、各日に「希望しない」を選んでもらう）
-    stores.forEach(store => {
+    // 2ページ目以降：店舗ごとに1ページ（希望しない場合も、各日に「希望しない」を選んでもらう）
+    stores.forEach((store, index) => {
       const fee = FORM_VENDOR_FEES[store.vendor] || FORM_DEFAULT_FEE;
+
+      form.addPageBreakItem().setTitle(stores.length > 1
+        ? `希望日の選択（${index + 1}/${stores.length}店舗目）`
+        : '希望日の選択');
 
       form.addSectionHeaderItem()
           .setTitle(`【${store.storeName}】の収集希望について`)
