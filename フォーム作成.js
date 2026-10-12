@@ -13,6 +13,10 @@
 // フォームの保存先フォルダ:
 //   スクリプトプロパティ FORM_FOLDER_ID にドライブのフォルダID（フォルダのURLの folders/ の後ろ）を入れると、
 //   作ったフォームをそのフォルダに移す。未設定ならマイドライブ直下に残る。
+//
+// 動作確認用:
+//   スクリプトプロパティ FORM_TEST_LIMIT に件数（例: 5）を入れると、その件数だけフォームを作って止まる（続きの自動実行もしない）。
+//   本番で全件作るときは、このプロパティを削除すること。
 
 const FORM_LIST_SHEET_NAME = "リスト";
 const FORM_SEND_SHEET_NAME = "メール送信用";
@@ -99,7 +103,14 @@ function createFormsInBatches() {
     const folder = getFormFolder();
 
     const groupedData = groupUnsentRowsByEmail(data);
-    const emails = Object.keys(groupedData);
+    let emails = Object.keys(groupedData);
+
+    // 動作確認用: スクリプトプロパティ FORM_TEST_LIMIT に件数（例: 5）を入れると、その件数だけ作って止まる。本番の前に消すこと
+    const testLimit = Number(PropertiesService.getScriptProperties().getProperty("FORM_TEST_LIMIT") || 0);
+    if (testLimit > 0) {
+      emails = emails.slice(0, testLimit);
+      console.log(`FORM_TEST_LIMIT が設定されているため、最大 ${testLimit} 件だけ作成します。`);
+    }
 
     // 準備が終わったら、保険の再開トリガーを予約しておく。6分制限などで強制終了しても、これで処理が再開する
     scheduleFormBatch(FORM_SAFETY_DELAY_MS);
