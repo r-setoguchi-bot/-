@@ -77,6 +77,7 @@ const RESP_MAIL_SENDER_NAME = "株式会社クリメン";
 const RESP_MAIL_SUBJECT = "【株式会社クリメン】年末年始廃棄物回収アンケート ご回答内容の控え";
 const RESP_MAIL_PERIOD_TEXT = "2026年12月30日(水)から2027年1月3日(日)";
 const RESP_MAIL_TIME_TEXT = "回収は、各回収日の当日の早朝から午前中に行います。";   // 回収の時間帯の案内（控えメールに書く）。空のままなら入れない
+const RESP_MAIL_NOREPLY_TEXT = "※このメールは送信専用のアドレスから送っています。返信いただいても、お答えできません。";   // 空のままなら入れない
 const RESP_MAIL_CONTACT = "";                               // 内容の変更の連絡先（電話番号など）。空のままなら案内の文だけ入れる
 
 // フォーム作成.js の質問文・選択肢と同じ文言にしておくこと
@@ -720,6 +721,7 @@ function respBuildReceiptMail(rows, dateHeaders, formUrl, addresses) {
   if (RESP_CUSTOMER_DEADLINE_TEXT) lines.push(`  変更のご希望は${RESP_CUSTOMER_DEADLINE_TEXT}までにお願いいたします。`);
   if (formUrl) lines.push(`  ${formUrl}`);
   if (RESP_MAIL_CONTACT) lines.push(`※ご不明な点は、${RESP_MAIL_CONTACT}までご連絡ください。`);
+  if (RESP_MAIL_NOREPLY_TEXT) lines.push(RESP_MAIL_NOREPLY_TEXT);
   lines.push("", RESP_MAIL_SENDER_NAME);
 
   // HTML版: 店舗ごとに、日付を横に並べた表にする（○＝希望する、×＝希望しない）
@@ -742,6 +744,7 @@ function respBuildReceiptMail(rows, dateHeaders, formUrl, addresses) {
   if (RESP_CUSTOMER_DEADLINE_TEXT) h.push(`<br>　変更のご希望は${esc(RESP_CUSTOMER_DEADLINE_TEXT)}までにお願いいたします。`);
   if (formUrl) h.push(`<br>　<a href="${esc(formUrl)}">${esc(formUrl)}</a>`);
   if (RESP_MAIL_CONTACT) h.push(`<br>※ご不明な点は、${esc(RESP_MAIL_CONTACT)}までご連絡ください。`);
+  if (RESP_MAIL_NOREPLY_TEXT) h.push(`<br>${esc(RESP_MAIL_NOREPLY_TEXT)}`);
   h.push(`</p><p>${esc(RESP_MAIL_SENDER_NAME)}</p></div>`);
 
   const subject = responseCount > 1 ? RESP_MAIL_SUBJECT.replace("の控え", "の控え（再回答）") : RESP_MAIL_SUBJECT;
