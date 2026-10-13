@@ -178,6 +178,56 @@ function sendTestInvitations() {
   console.log(`${Math.min(INV_TEST_COUNT, forms.length)} 通のテストメールを ${testTo} に送りました（送信元: ${from || "実行アカウント"}）。`);
 }
 
+// ===== Power Automate（Outlookの共有メールボックスから送る）用の送信リストを作る =====
+// 「案内メール_PA用」シートに、送る案内メール（宛先・件名・本文）を1行ずつ書き出す（お客様には何も送らない）。
+// このシートをExcelにして、Power Automate のフローで読み込んで送る。送った分は、Excelの「送信済み」の列に日時を入れて管理する。
+// すでに「案内メール送信記録」で送信済みのフォームは、書き出さない。宛先が正しくないものは「案内メール_宛先エラー」に分ける。
+// ※この方法で送るときは、startInvitations（Gmailからの送信）は実行しないこと（二重に送ってしまう）。
+const INV_PA_SHEET_NAME = "案内メール_PA用";
+const INV_PA_ERROR_SHEET_NAME = "案内メール_宛先エラー";
+const INV_PA_PER_DAY = 450;   // 1日に送る通数。「送信日」の列を、この通数ごとに「1日目」「2日目」…と分ける
+const INV_PA_HEADER = ["No", "宛先", "件名", "本文", "フォームID", "対象店舗", "送信日", "送信済み"];
+
+function exportInvitationsForPowerAutomate() {
+  const ss = invGetSpreadsheet();
+  const listSheet = ss.getSheetByName(INV_LIST_SHEET_NAME);
+  if (!listSheet) throw new Error(`シート「${INV_LIST_SHEET_NAME}」が見つかりません。`);
+  const forms = invGroupFormsFromList(listSheet.getDataRange().getDisplayValues());
+
+  const logged = new Set();
+  const logSheet = ss.getSheetByName(INV_LOG_SHEET_NAME);
+  if (logSheet && logSheet.getLastRow() > 1) {
+    logSheet.getRange(2, 1, logSheet.getLastRow() - 1, 4).getDisplayValues().forEach(row => {
+      if (row[3] === INV_RESULT_SENT) logged.add(row[0]);
+    });
+  }
+
+  const rows = [];
+  const errors = [];
+  forms.filter(form => !logged.has(form.formId)).forEach(form => {
+    const storeNames = form.stores.join("・");
+    if (!/^[^@\s,]+@[^@\s,]+\.[^@\s,]+$/.test(form.email)) {
+      errors.push([form.formId, form.email, storeNames, "宛先の形式が正しくありません"]);
+      return;
+    }
+    const message = invBuildMail(form);
+    rows.push([rows.length + 1, form.email, message.subject, message.body, form.formId, storeNames,
+      `${Math.floor(rows.length / INV_PA_PER_DAY) + 1}日目`, ""]);
+  });
+
+  const write = (name, header, data) => {
+    let sheet = ss.getSheetByName(name);
+    if (!sheet) sheet = ss.insertSheet(name);
+    sheet.clear();
+    sheet.getRange(1, 1, 1, header.length).setValues([header]);
+    if (data.length > 0) sheet.getRange(2, 1, data.length, header.length).setValues(data);
+  };
+  write(INV_PA_SHEET_NAME, INV_PA_HEADER, rows);
+  write(INV_PA_ERROR_SHEET_NAME, ["フォームID", "宛先", "対象店舗", "理由"], errors);
+  console.log(`「${INV_PA_SHEET_NAME}」に ${rows.length} 件（${Math.ceil(rows.length / INV_PA_PER_DAY)} 日分）を書き出しました。` +
+    `宛先エラー ${errors.length} 件は「${INV_PA_ERROR_SHEET_NAME}」にあります。お客様には何も送っていません。`);
+}
+
 function startInvitations() {
   deleteInvitationTriggers();
   runInvitationBatch();
