@@ -597,14 +597,15 @@ function respBuildReceiptMail(rows, dateHeaders, formUrl, addresses) {
 
   const notice = "※収集業者の都合などにより、回収日や料金を変更せざるを得ない場合は、改めてご連絡いたします。";
   const esc = text => String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-  const mark = cell => (cell === "○" ? "○（希望する）" : "×（希望しない）");
+  const NO_COLLECTION = "回収がありません";
+  const mark = cell => (cell === "○" || cell === "×" ? cell : NO_COLLECTION);
 
-  // 店舗ごとの「聞かれた日」だけを取り出す（回収日でない日は載せない）
+  // 店舗ごとに、特別回収期間のすべての日を載せる（回収日でない日は「回収がありません」）
   const stores = rows.map(row => ({
     name: row[0],
     address: (addresses || {})[row[0]] || "",
     want: row[2],
-    days: dateHeaders.map((header, i) => ({ header: header, cell: row[3 + i] })).filter(d => d.cell === "○" || d.cell === "×")
+    days: dateHeaders.map((header, i) => ({ header: header, cell: row[3 + i] }))
   }));
 
   const lines = [];
@@ -619,7 +620,6 @@ function respBuildReceiptMail(rows, dateHeaders, formUrl, addresses) {
   stores.forEach(store => {
     lines.push("", `▼${store.name}`);
     if (store.address) lines.push(`  ご住所：${store.address}`);
-    if (store.days.length === 0) lines.push(`  特別回収：${store.want}`);
     store.days.forEach(d => lines.push(`  ${d.header}　${mark(d.cell)}`));
   });
   if (comment) lines.push("", `■ご不明点・ご要望：${comment}`);
@@ -639,16 +639,12 @@ function respBuildReceiptMail(rows, dateHeaders, formUrl, addresses) {
   h.push(`<p>${esc(contactName || "ご担当者")} 様</p>`);
   h.push("<p>このたびは「年末年始廃棄物回収に関するアンケート」にご回答いただき、ありがとうございました。<br>下記の内容で承りました。ご確認ください。</p>");
   h.push(`<p>■回答日時：${esc(answeredAt)}<br>■特別回収期間：${esc(RESP_MAIL_PERIOD_TEXT)}<br>■ご担当者様：${esc(contactName)}<br>■お電話番号：${esc(phone)}</p>`);
-  h.push("<p><b>【店舗ごとの回収のご希望】</b><br>○＝回収を希望する　／　×＝回収を希望しない</p>");
+  h.push("<p><b>【店舗ごとの回収のご希望】</b><br>○＝回収を希望した　／　×＝回収を希望しない　／　回収がありません＝回収日ではない日</p>");
   stores.forEach(store => {
     h.push(`<p style="margin:16px 0 4px;"><b>▼${esc(store.name)}</b>${store.address ? `<br><span style="font-size:13px;">ご住所：${esc(store.address)}</span>` : ""}</p>`);
-    if (store.days.length === 0) {
-      h.push(`<p>特別回収：${esc(store.want)}</p>`);
-      return;
-    }
     h.push('<table style="border-collapse:collapse;">');
     h.push("<tr>" + store.days.map(d => `<th style="${cellStyle}background:#eee;">${esc(d.header)}</th>`).join("") + "</tr>");
-    h.push("<tr>" + store.days.map(d => `<td style="${cellStyle}font-size:18px;${d.cell === "○" ? "font-weight:bold;color:#1a7f37;" : "color:#666;"}">${d.cell}</td>`).join("") + "</tr>");
+    h.push("<tr>" + store.days.map(d => `<td style="${cellStyle}${d.cell === "○" ? "font-size:18px;font-weight:bold;color:#1a7f37;" : d.cell === "×" ? "font-size:18px;color:#666;" : "font-size:12px;color:#999;"}">${esc(mark(d.cell))}</td>`).join("") + "</tr>");
     h.push("</table>");
   });
   if (comment) h.push(`<p>■ご不明点・ご要望：${esc(comment)}</p>`);
@@ -668,10 +664,10 @@ function sendSampleReceiptMail() {
   if (!testTo) {
     throw new Error(`スクリプトプロパティ ${RESP_MAIL_TEST_TO_PROPERTY} にテスト用のメールアドレスを設定してください。`);
   }
-  const dateHeaders = ["12月30日(水)", "12月31日(木)", "1月2日(土)", "1月3日(日)"];
+  const dateHeaders = ["12月30日(水)", "12月31日(木)", "1月1日(金)", "1月2日(土)", "1月3日(日)"];
   const rows = [
-    ["サンプル店A", "2026/11/01 10:00:00", RESP_ANSWER_YES, "○", "×", "", "○", "山田 太郎", "03-0000-0000", "朝に来ますか？", "sample@example.com", "FORMID", 1, ""],
-    ["サンプル店B", "2026/11/01 10:00:00", RESP_ANSWER_NO, "×", "×", "", "", "山田 太郎", "03-0000-0000", "朝に来ますか？", "sample@example.com", "FORMID", 1, ""]
+    ["サンプル店A", "2026/11/01 10:00:00", RESP_ANSWER_YES, "○", "×", "", "○", "", "山田 太郎", "03-0000-0000", "朝に来ますか？", "sample@example.com", "FORMID", 1, ""],
+    ["サンプル店B", "2026/11/01 10:00:00", RESP_ANSWER_NO, "×", "×", "", "", "", "山田 太郎", "03-0000-0000", "朝に来ますか？", "sample@example.com", "FORMID", 1, ""]
   ];
   const message = respBuildReceiptMail(rows, dateHeaders, "https://docs.google.com/forms/d/e/（サンプル）/viewform",
     { "サンプル店A": "〒130-0013 東京都墨田区錦糸1-2-3 サンプルビル1F", "サンプル店B": "〒130-0022 東京都墨田区江東橋4-5-6" });
