@@ -41,6 +41,7 @@ const INV_FROM_PROPERTY = "MAIL_FROM";
 const INV_PROVIDER_PROPERTY = "MAIL_PROVIDER";   // graph のときだけ、Microsoft Graph から送る
 const INV_DAILY_LIMIT_PROPERTY = "INV_DAILY_LIMIT";
 const INV_GRAPH_INTERVAL_MS = 3000;              // Graphで送るときの、1通ごとの間隔（1分あたり約20通。上限は30通）
+const INV_GMAIL_INTERVAL_MS = 1000;              // Gmailで送るときの、1通ごとの間隔（一度に大量に送り出さないため）
 const INV_GRAPH_TOKEN_CACHE_KEY = "INV_MS_GRAPH_TOKEN";
 
 const INV_BATCH_HANDLER = "continueInvitations";
@@ -51,7 +52,7 @@ const INV_SAFETY_DELAY_MS = 7 * 60 * 1000;     // 実行が強制終了した場
 const INV_TEST_COUNT = 3;                      // テスト送信で送る件数
 
 // この日時より前は、本番送信しない（誤って早く送らないための安全装置）
-const INV_NOT_BEFORE = "2026/10/15 09:00";
+const INV_NOT_BEFORE = "2026/10/14 09:00";
 
 // 「リスト」シートの列（0始まり）
 const INV_COL_STORE = 0;     // A列: 店舗名
@@ -367,7 +368,7 @@ function runInvitationBatch() {
       SpreadsheetApp.flush();
       if (result === INV_RESULT_SENT) sentCount++;
       else failedCount++;
-      if (useGraph && result === INV_RESULT_SENT) Utilities.sleep(INV_GRAPH_INTERVAL_MS);   // 1分あたりの上限（30通）を超えないようにする
+      if (result === INV_RESULT_SENT) Utilities.sleep(useGraph ? INV_GRAPH_INTERVAL_MS : INV_GMAIL_INTERVAL_MS);   // 一度に大量に送り出さない（Graphは、1分あたりの上限30通を超えないようにする）
     }
 
     if (remaining > 0) {
