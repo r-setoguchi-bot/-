@@ -41,7 +41,7 @@ const INV_FROM_PROPERTY = "MAIL_FROM";
 const INV_PROVIDER_PROPERTY = "MAIL_PROVIDER";   // graph のときだけ、Microsoft Graph から送る
 const INV_DAILY_LIMIT_PROPERTY = "INV_DAILY_LIMIT";
 const INV_GRAPH_INTERVAL_MS = 3000;              // Graphで送るときの、1通ごとの間隔（1分あたり約20通。上限は30通）
-const INV_GMAIL_INTERVAL_MS = 1000;              // Gmailで送るときの、1通ごとの間隔（一度に大量に送り出さないため）
+const INV_GMAIL_INTERVAL_MS = 5000;              // Gmailで送るときの、1通ごとの間隔（1分あたり約12通。450通で約40分。一度に大量に送り出さないため）
 const INV_GRAPH_TOKEN_CACHE_KEY = "INV_MS_GRAPH_TOKEN";
 
 const INV_BATCH_HANDLER = "continueInvitations";
