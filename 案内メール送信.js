@@ -130,6 +130,7 @@ function invBuildMail(form) {
   lines.push(`■特別回収期間：${INV_PERIOD_TEXT}`);
   lines.push("　※1月1日は回収できません。");
   lines.push("■回収対象：可燃ごみのみ");
+  lines.push("■回収時間：各回収日の当日の早朝から午前中");
   lines.push("■特別回収料金：店舗ごとに異なります。アンケート内の各店舗の設問でご確認ください。", "");
   lines.push(`■ご回答期限：${INV_DEADLINE_TEXT}まで`, "");
   lines.push("下記のアンケートフォームから、ご回答をお願いいたします。");
