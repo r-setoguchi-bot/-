@@ -278,6 +278,7 @@ function createFormForStores(stores, headers, folder, customer) {
   const storeNamesText = stores.map(store => store.storeName).join('・');
 
   const form = FormApp.create(FORM_TITLE);
+  form.setTitle(FORM_TITLE);   // 作成時の名前とは別に、フォームの題名（回答者に見える見出し）も明示する
 
   try {
     if (folder) {
@@ -372,5 +373,103 @@ function deleteFormBatchTriggers() {
     if (trigger.getHandlerFunction() === FORM_BATCH_HANDLER) {
       ScriptApp.deleteTrigger(trigger);
     }
+  });
+}
+
+
+// ===== 作成済みフォームの題名を直す（フォームの題名が空になっていたときの修復） =====
+// 「リスト」の作成済みフォームのうち、題名が FORM_TITLE と違うものだけを直す。
+// 1回の実行は FORM_TIME_LIMIT_MS で打ち切り、残りは自動で続ける。何度実行しても安全（直っているフォームは触らない）。
+const FORM_FIX_HANDLER = "continueFixFormTitles";
+const FORM_FIX_CURSOR_PROPERTY = "FORM_FIX_TITLE_CURSOR";
+
+function startFixFormTitles() {
+  PropertiesService.getScriptProperties().deleteProperty(FORM_FIX_CURSOR_PROPERTY);
+  deleteFixTitleTriggers_();
+  continueFixFormTitles();
+}
+
+function continueFixFormTitles() {
+  const lock = LockService.getUserLock();
+  if (!lock.tryLock(10 * 1000)) {
+    console.log("別の処理が動いているためスキップしました。");
+    return;
+  }
+  const startTime = Date.now();
+  try {
+    deleteFixTitleTriggers_();
+    const safetyTrigger = scheduleFixTitleTrigger_(FORM_SAFETY_DELAY_MS);
+
+    const ss = getFormSpreadsheet();
+    const sheet = ss.getSheetByName(FORM_LIST_SHEET_NAME);
+    if (!sheet) throw new Error(`シート「${FORM_LIST_SHEET_NAME}」が見つかりません。`);
+    const data = sheet.getDataRange().getDisplayValues();
+    const ids = [];
+    const seen = {};
+    for (let i = 1; i < data.length; i++) {
+      const id = data[i][9];            // J列: フォームID
+      if (id && data[i][10] === "送信済" && !seen[id]) { seen[id] = true; ids.push(id); }   // K列: 作成状況
+    }
+
+    const props = PropertiesService.getScriptProperties();
+    let index = Number(props.getProperty(FORM_FIX_CURSOR_PROPERTY) || 0);
+    if (index > ids.length) index = 0;
+    let fixed = 0;
+    let errors = 0;
+    while (index < ids.length) {
+      if (Date.now() - startTime > FORM_TIME_LIMIT_MS) break;
+      try {
+        const form = FormApp.openById(ids[index]);
+        if (form.getTitle() !== FORM_TITLE) {
+          form.setTitle(FORM_TITLE);
+          fixed++;
+        }
+      } catch (e) {
+        console.error(`題名を直せませんでした: ${ids[index]} / ${e}`);
+        errors++;
+      }
+      index++;
+    }
+
+    if (index < ids.length) {
+      props.setProperty(FORM_FIX_CURSOR_PROPERTY, String(index));
+      scheduleFixTitleTrigger_(FORM_RETRY_DELAY_MS);
+      try {
+        ScriptApp.deleteTrigger(safetyTrigger);
+      } catch (e) {
+        console.warn(`保険の予約を消せませんでした（処理には影響しません）: ${e}`);
+      }
+      console.log(`${index} / ${ids.length} 件を確認しました（今回 ${fixed} 件を修正、エラー ${errors} 件）。残りは自動で続行します。`);
+    } else {
+      deleteFixTitleTriggers_();
+      props.deleteProperty(FORM_FIX_CURSOR_PROPERTY);
+      console.log(`全 ${ids.length} 件を確認しました（今回 ${fixed} 件を修正、エラー ${errors} 件）。すべて完了しました。`);
+    }
+  } finally {
+    try {
+      lock.releaseLock();
+    } catch (e) {
+      console.warn(`ロック解除に失敗しました（処理には影響しません）: ${e}`);
+    }
+  }
+}
+
+function scheduleFixTitleTrigger_(delayMs) {
+  let lastError;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      return ScriptApp.newTrigger(FORM_FIX_HANDLER).timeBased().after(delayMs).create();
+    } catch (e) {
+      lastError = e;
+      console.warn(`続きの予約に失敗しました（${attempt + 1}回目）: ${e}`);
+      Utilities.sleep(2000 * Math.pow(2, attempt));
+    }
+  }
+  throw lastError;
+}
+
+function deleteFixTitleTriggers_() {
+  ScriptApp.getProjectTriggers().forEach(trigger => {
+    if (trigger.getHandlerFunction() === FORM_FIX_HANDLER) ScriptApp.deleteTrigger(trigger);
   });
 }
