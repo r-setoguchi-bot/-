@@ -71,6 +71,7 @@ const RESP_MAIL_BCC_PROPERTY = "RESP_MAIL_BCC";             // on のときに�
 const RESP_MAIL_SENDER_NAME = "株式会社クリメン";
 const RESP_MAIL_SUBJECT = "【株式会社クリメン】年末年始廃棄物回収アンケート ご回答内容の控え";
 const RESP_MAIL_PERIOD_TEXT = "2026年12月30日(水)から2027年1月3日(日)";
+const RESP_MAIL_TIME_TEXT = "回収は、各回収日の当日の早朝から午前中に行います。";   // 回収の時間帯の案内（控えメールに書く）。空のままなら入れない
 const RESP_MAIL_CONTACT = "";                               // 内容の変更の連絡先（電話番号など）。空のままなら案内の文だけ入れる
 
 // フォーム作成.js の質問文・選択肢と同じ文言にしておくこと
@@ -617,6 +618,7 @@ function respBuildReceiptMail(rows, dateHeaders, formUrl, addresses) {
   lines.push(`■ご担当者様：${contactName}`);
   lines.push(`■お電話番号：${phone}`, "");
   lines.push("【店舗ごとの回収のご希望】");
+  if (RESP_MAIL_TIME_TEXT) lines.push(`※${RESP_MAIL_TIME_TEXT}`);
   stores.forEach(store => {
     lines.push("", `▼${store.name}`);
     if (store.address) lines.push(`  ご住所：${store.address}`);
@@ -639,7 +641,7 @@ function respBuildReceiptMail(rows, dateHeaders, formUrl, addresses) {
   h.push(`<p>${esc(contactName || "ご担当者")} 様</p>`);
   h.push("<p>このたびは「年末年始廃棄物回収に関するアンケート」にご回答いただき、ありがとうございました。<br>下記の内容で承りました。ご確認ください。</p>");
   h.push(`<p>■回答日時：${esc(answeredAt)}<br>■特別回収期間：${esc(RESP_MAIL_PERIOD_TEXT)}<br>■ご担当者様：${esc(contactName)}<br>■お電話番号：${esc(phone)}</p>`);
-  h.push("<p><b>【店舗ごとの回収のご希望】</b><br>○＝回収を希望した　／　×＝回収を希望しない　／　回収がありません＝回収日ではない日</p>");
+  h.push(`<p><b>【店舗ごとの回収のご希望】</b><br>○＝回収を希望した　／　×＝回収を希望しない　／　回収がありません＝回収日ではない日${RESP_MAIL_TIME_TEXT ? "<br>※" + esc(RESP_MAIL_TIME_TEXT) : ""}</p>`);
   stores.forEach(store => {
     h.push(`<p style="margin:16px 0 4px;"><b>▼${esc(store.name)}</b>${store.address ? `<br><span style="font-size:13px;">ご住所：${esc(store.address)}</span>` : ""}</p>`);
     h.push('<table style="border-collapse:collapse;">');
