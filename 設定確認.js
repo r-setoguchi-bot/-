@@ -66,7 +66,9 @@ function checkSettings() {
 
   // 送信元・テスト用アドレス
   const from = get("MAIL_FROM").trim();
-  if (!from) {
+  if (get("MAIL_PROVIDER").trim().toLowerCase() === "graph") {
+    log(true, "MAIL_FROM", "（MAIL_PROVIDER が graph のため、使いません）");
+  } else if (!from) {
     log(true, "MAIL_FROM", "未設定（実行アカウントのアドレスから送ります）");
   } else {
     const own = String(Session.getEffectiveUser().getEmail() || "").toLowerCase();
@@ -74,11 +76,39 @@ function checkSettings() {
     const ok = from.toLowerCase() === own || aliases.indexOf(from.toLowerCase()) !== -1;
     log(ok, "MAIL_FROM", ok ? `${from} から送信できます` : `${from} は、このアカウントから送信できるアドレスとして登録されていません`);
   }
+  // Outlook（Microsoft Graph）から送る場合の確認（MAIL_PROVIDER が graph のときだけ）
+  const provider = get("MAIL_PROVIDER").trim().toLowerCase();
+  if (provider !== "graph") {
+    log(true, "MAIL_PROVIDER", provider ? `${provider}（Gmailから送ります）` : "未設定（Gmailから送ります）");
+  } else {
+    const names = ["MS_TENANT_ID", "MS_CLIENT_ID", "MS_CLIENT_SECRET", "MS_MAIL_SENDER"];
+    let allSet = true;
+    names.forEach(name => {
+      const value = get(name);
+      const ok = !!value.trim() && value === value.trim();
+      if (!ok) allSet = false;
+      log(ok, name, !value ? "未設定" : name === "MS_MAIL_SENDER" ? `設定あり（${value.trim()}）${spaceNote(value)}` : `設定あり（${value.length}文字）${spaceNote(value)}`);
+    });
+    if (allSet) {
+      try {
+        const response = UrlFetchApp.fetch(`https://login.microsoftonline.com/${encodeURIComponent(get("MS_TENANT_ID"))}/oauth2/v2.0/token`, {
+          method: "post",
+          payload: { client_id: get("MS_CLIENT_ID"), client_secret: get("MS_CLIENT_SECRET"), scope: "https://graph.microsoft.com/.default", grant_type: "client_credentials" },
+          muteHttpExceptions: true
+        });
+        const json = JSON.parse(response.getContentText() || "{}");
+        log(response.getResponseCode() === 200 && !!json.access_token, "Microsoftへの接続（トークンの取得）",
+          response.getResponseCode() === 200 ? "成功" : `失敗（HTTP ${response.getResponseCode()}）: ${String(json.error_description || json.error || "").slice(0, 200)}`);
+      } catch (e) {
+        log(false, "Microsoftへの接続（トークンの取得）", `失敗: ${e}`);
+      }
+    }
+  }
   ["INVITE_TEST_TO", "RESP_MAIL_TEST_TO"].forEach(name => {
     const value = get(name).trim();
     log(!value || /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(value), name, !value ? "未設定" : `設定あり（${value}）`);
   });
-  console.log(`参考: FORM_TEST_LIMIT=${get("FORM_TEST_LIMIT") || "未設定"} / RESP_MAIL_MODE=${get("RESP_MAIL_MODE") || "未設定（off）"} / INVITE_MODE=${get("INVITE_MODE") || "未設定（送信しない）"}`);
+  console.log(`参考: FORM_TEST_LIMIT=${get("FORM_TEST_LIMIT") || "未設定"} / RESP_MAIL_MODE=${get("RESP_MAIL_MODE") || "未設定（off）"} / INVITE_MODE=${get("INVITE_MODE") || "未設定（送信しない）"} / INV_DAILY_LIMIT=${get("INV_DAILY_LIMIT") || "未設定（制限なし）"}`);
 }
 
 // アドレスに関係しそうな項目（名前に「メール」「mail」「アドレス」「送付」を含むもの）を、テーブルの中の項目も含めて一覧にする。
