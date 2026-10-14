@@ -208,3 +208,24 @@ function graphTestSendMail_(from, to) {
   if (code !== 202) console.log(`応答: ${response.getContentText().slice(0, 300)}`);
   return code;
 }
+
+// ===== リスト検証のエラー行を調べる（見るだけ。何も書き換えない。確認が済んだら削除してよい） =====
+// 検証結果の「参考」に出た行番号（リストシートの行）について、同じフォームに何店舗あるか、送信の状況などを出す。
+// 宛先のアドレスは、一部を伏せて表示する。
+function inspectErrorRows() {
+  const rowNumbers = [43, 416, 634, 682, 870, 1129];   // 検証結果の「参考」の行
+  const props = PropertiesService.getScriptProperties();
+  const url = String(props.getProperty("FORM_SPREADSHEET_URL") || "").trim();
+  const ss = url ? SpreadsheetApp.openByUrl(url) : SpreadsheetApp.getActiveSpreadsheet();
+  const data = ss.getSheetByName("リスト").getDataRange().getDisplayValues();
+  const mask = email => String(email).replace(/^(.{2})[^@]*@/, "$1***@");
+
+  rowNumbers.forEach(r => {
+    const row = data[r - 1];
+    if (!row) { console.log(`${r}行目: 見つかりません`); return; }
+    const formId = row[9];
+    const sameForm = data.map((d, i) => ({ d: d, line: i + 1 })).filter(x => x.line > 1 && x.d[9] === formId && formId);
+    console.log(`${r}行目 「${row[0]}」 状況=${row[10] || "（空）"} 宛先=${mask(row[1])} フォームID末尾=${String(formId).slice(-6) || "（なし）"} ` +
+      `同じフォームの店舗数=${sameForm.length}（${sameForm.map(x => x.line + "行目:" + x.d[0]).join(" / ")}）`);
+  });
+}
