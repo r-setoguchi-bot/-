@@ -241,7 +241,7 @@ function groupUnsentRowsByForm(data) {
     const row = data[i];
     const email = row[1].trim();               // B列
     const status = row[FORM_COL_STATUS - 1];   // K列
-    if (status === FORM_STATUS_SENT || status === FORM_STATUS_ERROR || !email) continue;
+    if (status === FORM_STATUS_SENT || status === FORM_STATUS_ERROR || status === "除外" || !email) continue;   // 「除外」は、案内の対象から外した行。フォームも作らない
 
     const customer = String(row[FORM_COL_CUSTOMER] || "").trim();
     const key = email + "\u0001" + customer;
