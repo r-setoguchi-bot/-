@@ -72,7 +72,7 @@ const RESP_MAIL_SENDER_NAME = "株式会社クリメン";
 const RESP_MAIL_SUBJECT = "【株式会社クリメン】年末年始廃棄物回収アンケート ご回答内容の控え";
 const RESP_MAIL_PERIOD_TEXT = "2026年12月30日(水)から2027年1月3日(日)";
 const RESP_MAIL_TIME_TEXT = "回収は、各回収日の当日の早朝から午前中に行います。";   // 回収の時間帯の案内（控えメールに書く）。空のままなら入れない
-const RESP_MAIL_NOREPLY_TEXT = "※このメールは送信専用のアドレスから送っています。返信いただいても、お答えできません。";   // 空のままなら入れない
+const RESP_MAIL_NOREPLY_TEXT = "";   // 返信を受け付ける方針のため空（入れる場合は文を書く）
 const RESP_MAIL_CONTACT = "";                               // 内容の変更の連絡先（電話番号など）。空のままなら案内の文だけ入れる
 
 // フォーム作成.js の質問文・選択肢と同じ文言にしておくこと

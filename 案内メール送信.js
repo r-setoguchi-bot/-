@@ -62,7 +62,7 @@ const INV_SUBJECT = "【株式会社クリメン】年末年始（12/30〜1/3）
 const INV_PERIOD_TEXT = "2026年12月30日(水)から2027年1月3日(日)";
 const INV_DEADLINE_TEXT = "2026年11月15日(日)";   // フォーム作成.js の FORM_DEADLINE_TEXT と同じにしておく
 const INV_CONTACT = "";                           // 問い合わせ先（電話番号・メールなど）。空のままなら案内の行を入れない
-const INV_NOREPLY_TEXT = "※このメールは送信専用のアドレスから送っています。返信いただいても、お答えできません。";   // 空のままなら入れない
+const INV_NOREPLY_TEXT = "";   // 返信を受け付ける方針のため空（入れる場合は文を書く）
 const INV_REPLY_TO = "";                          // 返信先のアドレス。空のままなら、送信元に返信される
 
 const INV_LOG_HEADER = ["フォームID", "送信先", "対象店舗", "結果", "日時"];
