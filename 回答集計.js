@@ -20,6 +20,8 @@
 //   メールには、変更するためのフォームのURLと、お客様に案内する変更の期限（RESP_CUSTOMER_DEADLINE_TEXT）を書く。
 //   社内の控え（RESP_MAIL_BCC）は、必要なときだけ設定する。回答はフォームの中に日時つきで全件残る。
 //   メールはスクリプトを実行しているアカウントから送られ、送信できる数には1日の上限がある。
+//   スクリプトプロパティ MAIL_PROVIDER が graph のときは、Microsoft Graph（Exchange Online）から送る。
+//   （必要なスクリプトプロパティ: MS_TENANT_ID / MS_CLIENT_ID / MS_CLIENT_SECRET / MS_MAIL_SENDER。案内メール送信.js と共通）
 //
 // 使い方:
 //   1. setupResponseCollectionTrigger を1回だけ実行 → RESP_INTERVAL_HOURS 時間ごとに自動で集計され、
@@ -67,6 +69,9 @@ const RESP_CLOSED_CONTACT = "";               // 連絡先（電話番号など�
 const RESP_MAIL_MODE_PROPERTY = "RESP_MAIL_MODE";           // off / test / on
 const RESP_MAIL_TEST_TO_PROPERTY = "RESP_MAIL_TEST_TO";     // test のときの宛先
 const RESP_MAIL_FROM_PROPERTY = "MAIL_FROM";                // 送信元アドレス（会社のアドレス。案内メールと共通）。未設定なら実行アカウントのアドレス
+const RESP_PROVIDER_PROPERTY = "MAIL_PROVIDER";             // graph のときだけ、Microsoft Graph から送る（案内メール送信.js と共通）
+const RESP_GRAPH_INTERVAL_MS = 2000;                        // Graphで送るときの、1通ごとの間隔
+const RESP_GRAPH_TOKEN_CACHE_KEY = "RESP_MS_GRAPH_TOKEN";
 const RESP_MAIL_BCC_PROPERTY = "RESP_MAIL_BCC";             // on のときに、社内の控えとして同じメールを送るアドレス（任意）
 const RESP_MAIL_SENDER_NAME = "株式会社クリメン";
 const RESP_MAIL_SUBJECT = "【株式会社クリメン】年末年始廃棄物回収アンケート ご回答内容の控え";
@@ -511,10 +516,19 @@ function respGetMailSettings() {
   const testTo = String(props.getProperty(RESP_MAIL_TEST_TO_PROPERTY) || "").trim();
   const bcc = String(props.getProperty(RESP_MAIL_BCC_PROPERTY) || "").trim();
 
-  const from = String(props.getProperty(RESP_MAIL_FROM_PROPERTY) || "").trim();
+  const graph = respIsGraph();
+  const from = graph ? String(props.getProperty("MS_MAIL_SENDER") || "").trim() : String(props.getProperty(RESP_MAIL_FROM_PROPERTY) || "").trim();
 
   let mode = rawMode === "on" || rawMode === "test" ? rawMode : "off";
-  if (mode !== "off" && from) {
+  if (mode !== "off" && graph) {
+    try {
+      respGraphToken_();
+      if (!from) throw new Error("MS_MAIL_SENDER が未設定です");
+    } catch (e) {
+      console.warn(`Microsoft Graph に接続できないため、控えメールは送りません: ${e}`);
+      mode = "off";
+    }
+  } else if (mode !== "off" && from) {
     const own = String(Session.getEffectiveUser().getEmail() || "").toLowerCase();
     const aliases = GmailApp.getAliases().map(alias => String(alias).toLowerCase());
     if (from.toLowerCase() !== own && aliases.indexOf(from.toLowerCase()) === -1) {
@@ -550,7 +564,7 @@ function respSendReceiptIfNeeded(form, rows, dateHeaders, previousMailed, mail) 
   }
 
   const recipientCount = 1 + (mail.mode === "on" && mail.bcc ? 1 : 0);
-  if (MailApp.getRemainingDailyQuota() < recipientCount) {
+  if (!respIsGraph() && MailApp.getRemainingDailyQuota() < recipientCount) {
     console.warn("メールの1日の送信上限に達したため、控えメールの送信を見送りました。次の集計で送ります。");
     return "";
   }
@@ -577,6 +591,11 @@ function respSendReceiptIfNeeded(form, rows, dateHeaders, previousMailed, mail) 
 
 // メールを送る。送信元アドレスがあれば Gmail から（別のアドレスとして登録済みのもの）、無ければ実行アカウントから送る
 function respSendMail(options, from) {
+  if (respIsGraph()) {
+    respGraphSend_(options);
+    Utilities.sleep(RESP_GRAPH_INTERVAL_MS);   // 1分あたりの上限を超えないようにする
+    return;
+  }
   if (!from) {
     MailApp.sendEmail(options);
     return;
@@ -585,6 +604,75 @@ function respSendMail(options, from) {
   if (options.bcc) gmailOptions.bcc = options.bcc;
   if (options.htmlBody) gmailOptions.htmlBody = options.htmlBody;
   GmailApp.sendEmail(options.to, options.subject, options.body, gmailOptions);
+}
+
+function respIsGraph() {
+  return String(PropertiesService.getScriptProperties().getProperty(RESP_PROVIDER_PROPERTY) || "").trim().toLowerCase() === "graph";
+}
+
+function respGraphSetting_(name) {
+  const value = String(PropertiesService.getScriptProperties().getProperty(name) || "").trim();
+  if (!value) throw new Error(`スクリプトプロパティ ${name} を設定してください（MAIL_PROVIDER が graph のときに必要です）。`);
+  return value;
+}
+
+// Microsoft Graph のアクセストークンを取る（約1時間有効。キャッシュして使い回す）
+function respGraphToken_() {
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get(RESP_GRAPH_TOKEN_CACHE_KEY);
+  if (cached) return cached;
+  const tenant = respGraphSetting_("MS_TENANT_ID");
+  const response = UrlFetchApp.fetch(`https://login.microsoftonline.com/${encodeURIComponent(tenant)}/oauth2/v2.0/token`, {
+    method: "post",
+    payload: {
+      client_id: respGraphSetting_("MS_CLIENT_ID"),
+      client_secret: respGraphSetting_("MS_CLIENT_SECRET"),
+      scope: "https://graph.microsoft.com/.default",
+      grant_type: "client_credentials"
+    },
+    muteHttpExceptions: true
+  });
+  const json = JSON.parse(response.getContentText() || "{}");
+  if (response.getResponseCode() !== 200 || !json.access_token) {
+    throw new Error(`Microsoftのアクセストークンを取れませんでした（HTTP ${response.getResponseCode()}）: ${String(json.error_description || json.error || "").slice(0, 300)}`);
+  }
+  cache.put(RESP_GRAPH_TOKEN_CACHE_KEY, json.access_token, Math.max(60, Math.min(Number(json.expires_in || 3600) - 300, 21600)));
+  return json.access_token;
+}
+
+// Microsoft Graph でメールを1通送る（HTML があればHTML、無ければテキスト）。混み合っているとき（429など）は、少し待ってやり直す
+function respGraphSend_(options) {
+  const message = {
+    subject: options.subject,
+    body: options.htmlBody ? { contentType: "HTML", content: options.htmlBody } : { contentType: "Text", content: options.body },
+    toRecipients: [{ emailAddress: { address: options.to } }]
+  };
+  if (options.bcc) message.bccRecipients = [{ emailAddress: { address: options.bcc } }];
+  const payload = JSON.stringify({ message: message, saveToSentItems: true });
+  const url = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(respGraphSetting_("MS_MAIL_SENDER"))}/sendMail`;
+
+  let lastText = "";
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const response = UrlFetchApp.fetch(url, {
+      method: "post",
+      contentType: "application/json",
+      headers: { Authorization: "Bearer " + respGraphToken_() },
+      payload: payload,
+      muteHttpExceptions: true
+    });
+    const code = response.getResponseCode();
+    if (code === 202) return;
+    lastText = `HTTP ${code}: ${response.getContentText().slice(0, 300)}`;
+    if (code === 401) {
+      CacheService.getScriptCache().remove(RESP_GRAPH_TOKEN_CACHE_KEY);
+    } else if (code === 429 || code === 503 || code === 504) {
+      const retryAfter = Number((response.getHeaders() || {})["Retry-After"] || 0);
+      Utilities.sleep(Math.min(Math.max(retryAfter, 5), 60) * 1000);
+    } else {
+      break;
+    }
+  }
+  throw new Error(`Microsoft Graph で送れませんでした（${lastText}）`);
 }
 
 // 1つのフォームの回答（店舗ごとの行）から、控えメールの件名と本文を作る
