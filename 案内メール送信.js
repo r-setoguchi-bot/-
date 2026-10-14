@@ -10,9 +10,12 @@
 //   そのアドレスが、実行するアカウントのGmailの「別のアドレスから送信」に登録されていること（回答の控えメールも同じアドレスから送る）。
 //   未設定なら、スクリプトを実行しているアカウントのアドレスから送る。
 //
-// 1日に送る通数の制限:
-//   スクリプトプロパティ INV_DAILY_LIMIT（例: 450）で、1日に送る通数を制限できる。未設定なら制限しない。
-//   上限に達したら、翌日の9時に自動で続きを送る。1通ごとに INV_SEND_INTERVAL_MS だけ間隔をあけて送る。
+// Outlook（Microsoft Graph）から送る場合:
+//   スクリプトプロパティ MAIL_PROVIDER に graph を入れると、Gmail ではなく、Microsoft Graph（Exchange Online）から送る。
+//   必要なスクリプトプロパティ: MS_TENANT_ID / MS_CLIENT_ID / MS_CLIENT_SECRET / MS_MAIL_SENDER（送信元のメールボックス）
+//   MAIL_PROVIDER が未設定、または graph 以外なら、これまでどおり Gmail から送る。
+//   1日に送る通数は、スクリプトプロパティ INV_DAILY_LIMIT（例: 200）で制限できる。未設定なら制限しない。
+//   上限に達したら、翌日の9時に自動で続きを送る。
 //
 // 安全のしくみ（お客様に誤って送らないため）:
 //   ・スクリプトプロパティ INVITE_MODE が on のときだけ本番送信する（未設定は送らない）。
@@ -35,8 +38,11 @@ const INV_STATUS_SENT = "送信済";           // 「リスト」のフォーム
 const INV_MODE_PROPERTY = "INVITE_MODE";     // on のときだけ本番送信
 const INV_TEST_TO_PROPERTY = "INVITE_TEST_TO";
 const INV_FROM_PROPERTY = "MAIL_FROM";
+const INV_PROVIDER_PROPERTY = "MAIL_PROVIDER";   // graph のときだけ、Microsoft Graph から送る
 const INV_DAILY_LIMIT_PROPERTY = "INV_DAILY_LIMIT";
-const INV_SEND_INTERVAL_MS = 5000;               // 1通ごとの間隔（1分あたり約12通。450通で約40分。一度に大量に送り出さないため）
+const INV_GRAPH_INTERVAL_MS = 3000;              // Graphで送るときの、1通ごとの間隔（1分あたり約20通。上限は30通）
+const INV_GMAIL_INTERVAL_MS = 5000;              // Gmailで送るときの、1通ごとの間隔（1分あたり約12通。450通で約40分。一度に大量に送り出さないため）
+const INV_GRAPH_TOKEN_CACHE_KEY = "INV_MS_GRAPH_TOKEN";
 
 const INV_BATCH_HANDLER = "continueInvitations";
 const INV_TIME_LIMIT_MS = 4.5 * 60 * 1000;
@@ -85,8 +91,18 @@ function invFormatNow() {
   return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy/MM/dd HH:mm:ss");
 }
 
+function invIsGraph() {
+  return String(PropertiesService.getScriptProperties().getProperty(INV_PROVIDER_PROPERTY) || "").trim().toLowerCase() === "graph";
+}
+
 // 送信元アドレスを確認する。未設定なら空文字（実行アカウントのアドレスから送る）。使えないアドレスなら、送る前にエラーで止める
+// Graphで送る場合は、MS_MAIL_SENDER を返す（接続に必要な設定とトークンも、ここで確認する）
 function invGetFrom() {
+  if (invIsGraph()) {
+    const sender = invGraphSetting_("MS_MAIL_SENDER");
+    invGraphToken_();
+    return sender;
+  }
   const from = String(PropertiesService.getScriptProperties().getProperty(INV_FROM_PROPERTY) || "").trim();
   if (!from) return "";
   const own = String(Session.getEffectiveUser().getEmail() || "").toLowerCase();
@@ -99,10 +115,79 @@ function invGetFrom() {
 }
 
 function invSend(to, subject, body, from) {
+  if (invIsGraph()) {
+    invGraphSend_(from, to, subject, body);
+    return;
+  }
   const options = { name: INV_SENDER_NAME };
   if (from) options.from = from;
   if (INV_REPLY_TO) options.replyTo = INV_REPLY_TO;
   GmailApp.sendEmail(to, subject, body, options);
+}
+
+function invGraphSetting_(name) {
+  const value = String(PropertiesService.getScriptProperties().getProperty(name) || "").trim();
+  if (!value) throw new Error(`スクリプトプロパティ ${name} を設定してください（MAIL_PROVIDER が graph のときに必要です）。`);
+  return value;
+}
+
+// Microsoft Graph のアクセストークンを取る（約1時間有効。キャッシュして使い回す）
+function invGraphToken_() {
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get(INV_GRAPH_TOKEN_CACHE_KEY);
+  if (cached) return cached;
+  const tenant = invGraphSetting_("MS_TENANT_ID");
+  const response = UrlFetchApp.fetch(`https://login.microsoftonline.com/${encodeURIComponent(tenant)}/oauth2/v2.0/token`, {
+    method: "post",
+    payload: {
+      client_id: invGraphSetting_("MS_CLIENT_ID"),
+      client_secret: invGraphSetting_("MS_CLIENT_SECRET"),
+      scope: "https://graph.microsoft.com/.default",
+      grant_type: "client_credentials"
+    },
+    muteHttpExceptions: true
+  });
+  const json = JSON.parse(response.getContentText() || "{}");
+  if (response.getResponseCode() !== 200 || !json.access_token) {
+    throw new Error(`Microsoftのアクセストークンを取れませんでした（HTTP ${response.getResponseCode()}）: ${String(json.error_description || json.error || "").slice(0, 300)}`);
+  }
+  cache.put(INV_GRAPH_TOKEN_CACHE_KEY, json.access_token, Math.max(60, Math.min(Number(json.expires_in || 3600) - 300, 21600)));
+  return json.access_token;
+}
+
+// Microsoft Graph でメールを1通送る（テキスト）。混み合っているとき（429など）は、少し待ってやり直す
+function invGraphSend_(sender, to, subject, body) {
+  const message = {
+    subject: subject,
+    body: { contentType: "Text", content: body },
+    toRecipients: [{ emailAddress: { address: to } }]
+  };
+  if (INV_REPLY_TO) message.replyTo = [{ emailAddress: { address: INV_REPLY_TO } }];
+  const payload = JSON.stringify({ message: message, saveToSentItems: true });
+  const url = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(sender)}/sendMail`;
+
+  let lastText = "";
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const response = UrlFetchApp.fetch(url, {
+      method: "post",
+      contentType: "application/json",
+      headers: { Authorization: "Bearer " + invGraphToken_() },
+      payload: payload,
+      muteHttpExceptions: true
+    });
+    const code = response.getResponseCode();
+    if (code === 202) return;
+    lastText = `HTTP ${code}: ${response.getContentText().slice(0, 300)}`;
+    if (code === 401) {
+      CacheService.getScriptCache().remove(INV_GRAPH_TOKEN_CACHE_KEY);
+    } else if (code === 429 || code === 503 || code === 504) {
+      const retryAfter = Number((response.getHeaders() || {})["Retry-After"] || 0);
+      Utilities.sleep(Math.min(Math.max(retryAfter, 5), 60) * 1000);
+    } else {
+      break;
+    }
+  }
+  throw new Error(`Microsoft Graph で送れませんでした（${lastText}）`);
 }
 
 // 「リスト」から、作成済みフォームごとの宛先と店舗を取り出す
@@ -293,6 +378,7 @@ function runInvitationBatch() {
       });
     }
     const dailyLimit = Number(props.getProperty(INV_DAILY_LIMIT_PROPERTY) || 0);   // 0なら制限しない
+    const useGraph = invIsGraph();
 
     const targets = forms.filter(form => !logged.has(form.formId));
 
@@ -306,7 +392,7 @@ function runInvitationBatch() {
         remaining = targets.length - n;
         break;
       }
-      if (MailApp.getRemainingDailyQuota() < 1) {
+      if (!useGraph && MailApp.getRemainingDailyQuota() < 1) {
         stoppedByQuota = true;
         remaining = targets.length - n;
         break;
@@ -332,7 +418,7 @@ function runInvitationBatch() {
       SpreadsheetApp.flush();
       if (result === INV_RESULT_SENT) sentCount++;
       else failedCount++;
-      if (result === INV_RESULT_SENT) Utilities.sleep(INV_SEND_INTERVAL_MS);   // 一度に大量に送り出さない
+      if (result === INV_RESULT_SENT) Utilities.sleep(useGraph ? INV_GRAPH_INTERVAL_MS : INV_GMAIL_INTERVAL_MS);   // 一度に大量に送り出さない（Graphは、1分あたりの上限30通を超えないようにする）
     }
 
     if (remaining > 0) {
