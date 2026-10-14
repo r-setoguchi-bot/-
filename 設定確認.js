@@ -147,3 +147,66 @@ function findAddressFields() {
   });
   console.log(`該当した項目: ${found.length} 件`);
 }
+
+// ===== Microsoft Graph の動作確認（km-customer からだけ送れることの確認） =====
+// 使う前に、スクリプトプロパティに次を入れる: MS_TENANT_ID / MS_CLIENT_ID / MS_CLIENT_SECRET / MS_MAIL_SENDER（km-customer@kurimen.co.jp） / RESP_MAIL_TEST_TO（自分のアドレス）
+// 管理者の設定が反映されるまで（30分〜2時間）は 403 になる。202 が出れば反映済み。
+//   手順2: testGraphSend()         … km-customer から、RESP_MAIL_TEST_TO 宛てに1通送る。202 なら反映済み
+//   手順3: testGraphRestriction()  … r-setoguchi から送ろうとする。403 になれば、km-customer だけに制限できている証拠（手順2が 202 になってから実行する）
+// 顧客には送らない。シークレットやトークンの中身は、ログに出さない。
+
+function testGraphSend() {
+  const props = PropertiesService.getScriptProperties();
+  const sender = String(props.getProperty("MS_MAIL_SENDER") || "").trim();
+  const to = String(props.getProperty("RESP_MAIL_TEST_TO") || "").trim();
+  if (!sender || !to) throw new Error("MS_MAIL_SENDER と RESP_MAIL_TEST_TO を、スクリプトプロパティに設定してください");
+  const code = graphTestSendMail_(sender, to);
+  console.log(`km-customer（${sender}）から送信 → HTTP ${code}  ${code === 202 ? "○ 反映済みです。続けて testGraphRestriction を実行してください" : code === 403 ? "× まだ反映待ちです（15〜30分おいて、もう一度）" : "× 想定外の結果です。上のログを確認してください"}`);
+}
+
+function testGraphRestriction() {
+  const props = PropertiesService.getScriptProperties();
+  const to = String(props.getProperty("RESP_MAIL_TEST_TO") || "").trim();
+  if (!to) throw new Error("RESP_MAIL_TEST_TO を、スクリプトプロパティに設定してください");
+  const other = "r-setoguchi@kurimen.co.jp";
+  const code = graphTestSendMail_(other, to);
+  console.log(`${other} から送信 → HTTP ${code}  ${code === 403 ? "○ 送れません。km-customer だけに制限できています" : code === 202 ? "× 送れてしまいました。制限が効いていません。管理者に連絡してください（Entra で同意して回避しないでください）" : "× 想定外の結果です。上のログを確認してください"}`);
+}
+
+// Graph で、from のメールボックスから to 宛てに、テストメールを1通送る。HTTP ステータスを返す
+function graphTestSendMail_(from, to) {
+  const props = PropertiesService.getScriptProperties();
+  const need = name => {
+    const value = String(props.getProperty(name) || "").trim();
+    if (!value) throw new Error(`スクリプトプロパティ ${name} を設定してください`);
+    return value;
+  };
+  const tokenResponse = UrlFetchApp.fetch(`https://login.microsoftonline.com/${encodeURIComponent(need("MS_TENANT_ID"))}/oauth2/v2.0/token`, {
+    method: "post",
+    payload: { grant_type: "client_credentials", client_id: need("MS_CLIENT_ID"), client_secret: need("MS_CLIENT_SECRET"), scope: "https://graph.microsoft.com/.default" },
+    muteHttpExceptions: true
+  });
+  const tokenJson = JSON.parse(tokenResponse.getContentText() || "{}");
+  if (tokenResponse.getResponseCode() !== 200 || !tokenJson.access_token) {
+    console.error(`トークンを取れませんでした: HTTP ${tokenResponse.getResponseCode()} ${tokenJson.error || ""} ${String(tokenJson.error_description || "").slice(0, 200)}`);
+    throw new Error("トークンを取れませんでした（テナントID・クライアントID・シークレットの値と、シークレットの有効期限を確認）");
+  }
+  console.log("トークンの取得: 成功");
+  const response = UrlFetchApp.fetch(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(from)}/sendMail`, {
+    method: "post",
+    contentType: "application/json",
+    headers: { Authorization: "Bearer " + tokenJson.access_token },
+    payload: JSON.stringify({
+      message: {
+        subject: "【テスト】Graph の動作確認（顧客には送っていません）",
+        body: { contentType: "Text", content: `Graph の動作確認です。送信元: ${from}\n送信時刻: ${new Date()}` },
+        toRecipients: [{ emailAddress: { address: to } }]
+      },
+      saveToSentItems: true
+    }),
+    muteHttpExceptions: true
+  });
+  const code = response.getResponseCode();
+  if (code !== 202) console.log(`応答: ${response.getContentText().slice(0, 300)}`);
+  return code;
+}
