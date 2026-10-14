@@ -42,7 +42,7 @@ const INV_SAFETY_DELAY_MS = 7 * 60 * 1000;     // 実行が強制終了した場
 const INV_TEST_COUNT = 3;                      // テスト送信で送る件数
 
 // この日時より前は、本番送信しない（誤って早く送らないための安全装置）
-const INV_NOT_BEFORE = "2026/10/14 09:00";
+const INV_NOT_BEFORE = "2026/10/15 09:00";
 
 // 「リスト」シートの列（0始まり）
 const INV_COL_STORE = 0;     // A列: 店舗名
