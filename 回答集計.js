@@ -19,8 +19,7 @@
 //   同じ回答には1回だけ送る。再回答があれば、その回答の分をもう一度送る。送信の結果は「控えメール」の列に残る。
 //   メールには、変更するためのフォームのURLと、お客様に案内する変更の期限（RESP_CUSTOMER_DEADLINE_TEXT）を書く。
 //   社内の控え（RESP_MAIL_BCC）は、必要なときだけ設定する。回答はフォームの中に日時つきで全件残る。
-//   メールはスクリプトを実行しているアカウントから送られ、送信できる数には1日の上限がある。
-//   スクリプトプロパティ MAIL_PROVIDER が graph のときは、Microsoft Graph（Exchange Online）から送る。
+//   メールは Microsoft Graph（Exchange Online）から、共有メールボックス km-customer@kurimen.co.jp の名前で送る（Gmailからは送らない）。
 //   （必要なスクリプトプロパティ: MS_TENANT_ID / MS_CLIENT_ID / MS_CLIENT_SECRET / MS_MAIL_SENDER。案内メール送信.js と共通）
 //
 // 使い方:
@@ -68,9 +67,7 @@ const RESP_CLOSED_CONTACT = "";               // 連絡先（電話番号など�
 // 控えメール
 const RESP_MAIL_MODE_PROPERTY = "RESP_MAIL_MODE";           // off / test / on
 const RESP_MAIL_TEST_TO_PROPERTY = "RESP_MAIL_TEST_TO";     // test のときの宛先
-const RESP_MAIL_FROM_PROPERTY = "MAIL_FROM";                // 送信元アドレス（会社のアドレス。案内メールと共通）。未設定なら実行アカウントのアドレス
-const RESP_PROVIDER_PROPERTY = "MAIL_PROVIDER";             // graph のときだけ、Microsoft Graph から送る（案内メール送信.js と共通）
-const RESP_GRAPH_INTERVAL_MS = 2000;                        // Graphで送るときの、1通ごとの間隔
+const RESP_GRAPH_INTERVAL_MS = 3000;                        // 1通ごとの間隔（1分あたりの上限30通を超えないようにする）
 const RESP_GRAPH_TOKEN_CACHE_KEY = "RESP_MS_GRAPH_TOKEN";
 const RESP_MAIL_BCC_PROPERTY = "RESP_MAIL_BCC";             // on のときに、社内の控えとして同じメールを送るアドレス（任意）
 const RESP_MAIL_SENDER_NAME = "株式会社クリメン";
@@ -516,23 +513,15 @@ function respGetMailSettings() {
   const testTo = String(props.getProperty(RESP_MAIL_TEST_TO_PROPERTY) || "").trim();
   const bcc = String(props.getProperty(RESP_MAIL_BCC_PROPERTY) || "").trim();
 
-  const graph = respIsGraph();
-  const from = graph ? String(props.getProperty("MS_MAIL_SENDER") || "").trim() : String(props.getProperty(RESP_MAIL_FROM_PROPERTY) || "").trim();
+  const from = String(props.getProperty("MS_MAIL_SENDER") || "").trim();
 
   let mode = rawMode === "on" || rawMode === "test" ? rawMode : "off";
-  if (mode !== "off" && graph) {
+  if (mode !== "off") {
     try {
-      respGraphToken_();
       if (!from) throw new Error("MS_MAIL_SENDER が未設定です");
+      respGraphToken_();
     } catch (e) {
       console.warn(`Microsoft Graph に接続できないため、控えメールは送りません: ${e}`);
-      mode = "off";
-    }
-  } else if (mode !== "off" && from) {
-    const own = String(Session.getEffectiveUser().getEmail() || "").toLowerCase();
-    const aliases = GmailApp.getAliases().map(alias => String(alias).toLowerCase());
-    if (from.toLowerCase() !== own && aliases.indexOf(from.toLowerCase()) === -1) {
-      console.warn(`${RESP_MAIL_FROM_PROPERTY}（${from}）はこのアカウントから送信できるアドレスではないため、控えメールは送りません。`);
       mode = "off";
     }
   }
@@ -563,12 +552,6 @@ function respSendReceiptIfNeeded(form, rows, dateHeaders, previousMailed, mail) 
     return mail.mode === "test" ? "" : failMark;
   }
 
-  const recipientCount = 1 + (mail.mode === "on" && mail.bcc ? 1 : 0);
-  if (!respIsGraph() && MailApp.getRemainingDailyQuota() < recipientCount) {
-    console.warn("メールの1日の送信上限に達したため、控えメールの送信を見送りました。次の集計で送ります。");
-    return "";
-  }
-
   const addresses = {};
   form.stores.forEach(store => { addresses[store.name] = store.address; });
   const message = respBuildReceiptMail(rows, dateHeaders, form.formUrl, addresses);
@@ -589,30 +572,15 @@ function respSendReceiptIfNeeded(form, rows, dateHeaders, previousMailed, mail) 
   }
 }
 
-// メールを送る。送信元アドレスがあれば Gmail から（別のアドレスとして登録済みのもの）、無ければ実行アカウントから送る
+// メールを送る（Microsoft Graph。送信元は MS_MAIL_SENDER）
 function respSendMail(options, from) {
-  if (respIsGraph()) {
-    respGraphSend_(options);
-    Utilities.sleep(RESP_GRAPH_INTERVAL_MS);   // 1分あたりの上限を超えないようにする
-    return;
-  }
-  if (!from) {
-    MailApp.sendEmail(options);
-    return;
-  }
-  const gmailOptions = { name: options.name, from: from };
-  if (options.bcc) gmailOptions.bcc = options.bcc;
-  if (options.htmlBody) gmailOptions.htmlBody = options.htmlBody;
-  GmailApp.sendEmail(options.to, options.subject, options.body, gmailOptions);
-}
-
-function respIsGraph() {
-  return String(PropertiesService.getScriptProperties().getProperty(RESP_PROVIDER_PROPERTY) || "").trim().toLowerCase() === "graph";
+  respGraphSend_(options);
+  Utilities.sleep(RESP_GRAPH_INTERVAL_MS);   // 1分あたりの上限を超えないようにする
 }
 
 function respGraphSetting_(name) {
   const value = String(PropertiesService.getScriptProperties().getProperty(name) || "").trim();
-  if (!value) throw new Error(`スクリプトプロパティ ${name} を設定してください（MAIL_PROVIDER が graph のときに必要です）。`);
+  if (!value) throw new Error(`スクリプトプロパティ ${name} を設定してください（Graph で送るために必要です）。`);
   return value;
 }
 
@@ -764,7 +732,7 @@ function sendSampleReceiptMail() {
   ];
   const message = respBuildReceiptMail(rows, dateHeaders, "https://docs.google.com/forms/d/e/（サンプル）/viewform",
     { "サンプル店A": "〒130-0013 東京都墨田区錦糸1-2-3 サンプルビル1F", "サンプル店B": "〒130-0022 東京都墨田区江東橋4-5-6" });
-  const from = String(PropertiesService.getScriptProperties().getProperty(RESP_MAIL_FROM_PROPERTY) || "").trim();
+  const from = String(PropertiesService.getScriptProperties().getProperty("MS_MAIL_SENDER") || "").trim();
   respSendMail({ to: testTo, subject: "【テスト】" + message.subject, body: "（サンプルです。実際の回答ではありません）\n\n" + message.body,
     htmlBody: "<p>（サンプルです。実際の回答ではありません）</p>" + message.htmlBody, name: RESP_MAIL_SENDER_NAME }, from);
   console.log(`サンプルのメールを ${testTo} に送りました。`);

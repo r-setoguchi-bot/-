@@ -6,15 +6,9 @@
 // 送った結果は「案内メール送信記録」シートに残り、同じフォームには二重に送らない（「リスト」を作り直しても記録は残る）。
 //
 // 送信元:
-//   スクリプトプロパティ MAIL_FROM に、会社のアドレスを入れる。
-//   そのアドレスが、実行するアカウントのGmailの「別のアドレスから送信」に登録されていること（回答の控えメールも同じアドレスから送る）。
-//   未設定なら、スクリプトを実行しているアカウントのアドレスから送る。
-//
-// Outlook（Microsoft Graph）から送る場合:
-//   スクリプトプロパティ MAIL_PROVIDER に graph を入れると、Gmail ではなく、Microsoft Graph（Exchange Online）から送る。
-//   必要なスクリプトプロパティ: MS_TENANT_ID / MS_CLIENT_ID / MS_CLIENT_SECRET / MS_MAIL_SENDER（送信元のメールボックス）
-//   MAIL_PROVIDER が未設定、または graph 以外なら、これまでどおり Gmail から送る。
-//   1日に送る通数は、スクリプトプロパティ INV_DAILY_LIMIT（例: 200）で制限できる。未設定なら制限しない。
+//   Microsoft Graph（Exchange Online）から、共有メールボックス km-customer@kurimen.co.jp の名前で送る（Gmailからは送らない）。
+//   必要なスクリプトプロパティ: MS_TENANT_ID / MS_CLIENT_ID / MS_CLIENT_SECRET / MS_MAIL_SENDER（km-customer@kurimen.co.jp）
+//   1日に送る通数は、スクリプトプロパティ INV_DAILY_LIMIT（例: 450）で制限できる。未設定なら制限しない。
 //   上限に達したら、翌日の9時に自動で続きを送る。
 //
 // 安全のしくみ（お客様に誤って送らないため）:
@@ -23,7 +17,7 @@
 //   ・テスト送信（sendTestInvitations）は、INVITE_TEST_TO のアドレスだけに送り、記録には残さない。
 //
 // 使い方:
-//   1. スクリプトプロパティ MAIL_FROM（会社のアドレス）、INVITE_TEST_TO（テスト用の自分のアドレス）を設定
+//   1. スクリプトプロパティ MS_TENANT_ID / MS_CLIENT_ID / MS_CLIENT_SECRET / MS_MAIL_SENDER、INVITE_TEST_TO（テスト用の自分のアドレス）を設定
 //   2. sendTestInvitations を実行 → 先頭の数件分の案内を、テスト用のアドレスに送る（文面とURLを確認する）
 //   3. 当日、スクリプトプロパティ INVITE_MODE を on にして startInvitations を実行（終わるまで自動で続く）
 //   4. 途中で止めるときは stopInvitations
@@ -37,17 +31,13 @@ const INV_LOG_SHEET_NAME = "案内メール送信記録";
 const INV_STATUS_SENT = "送信済";           // 「リスト」のフォーム作成状況
 const INV_MODE_PROPERTY = "INVITE_MODE";     // on のときだけ本番送信
 const INV_TEST_TO_PROPERTY = "INVITE_TEST_TO";
-const INV_FROM_PROPERTY = "MAIL_FROM";
-const INV_PROVIDER_PROPERTY = "MAIL_PROVIDER";   // graph のときだけ、Microsoft Graph から送る
 const INV_DAILY_LIMIT_PROPERTY = "INV_DAILY_LIMIT";
 const INV_GRAPH_INTERVAL_MS = 3000;              // Graphで送るときの、1通ごとの間隔（1分あたり約20通。上限は30通）
-const INV_GMAIL_INTERVAL_MS = 5000;              // Gmailで送るときの、1通ごとの間隔（1分あたり約12通。450通で約40分。一度に大量に送り出さないため）
 const INV_GRAPH_TOKEN_CACHE_KEY = "INV_MS_GRAPH_TOKEN";
 
 const INV_BATCH_HANDLER = "continueInvitations";
 const INV_TIME_LIMIT_MS = 4.5 * 60 * 1000;
 const INV_RETRY_DELAY_MS = 60 * 1000;          // 続きを実行するまでの待ち時間
-const INV_QUOTA_WAIT_MS = 3 * 60 * 60 * 1000;  // 1日の送信上限に達したときに、再開するまでの待ち時間
 const INV_SAFETY_DELAY_MS = 7 * 60 * 1000;     // 実行が強制終了した場合に再開するまでの待ち時間（6分制限より長く）
 const INV_TEST_COUNT = 3;                      // テスト送信で送る件数
 
@@ -91,43 +81,20 @@ function invFormatNow() {
   return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy/MM/dd HH:mm:ss");
 }
 
-function invIsGraph() {
-  return String(PropertiesService.getScriptProperties().getProperty(INV_PROVIDER_PROPERTY) || "").trim().toLowerCase() === "graph";
-}
-
-// 送信元アドレスを確認する。未設定なら空文字（実行アカウントのアドレスから送る）。使えないアドレスなら、送る前にエラーで止める
-// Graphで送る場合は、MS_MAIL_SENDER を返す（接続に必要な設定とトークンも、ここで確認する）
+// 送信元のメールボックス（MS_MAIL_SENDER）を返す。接続に必要な設定とトークンも、ここで確認する
 function invGetFrom() {
-  if (invIsGraph()) {
-    const sender = invGraphSetting_("MS_MAIL_SENDER");
-    invGraphToken_();
-    return sender;
-  }
-  const from = String(PropertiesService.getScriptProperties().getProperty(INV_FROM_PROPERTY) || "").trim();
-  if (!from) return "";
-  const own = String(Session.getEffectiveUser().getEmail() || "").toLowerCase();
-  const aliases = GmailApp.getAliases().map(alias => String(alias).toLowerCase());
-  if (from.toLowerCase() !== own && aliases.indexOf(from.toLowerCase()) === -1) {
-    throw new Error(`${INV_FROM_PROPERTY}（${from}）は、このアカウントから送信できるアドレスではありません。` +
-      "Gmailの設定「アカウント」→「他のメールアドレスを追加」で登録してください。");
-  }
-  return from;
+  const sender = invGraphSetting_("MS_MAIL_SENDER");
+  invGraphToken_();
+  return sender;
 }
 
 function invSend(to, subject, body, from) {
-  if (invIsGraph()) {
-    invGraphSend_(from, to, subject, body);
-    return;
-  }
-  const options = { name: INV_SENDER_NAME };
-  if (from) options.from = from;
-  if (INV_REPLY_TO) options.replyTo = INV_REPLY_TO;
-  GmailApp.sendEmail(to, subject, body, options);
+  invGraphSend_(from, to, subject, body);
 }
 
 function invGraphSetting_(name) {
   const value = String(PropertiesService.getScriptProperties().getProperty(name) || "").trim();
-  if (!value) throw new Error(`スクリプトプロパティ ${name} を設定してください（MAIL_PROVIDER が graph のときに必要です）。`);
+  if (!value) throw new Error(`スクリプトプロパティ ${name} を設定してください（Graph で送るために必要です）。`);
   return value;
 }
 
@@ -260,14 +227,14 @@ function sendTestInvitations() {
     invSend(testTo, "【テスト】" + message.subject,
       `（テスト送信です。本来の宛先: ${form.email}）\n\n` + message.body, from);
   });
-  console.log(`${Math.min(INV_TEST_COUNT, forms.length)} 通のテストメールを ${testTo} に送りました（送信元: ${from || "実行アカウント"}）。`);
+  console.log(`${Math.min(INV_TEST_COUNT, forms.length)} 通のテストメールを ${testTo} に送りました（送信元: ${from}）。`);
 }
 
 // ===== Power Automate（Outlookの共有メールボックスから送る）用の送信リストを作る =====
 // 「案内メール_PA用」シートに、送る案内メール（宛先・件名・本文）を1行ずつ書き出す（お客様には何も送らない）。
 // このシートをExcelにして、Power Automate のフローで読み込んで送る。送った分は、Excelの「送信済み」の列に日時を入れて管理する。
 // すでに「案内メール送信記録」で送信済みのフォームは、書き出さない。宛先が正しくないものは「案内メール_宛先エラー」に分ける。
-// ※この方法で送るときは、startInvitations（Gmailからの送信）は実行しないこと（二重に送ってしまう）。
+// ※現在は使わない（Graphで直接送る）。この方法で送るときは、startInvitations は実行しないこと（二重に送ってしまう）。
 const INV_PA_SHEET_NAME = "案内メール_PA用";
 const INV_PA_ERROR_SHEET_NAME = "案内メール_宛先エラー";
 const INV_PA_PER_DAY = 450;   // 1日に送る通数。「送信日」の列を、この通数ごとに「1日目」「2日目」…と分ける
@@ -348,7 +315,6 @@ function runInvitationBatch() {
   const startTime = Date.now();
   let sentCount = 0;
   let failedCount = 0;
-  let stoppedByQuota = false;
   let stoppedByDailyLimit = false;
   let remaining = 0;
 
@@ -378,7 +344,6 @@ function runInvitationBatch() {
       });
     }
     const dailyLimit = Number(props.getProperty(INV_DAILY_LIMIT_PROPERTY) || 0);   // 0なら制限しない
-    const useGraph = invIsGraph();
 
     const targets = forms.filter(form => !logged.has(form.formId));
 
@@ -389,11 +354,6 @@ function runInvitationBatch() {
       }
       if (dailyLimit > 0 && sentToday + sentCount >= dailyLimit) {
         stoppedByDailyLimit = true;
-        remaining = targets.length - n;
-        break;
-      }
-      if (!useGraph && MailApp.getRemainingDailyQuota() < 1) {
-        stoppedByQuota = true;
         remaining = targets.length - n;
         break;
       }
@@ -418,19 +378,19 @@ function runInvitationBatch() {
       SpreadsheetApp.flush();
       if (result === INV_RESULT_SENT) sentCount++;
       else failedCount++;
-      if (result === INV_RESULT_SENT) Utilities.sleep(useGraph ? INV_GRAPH_INTERVAL_MS : INV_GMAIL_INTERVAL_MS);   // 一度に大量に送り出さない（Graphは、1分あたりの上限30通を超えないようにする）
+      if (result === INV_RESULT_SENT) Utilities.sleep(INV_GRAPH_INTERVAL_MS);   // 1分あたりの上限30通を超えないようにする
     }
 
     if (remaining > 0) {
       // 先に続きの予約を作る（失敗しても、保険の予約が残る）。そのあとで、保険の予約を消す
-      invScheduleBatch(stoppedByDailyLimit ? invMsUntilTomorrow9_() : stoppedByQuota ? INV_QUOTA_WAIT_MS : INV_RETRY_DELAY_MS);
+      invScheduleBatch(stoppedByDailyLimit ? invMsUntilTomorrow9_() : INV_RETRY_DELAY_MS);
       try {
         ScriptApp.deleteTrigger(safetyTrigger);
       } catch (e) {
         console.warn(`保険の予約を消せませんでした（処理には影響しません）: ${e}`);
       }
       console.log(`今回 ${sentCount} 通送信（失敗 ${failedCount} 件）。残り ${remaining} 件は` +
-        (stoppedByDailyLimit ? `1日の上限（${dailyLimit} 通）に達したため、明日の9時から` : stoppedByQuota ? "1日の送信上限に達したため、しばらく待ってから" : "") + "自動で続行します。");
+        (stoppedByDailyLimit ? `1日の上限（${dailyLimit} 通）に達したため、明日の9時から` : "") + "自動で続行します。");
     } else {
       deleteInvitationTriggers();
       console.log(`今回 ${sentCount} 通送信（失敗 ${failedCount} 件）。すべて完了しました。送信記録は「${INV_LOG_SHEET_NAME}」シートにあります。`);

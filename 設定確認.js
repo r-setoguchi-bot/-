@@ -64,15 +64,13 @@ function checkSettings() {
     log(false, "スプレッドシート", String(e));
   }
 
-  // 送信元・テスト用アドレス
-  const from = get("MAIL_FROM").trim();
-  if (!from) {
-    log(true, "MAIL_FROM", "未設定（実行アカウントのアドレスから送ります）");
-  } else {
-    const own = String(Session.getEffectiveUser().getEmail() || "").toLowerCase();
-    const aliases = GmailApp.getAliases().map(a => String(a).toLowerCase());
-    const ok = from.toLowerCase() === own || aliases.indexOf(from.toLowerCase()) !== -1;
-    log(ok, "MAIL_FROM", ok ? `${from} から送信できます` : `${from} は、このアカウントから送信できるアドレスとして登録されていません`);
+  // メールの送信（Microsoft Graph）の設定。値は表示しない（シークレットは○か×だけ）
+  ["MS_TENANT_ID", "MS_CLIENT_ID", "MS_CLIENT_SECRET", "MS_MAIL_SENDER"].forEach(name => {
+    const value = get(name);
+    log(!!value && value === value.trim(), name, !value ? "未設定" : `設定あり${spaceNote(value)}`);
+  });
+  if (get("MS_MAIL_SENDER") && get("MS_MAIL_SENDER").trim().toLowerCase() !== "km-customer@kurimen.co.jp") {
+    log(false, "MS_MAIL_SENDER", "km-customer@kurimen.co.jp になっていません（管理者の設定は、このアドレスだけに限定されています）");
   }
   ["INVITE_TEST_TO", "RESP_MAIL_TEST_TO"].forEach(name => {
     const value = get(name).trim();
