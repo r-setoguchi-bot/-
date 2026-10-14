@@ -229,3 +229,40 @@ function inspectErrorRows() {
       `同じフォームの店舗数=${sameForm.length}（${sameForm.map(x => x.line + "行目:" + x.d[0]).join(" / ")}）`);
   });
 }
+
+// ===== 「除外」にした行の確認（見るだけ。何も書き換えない） =====
+// 「リスト」のK列が「除外」の行ごとに、同じフォーム（J列）を使う、除外していない行があるかを調べる。
+// あると、その店舗を除外しても、同じフォームの他の店舗の分で案内が送られる（除外した店舗も、本文とフォームに載る）。
+function checkExcludedRows() {
+  const props = PropertiesService.getScriptProperties();
+  const url = String(props.getProperty("FORM_SPREADSHEET_URL") || "").trim();
+  const ss = url ? SpreadsheetApp.openByUrl(url) : SpreadsheetApp.getActiveSpreadsheet();
+  const data = ss.getSheetByName("リスト").getDataRange().getDisplayValues();
+
+  const rowsByForm = {};
+  for (let i = 1; i < data.length; i++) {
+    const formId = data[i][9];
+    if (!formId) continue;
+    (rowsByForm[formId] = rowsByForm[formId] || []).push(i);
+  }
+
+  let excluded = 0;
+  let shared = 0;
+  const statusCount = {};
+  for (let i = 1; i < data.length; i++) {
+    const status = data[i][10] || "（空）";
+    statusCount[status] = (statusCount[status] || 0) + 1;
+    if (data[i][10] !== "除外") continue;
+    excluded++;
+    const formId = data[i][9];
+    const others = (rowsByForm[formId] || []).filter(j => j !== i && data[j][10] !== "除外");
+    if (others.length > 0) {
+      shared++;
+      console.log(`△ ${i + 1}行目「${data[i][0]}」: 同じフォームに、除外していない店舗が ${others.length} 件あります（${others.map(j => (j + 1) + "行目:" + data[j][0]).join(" / ")}）。案内は、それらの店舗の分で送られます`);
+    } else {
+      console.log(`○ ${i + 1}行目「${data[i][0]}」: このフォームの店舗は、すべて除外です（案内は送られません）`);
+    }
+  }
+  console.log(`除外の行: ${excluded} 件（うち、同じフォームに除外していない店舗がある行: ${shared} 件）`);
+  console.log(`状況の内訳: ${JSON.stringify(statusCount)}`);
+}
