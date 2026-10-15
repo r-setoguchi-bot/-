@@ -351,3 +351,103 @@ function continueFixFormLogin() {
 function fixLoginDeleteTriggers_() {
   ScriptApp.getProjectTriggers().forEach(t => { if (t.getHandlerFunction() === FIXLOGIN_HANDLER) ScriptApp.deleteTrigger(t); });
 }
+
+// ===== フォームの「回答者ビュー」（Driveの共有）の確認と変更 =====
+// 先に、左の「サービス」に「Drive API（v3）」を追加しておくこと。
+//   inspectFormPermissions()  … 先頭の数件のフォームの、回答者ビューの権限を見るだけ（何も変えない）
+//   openFormAccessSample()    … 先頭の1件だけ、「リンクを知っている全員が回答できる」に変える（試し）
+//   startOpenFormAccess()     … 作成済みのフォームすべてを、同じように変える（途中で止まっても、自動で続ける）
+const OPENACCESS_HANDLER = "continueOpenFormAccess";
+const OPENACCESS_CURSOR = "OPEN_ACCESS_CURSOR";
+
+function openAccessRetry_(fn) {
+  let lastError;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try { return fn(); } catch (e) { lastError = e; Utilities.sleep(2000 * (attempt + 1)); }
+  }
+  throw lastError;
+}
+
+function openAccessList_(formId) {
+  const result = Drive.Permissions.list(formId, { fields: "permissions(id,type,role,view,domain)", supportsAllDrives: true });
+  return result.permissions || [];
+}
+
+function openAccessDescribe_(perms) {
+  return perms.map(p => `${p.type}/${p.role}/view=${p.view || "-"}${p.domain ? "/" + p.domain : ""}`).join(" , ");
+}
+
+function inspectFormPermissions() {
+  const ids = fixLoginFormIds_();
+  [0, 1, ids.length - 1].forEach(n => {
+    try {
+      const perms = openAccessRetry_(() => openAccessList_(ids[n]));
+      console.log(`${n + 1}件目 末尾=${ids[n].slice(-6)} 権限: ` + openAccessDescribe_(perms));
+    } catch (e) {
+      console.error(`${n + 1}件目 末尾=${ids[n].slice(-6)} 権限を読めませんでした: ${e}`);
+    }
+  });
+  console.log(`対象のフォーム: ${ids.length} 件`);
+}
+
+function openAccessOne_(formId) {
+  const perms = openAccessList_(formId);
+  if (perms.some(p => p.type === "anyone" && p.view === "published")) return "already";
+  Drive.Permissions.create({ type: "anyone", role: "reader", view: "published" }, formId, { supportsAllDrives: true });
+  return "changed";
+}
+
+function openFormAccessSample() {
+  const ids = fixLoginFormIds_();
+  const result = openAccessRetry_(() => openAccessOne_(ids[0]));
+  const after = openAccessRetry_(() => openAccessList_(ids[0]));
+  console.log(`1件目 末尾=${ids[0].slice(-6)} 結果=${result} 変更後の権限: ` + openAccessDescribe_(after));
+}
+
+function startOpenFormAccess() {
+  PropertiesService.getScriptProperties().deleteProperty(OPENACCESS_CURSOR);
+  openAccessDeleteTriggers_();
+  continueOpenFormAccess();
+}
+
+function continueOpenFormAccess() {
+  const lock = LockService.getUserLock();
+  if (!lock.tryLock(10 * 1000)) { console.log("別の処理が動いているためスキップしました。"); return; }
+  const startTime = Date.now();
+  try {
+    openAccessDeleteTriggers_();
+    const safety = ScriptApp.newTrigger(OPENACCESS_HANDLER).timeBased().after(7 * 60 * 1000).create();
+    const ids = fixLoginFormIds_();
+    const props = PropertiesService.getScriptProperties();
+    let index = Number(props.getProperty(OPENACCESS_CURSOR) || 0);
+    if (index > ids.length) index = 0;
+    let changed = 0, already = 0, errors = 0;
+    while (index < ids.length) {
+      if (Date.now() - startTime > 4.5 * 60 * 1000) break;
+      try {
+        const result = openAccessRetry_(() => openAccessOne_(ids[index]));
+        if (result === "changed") changed++; else already++;
+      } catch (e) {
+        console.error(`変更できませんでした: 末尾=${String(ids[index]).slice(-6)} / ${e}`);
+        errors++;
+      }
+      index++;
+    }
+    if (index < ids.length) {
+      props.setProperty(OPENACCESS_CURSOR, String(index));
+      ScriptApp.newTrigger(OPENACCESS_HANDLER).timeBased().after(60 * 1000).create();
+      try { ScriptApp.deleteTrigger(safety); } catch (e) { /* 影響なし */ }
+      console.log(`${index} / ${ids.length} 件を確認（今回 変更 ${changed} 件、もともと全員可 ${already} 件、エラー ${errors} 件）。残りは自動で続行します。`);
+    } else {
+      openAccessDeleteTriggers_();
+      props.deleteProperty(OPENACCESS_CURSOR);
+      console.log(`全 ${ids.length} 件を確認しました（今回 変更 ${changed} 件、もともと全員可 ${already} 件、エラー ${errors} 件）。完了しました。`);
+    }
+  } finally {
+    try { lock.releaseLock(); } catch (e) { /* 影響なし */ }
+  }
+}
+
+function openAccessDeleteTriggers_() {
+  ScriptApp.getProjectTriggers().forEach(t => { if (t.getHandlerFunction() === OPENACCESS_HANDLER) ScriptApp.deleteTrigger(t); });
+}
