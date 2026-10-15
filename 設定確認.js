@@ -369,8 +369,9 @@ function openAccessRetry_(fn) {
 }
 
 function openAccessList_(formId) {
-  const result = Drive.Permissions.list(formId, { fields: "permissions(id,type,role,view,domain)", supportsAllDrives: true });
-  return result.permissions || [];
+  // 回答者ビュー（view=published）の権限は、通常の一覧には出ないので、includePermissionsForView を付けて取る
+  const file = Drive.Files.get(formId, { fields: "id,permissions(id,type,role,view,domain)", includePermissionsForView: "published", supportsAllDrives: true });
+  return file.permissions || [];
 }
 
 function openAccessDescribe_(perms) {
