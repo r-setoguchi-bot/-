@@ -18,7 +18,8 @@ const APO_SAFETY_DELAY_MS = 7 * 60 * 1000;
 const APO_TEST_COUNT = 2;
 const APO_LOG_HEADER = ["フォームID", "送信先", "対象店舗", "結果", "日時"];
 
-const APO_SUBJECT = "【お詫び】年末年始（12/30〜1/3）廃棄物回収のご希望に関するアンケートについて【11/15までにご回答ください】";
+// 件名は、案内メールと同じにする（Gmail・Outlookで、同じスレッドにまとまりやすくするため）。お詫びは、本文の先頭に書く
+const APO_SUBJECT = INV_SUBJECT;
 
 // 案内メールを送ったフォームの一覧（案内メール送信記録の「送信済」）
 function apoTargets_() {
@@ -39,6 +40,7 @@ function apoTargets_() {
 
 function apoBuildMail_(form) {
   const lines = [];
+  lines.push("【お詫びとお知らせ】", "");
   lines.push("ご担当者様", "");
   lines.push("平素より大変お世話になっております。株式会社クリメンです。");
   lines.push("先日お送りしました、年末年始の特別回収に関するアンケートのメールについて、お詫びとお知らせです。", "");
