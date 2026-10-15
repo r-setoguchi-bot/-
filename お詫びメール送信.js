@@ -18,8 +18,10 @@ const APO_SAFETY_DELAY_MS = 7 * 60 * 1000;
 const APO_TEST_COUNT = 2;
 const APO_LOG_HEADER = ["フォームID", "送信先", "対象店舗", "結果", "日時"];
 
-// 件名は、案内メールと同じにする（Gmail・Outlookで、同じスレッドにまとまりやすくするため）。お詫びは、本文の先頭に書く
-const APO_SUBJECT = INV_SUBJECT;
+// 件名は、案内メールの件名の先頭に「【お詫び】」を付ける（別のメールとして、目に留まりやすくする）
+function apoSubject_() {
+  return "【お詫び】" + INV_SUBJECT;
+}
 
 // 案内メールを送ったフォームの一覧（案内メール送信記録の「送信済」）
 function apoTargets_() {
@@ -57,7 +59,7 @@ function apoBuildMail_(form) {
   lines.push("すでにご回答いただいている場合は、改めてのご回答は不要です。");
   lines.push("フォームが開けない場合は、このメールにご返信ください。", "");
   lines.push("お手数をおかけしますが、よろしくお願いいたします。", "", INV_SENDER_NAME);
-  return { subject: APO_SUBJECT, body: lines.join("\n") };
+  return { subject: apoSubject_(), body: lines.join("\n") };
 }
 
 // テスト送信: 先頭の数件分を、INVITE_TEST_TO のアドレスだけに送る（お客様には送らない。記録にも残さない）
