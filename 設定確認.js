@@ -266,3 +266,88 @@ function checkExcludedRows() {
   console.log(`除外の行: ${excluded} 件（うち、同じフォームに除外していない店舗がある行: ${shared} 件）`);
   console.log(`状況の内訳: ${JSON.stringify(statusCount)}`);
 }
+
+// ===== フォームの「回答にログインが必要」の確認と解除 =====
+// Google Workspace のアカウントで作ったフォームは、既定で「組織内のユーザーだけが回答できる」設定になっていることがある。
+// その場合、組織の外のお客様は「アクセス権限がありません」となる。
+//   checkFormLoginSample()  … 先頭の数件のフォームの設定を見るだけ（何も変えない）
+//   startFixFormLogin()     … 「リスト」の作成済みフォームすべてについて、ログイン必須を解除する（途中で止まっても、自動で続ける）
+const FIXLOGIN_HANDLER = "continueFixFormLogin";
+const FIXLOGIN_CURSOR = "FIX_LOGIN_CURSOR";
+
+function fixLoginFormIds_() {
+  const props = PropertiesService.getScriptProperties();
+  const url = String(props.getProperty("FORM_SPREADSHEET_URL") || "").trim();
+  const ss = url ? SpreadsheetApp.openByUrl(url) : SpreadsheetApp.getActiveSpreadsheet();
+  const data = ss.getSheetByName("リスト").getDataRange().getDisplayValues();
+  const ids = [];
+  const seen = {};
+  for (let i = 1; i < data.length; i++) {
+    const id = data[i][9];
+    if (id && data[i][10] === "送信済" && !seen[id]) { seen[id] = true; ids.push(id); }
+  }
+  return ids;
+}
+
+function checkFormLoginSample() {
+  const ids = fixLoginFormIds_();
+  [0, 1, 2, ids.length - 1].forEach(n => {
+    const form = FormApp.openById(ids[n]);
+    console.log(`${n + 1}件目 末尾=${ids[n].slice(-6)} ログイン必須=${form.requiresLogin()} 回答受付=${form.isAcceptingResponses()}`);
+  });
+  console.log(`対象のフォーム: ${ids.length} 件`);
+}
+
+function startFixFormLogin() {
+  PropertiesService.getScriptProperties().deleteProperty(FIXLOGIN_CURSOR);
+  fixLoginDeleteTriggers_();
+  continueFixFormLogin();
+}
+
+function continueFixFormLogin() {
+  const lock = LockService.getUserLock();
+  if (!lock.tryLock(10 * 1000)) { console.log("別の処理が動いているためスキップしました。"); return; }
+  const startTime = Date.now();
+  try {
+    fixLoginDeleteTriggers_();
+    const safety = ScriptApp.newTrigger(FIXLOGIN_HANDLER).timeBased().after(7 * 60 * 1000).create();
+    const ids = fixLoginFormIds_();
+    const props = PropertiesService.getScriptProperties();
+    let index = Number(props.getProperty(FIXLOGIN_CURSOR) || 0);
+    if (index > ids.length) index = 0;
+    let fixed = 0, already = 0, errors = 0;
+    while (index < ids.length) {
+      if (Date.now() - startTime > 4.5 * 60 * 1000) break;
+      try {
+        const form = FormApp.openById(ids[index]);
+        if (form.requiresLogin()) {
+          form.setRequireLogin(false);
+          if (form.requiresLogin()) throw new Error("解除できませんでした（組織の設定で固定されている可能性があります）");
+          fixed++;
+        } else {
+          already++;
+        }
+      } catch (e) {
+        console.error(`ログイン必須を解除できませんでした: 末尾=${String(ids[index]).slice(-6)} / ${e}`);
+        errors++;
+      }
+      index++;
+    }
+    if (index < ids.length) {
+      props.setProperty(FIXLOGIN_CURSOR, String(index));
+      ScriptApp.newTrigger(FIXLOGIN_HANDLER).timeBased().after(60 * 1000).create();
+      try { ScriptApp.deleteTrigger(safety); } catch (e) { /* 影響なし */ }
+      console.log(`${index} / ${ids.length} 件を確認（今回 解除 ${fixed} 件、もともと不要 ${already} 件、エラー ${errors} 件）。残りは自動で続行します。`);
+    } else {
+      fixLoginDeleteTriggers_();
+      props.deleteProperty(FIXLOGIN_CURSOR);
+      console.log(`全 ${ids.length} 件を確認しました（今回 解除 ${fixed} 件、もともと不要 ${already} 件、エラー ${errors} 件）。完了しました。`);
+    }
+  } finally {
+    try { lock.releaseLock(); } catch (e) { /* 影響なし */ }
+  }
+}
+
+function fixLoginDeleteTriggers_() {
+  ScriptApp.getProjectTriggers().forEach(t => { if (t.getHandlerFunction() === FIXLOGIN_HANDLER) ScriptApp.deleteTrigger(t); });
+}
