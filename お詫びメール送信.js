@@ -1,0 +1,155 @@
+// ===== 案内メールを送ったお客様に、フォームの不備のお詫びと、修正のお知らせを送る =====
+// 「案内メール送信記録」で「送信済」になっているフォームの宛先にだけ、1通ずつ送る（まだ案内を送っていない店舗には送らない）。
+// 送信元は、案内メールと同じ（Microsoft Graph、km-customer@kurimen.co.jp）。案内メール送信.js の関数を使う。
+// 1通ごとに「お詫びメール送信記録」シートに記録して、同じフォームには二重に送らない。
+//
+// 使い方:
+//   1. sendTestApology を実行 → 先頭の2件分を、INVITE_TEST_TO のアドレスだけに送る（文面を確認する）
+//   2. スクリプトプロパティ APOLOGY_MODE に on を入れて、startApology を実行（終わるまで自動で続く）
+//   3. 途中で止めるときは stopApology
+//   4. 送り終わったら、APOLOGY_MODE を削除する
+
+const APO_LOG_SHEET_NAME = "お詫びメール送信記録";
+const APO_MODE_PROPERTY = "APOLOGY_MODE";
+const APO_HANDLER = "continueApology";
+const APO_TIME_LIMIT_MS = 4.5 * 60 * 1000;
+const APO_RETRY_DELAY_MS = 60 * 1000;
+const APO_SAFETY_DELAY_MS = 7 * 60 * 1000;
+const APO_TEST_COUNT = 2;
+const APO_LOG_HEADER = ["フォームID", "送信先", "対象店舗", "結果", "日時"];
+
+const APO_SUBJECT = "【お詫び】年末年始（12/30〜1/3）廃棄物回収のご希望に関するアンケートについて【11/15までにご回答ください】";
+
+// 案内メールを送ったフォームの一覧（案内メール送信記録の「送信済」）
+function apoTargets_() {
+  const ss = invGetSpreadsheet();
+  const listSheet = ss.getSheetByName(INV_LIST_SHEET_NAME);
+  if (!listSheet) throw new Error(`シート「${INV_LIST_SHEET_NAME}」が見つかりません。`);
+  const forms = invGroupFormsFromList(listSheet.getDataRange().getDisplayValues());
+
+  const sent = new Set();
+  const logSheet = ss.getSheetByName(INV_LOG_SHEET_NAME);
+  if (logSheet && logSheet.getLastRow() > 1) {
+    logSheet.getRange(2, 1, logSheet.getLastRow() - 1, 4).getDisplayValues().forEach(row => {
+      if (row[3] === INV_RESULT_SENT) sent.add(row[0]);
+    });
+  }
+  return forms.filter(form => sent.has(form.formId));
+}
+
+function apoBuildMail_(form) {
+  const lines = [];
+  lines.push("ご担当者様", "");
+  lines.push("平素より大変お世話になっております。株式会社クリメンです。");
+  lines.push("先日お送りしました、年末年始の特別回収に関するアンケートのメールについて、お詫びとお知らせです。", "");
+  lines.push("アンケートフォームの設定に不備があり、一部のお客様で、フォームを開けない状態となっておりました。");
+  lines.push("現在は修正が完了しており、先日のメールのリンク、または下記のリンクから、ご回答いただけます。");
+  lines.push("ご迷惑をおかけし、誠に申し訳ございません。", "");
+  if (form.customer) lines.push("【ご契約者】", form.customer, "");
+  lines.push("【対象店舗】");
+  form.stores.forEach(store => lines.push(`・${store}`));
+  lines.push("");
+  lines.push("■アンケートフォーム");
+  lines.push(form.formUrl, "");
+  lines.push(`■ご回答期限：${INV_DEADLINE_TEXT}まで`, "");
+  lines.push("すでにご回答いただいている場合は、改めてのご回答は不要です。");
+  lines.push("フォームが開けない場合は、このメールにご返信ください。", "");
+  lines.push("お手数をおかけしますが、よろしくお願いいたします。", "", INV_SENDER_NAME);
+  return { subject: APO_SUBJECT, body: lines.join("\n") };
+}
+
+// テスト送信: 先頭の数件分を、INVITE_TEST_TO のアドレスだけに送る（お客様には送らない。記録にも残さない）
+function sendTestApology() {
+  const testTo = String(PropertiesService.getScriptProperties().getProperty(INV_TEST_TO_PROPERTY) || "").trim();
+  if (!testTo) throw new Error(`スクリプトプロパティ ${INV_TEST_TO_PROPERTY} にテスト用のメールアドレスを設定してください。`);
+  const from = invGetFrom();
+  const targets = apoTargets_();
+  if (targets.length === 0) throw new Error("案内メールを送ったフォームがありません。");
+  targets.slice(0, APO_TEST_COUNT).forEach(form => {
+    const message = apoBuildMail_(form);
+    invSend(testTo, "【テスト】" + message.subject, `（テスト送信です。本来の宛先: ${form.email}）\n\n` + message.body, from);
+  });
+  console.log(`${Math.min(APO_TEST_COUNT, targets.length)} 通のテストメールを ${testTo} に送りました（送信元: ${from}）。対象のフォーム: 全 ${targets.length} 件。`);
+}
+
+function startApology() {
+  apoDeleteTriggers_();
+  runApologyBatch_();
+}
+
+function continueApology() {
+  runApologyBatch_();
+}
+
+function stopApology() {
+  apoDeleteTriggers_();
+  console.log("お詫びメールの自動送信を停止しました。");
+}
+
+function runApologyBatch_() {
+  const props = PropertiesService.getScriptProperties();
+  if (String(props.getProperty(APO_MODE_PROPERTY) || "").trim().toLowerCase() !== "on") {
+    console.log(`スクリプトプロパティ ${APO_MODE_PROPERTY} が on ではないため、送信しません。`);
+    return;
+  }
+  const lock = LockService.getUserLock();
+  if (!lock.tryLock(10 * 1000)) { console.log("別の送信が処理中のためスキップしました。"); return; }
+
+  const startTime = Date.now();
+  let sentCount = 0;
+  let failedCount = 0;
+  let remaining = 0;
+  try {
+    apoDeleteTriggers_();
+    const safety = ScriptApp.newTrigger(APO_HANDLER).timeBased().after(APO_SAFETY_DELAY_MS).create();
+
+    const from = invGetFrom();
+    const ss = invGetSpreadsheet();
+    let logSheet = ss.getSheetByName(APO_LOG_SHEET_NAME);
+    if (!logSheet) {
+      logSheet = ss.insertSheet(APO_LOG_SHEET_NAME);
+      logSheet.appendRow(APO_LOG_HEADER);
+    }
+    const logged = new Set();
+    if (logSheet.getLastRow() > 1) {
+      logSheet.getRange(2, 1, logSheet.getLastRow() - 1, 1).getDisplayValues().forEach(row => logged.add(row[0]));
+    }
+    const targets = apoTargets_().filter(form => !logged.has(form.formId));
+
+    for (let n = 0; n < targets.length; n++) {
+      if (Date.now() - startTime > APO_TIME_LIMIT_MS) { remaining = targets.length - n; break; }
+      const form = targets[n];
+      let result = INV_RESULT_SENT;
+      if (!/^[^@\s,]+@[^@\s,]+\.[^@\s,]+$/.test(form.email)) {
+        console.error(`宛先が正しくありません: ${form.formId}`);
+        result = INV_RESULT_FAILED;
+      } else {
+        try {
+          const message = apoBuildMail_(form);
+          invSend(form.email, message.subject, message.body, from);
+        } catch (e) {
+          console.error(`お詫びメールを送れませんでした: ${form.formId} / ${e}`);
+          result = INV_RESULT_FAILED;
+        }
+      }
+      logSheet.appendRow([form.formId, form.email, form.stores.join("・"), result, invFormatNow()]);
+      SpreadsheetApp.flush();
+      if (result === INV_RESULT_SENT) { sentCount++; Utilities.sleep(INV_GRAPH_INTERVAL_MS); } else { failedCount++; }
+    }
+
+    if (remaining > 0) {
+      ScriptApp.newTrigger(APO_HANDLER).timeBased().after(APO_RETRY_DELAY_MS).create();
+      try { ScriptApp.deleteTrigger(safety); } catch (e) { /* 影響なし */ }
+      console.log(`今回 ${sentCount} 通送信（失敗 ${failedCount} 件）。残り ${remaining} 件は自動で続行します。`);
+    } else {
+      apoDeleteTriggers_();
+      console.log(`今回 ${sentCount} 通送信（失敗 ${failedCount} 件）。すべて完了しました。記録は「${APO_LOG_SHEET_NAME}」シートにあります。`);
+    }
+  } finally {
+    try { lock.releaseLock(); } catch (e) { /* 影響なし */ }
+  }
+}
+
+function apoDeleteTriggers_() {
+  ScriptApp.getProjectTriggers().forEach(t => { if (t.getHandlerFunction() === APO_HANDLER) ScriptApp.deleteTrigger(t); });
+}
