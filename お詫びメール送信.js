@@ -157,3 +157,127 @@ function runApologyBatch_() {
 function apoDeleteTriggers_() {
   ScriptApp.getProjectTriggers().forEach(t => { if (t.getHandlerFunction() === APO_HANDLER) ScriptApp.deleteTrigger(t); });
 }
+
+// ===== 控えメールが重複して届いたお客様に、お詫びを送る =====
+// 回答の日時が午前0〜9時台のお客様は、控えメールが、2時間ごとに、繰り返し届いてしまった（時が1桁で表示される不具合）。
+// 「回答集計」の「控えメール」の列が、時が1桁の日時（例: 9:41:03）の行を、対象にする。同じフォームは、1通にまとめる。
+// 1通ごとに「重複お詫びメール送信記録」シートに記録して、同じフォームには二重に送らない。
+//
+// 使い方:
+//   1. sendTestDuplicateApology を実行 → 先頭の2件分を、INVITE_TEST_TO のアドレスだけに送る（文面と、対象の件数を確認する）
+//   2. スクリプトプロパティ DUP_APOLOGY_MODE に on を入れて、startDuplicateApology を実行
+//   3. 送り終わったら、DUP_APOLOGY_MODE を削除する
+
+const DUP_LOG_SHEET_NAME = "重複お詫びメール送信記録";
+const DUP_MODE_PROPERTY = "DUP_APOLOGY_MODE";
+const DUP_SUBJECT = "【お詫び】年末年始廃棄物回収アンケート ご回答内容の控えメールが重複して届いたことについて";
+
+// 控えメールが重複して届いた可能性のあるフォーム（控えメールの列が、時が1桁の日時のもの）
+function dupTargets_() {
+  const ss = invGetSpreadsheet();
+  const sheet = ss.getSheetByName("回答集計");
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  const values = sheet.getDataRange().getDisplayValues();
+  const header = values[0];
+  const colMail = header.indexOf("控えメール");
+  const colEmail = header.indexOf("メールアドレス");
+  const colForm = header.indexOf("フォームID");
+  if (colMail < 0 || colEmail < 0 || colForm < 0) throw new Error("「回答集計」シートの見出しが、想定と違います。");
+
+  const byForm = {};
+  const targets = [];
+  for (let i = 1; i < values.length; i++) {
+    const mark = String(values[i][colMail] || "").trim();
+    if (!/^\d{4}\/\d{1,2}\/\d{1,2}\s+\d:\d{2}:\d{2}$/.test(mark)) continue;   // 時が1桁の、お客様に送信済みの印
+    const formId = values[i][colForm];
+    if (!formId) continue;
+    if (!byForm[formId]) {
+      byForm[formId] = { formId: formId, email: String(values[i][colEmail] || "").trim(), stores: [] };
+      targets.push(byForm[formId]);
+    }
+    byForm[formId].stores.push(values[i][0]);
+  }
+  return targets;
+}
+
+function dupBuildMail_(target) {
+  const lines = [];
+  lines.push("ご担当者様", "");
+  lines.push("平素より大変お世話になっております。株式会社クリメンです。");
+  lines.push("このたびは、年末年始の廃棄物回収に関するアンケートにご回答いただき、ありがとうございました。", "");
+  lines.push("システムの不具合により、ご回答内容の控えメールが、同じ内容で、繰り返しお手元に届いておりました。");
+  lines.push("ご迷惑をおかけし、誠に申し訳ございません。", "");
+  lines.push("不具合は修正済みで、今後、同じ控えメールが繰り返し届くことはございません。");
+  lines.push("ご回答の内容に、変更はございません。繰り返し届いたメールは、お手数ですが、破棄していただけますと幸いです。", "");
+  lines.push("【対象店舗】");
+  target.stores.forEach(store => lines.push(`・${store}`));
+  lines.push("");
+  lines.push(`ご回答内容を変更される場合は、先にお送りしたメールのリンクから、${INV_DEADLINE_TEXT}までに、もう一度ご回答ください。`, "");
+  lines.push("今後とも、よろしくお願いいたします。", "", INV_SENDER_NAME);
+  return { subject: DUP_SUBJECT, body: lines.join("\n") };
+}
+
+function sendTestDuplicateApology() {
+  const testTo = String(PropertiesService.getScriptProperties().getProperty(INV_TEST_TO_PROPERTY) || "").trim();
+  if (!testTo) throw new Error(`スクリプトプロパティ ${INV_TEST_TO_PROPERTY} にテスト用のメールアドレスを設定してください。`);
+  const from = invGetFrom();
+  const targets = dupTargets_();
+  console.log(`対象のフォーム: 全 ${targets.length} 件（店舗は、合計 ${targets.reduce((n, t) => n + t.stores.length, 0)} 件）`);
+  if (targets.length === 0) throw new Error("対象のフォームがありません。");
+  targets.slice(0, 2).forEach(target => {
+    const message = dupBuildMail_(target);
+    invSend(testTo, "【テスト】" + message.subject, `（テスト送信です。本来の宛先: ${target.email}）\n\n` + message.body, from);
+  });
+  console.log(`${Math.min(2, targets.length)} 通のテストメールを ${testTo} に送りました（送信元: ${from}）。`);
+}
+
+function startDuplicateApology() {
+  const props = PropertiesService.getScriptProperties();
+  if (String(props.getProperty(DUP_MODE_PROPERTY) || "").trim().toLowerCase() !== "on") {
+    console.log(`スクリプトプロパティ ${DUP_MODE_PROPERTY} が on ではないため、送信しません。`);
+    return;
+  }
+  const lock = LockService.getUserLock();
+  if (!lock.tryLock(10 * 1000)) { console.log("別の処理が動いているためスキップしました。少し待って、もう一度実行してください。"); return; }
+  const startTime = Date.now();
+  let sentCount = 0;
+  let failedCount = 0;
+  let remaining = 0;
+  try {
+    const from = invGetFrom();
+    const ss = invGetSpreadsheet();
+    let logSheet = ss.getSheetByName(DUP_LOG_SHEET_NAME);
+    if (!logSheet) {
+      logSheet = ss.insertSheet(DUP_LOG_SHEET_NAME);
+      logSheet.appendRow(APO_LOG_HEADER);
+    }
+    const logged = new Set();
+    if (logSheet.getLastRow() > 1) {
+      logSheet.getRange(2, 1, logSheet.getLastRow() - 1, 1).getDisplayValues().forEach(row => logged.add(row[0]));
+    }
+    const targets = dupTargets_().filter(target => !logged.has(target.formId));
+    for (let n = 0; n < targets.length; n++) {
+      if (Date.now() - startTime > APO_TIME_LIMIT_MS) { remaining = targets.length - n; break; }
+      const target = targets[n];
+      let result = INV_RESULT_SENT;
+      if (!/^[^@\s,]+@[^@\s,]+\.[^@\s,]+$/.test(target.email)) {
+        console.error(`宛先が正しくありません: ${target.formId}`);
+        result = INV_RESULT_FAILED;
+      } else {
+        try {
+          const message = dupBuildMail_(target);
+          invSend(target.email, message.subject, message.body, from);
+        } catch (e) {
+          console.error(`お詫びメールを送れませんでした: ${target.formId} / ${e}`);
+          result = INV_RESULT_FAILED;
+        }
+      }
+      logSheet.appendRow([target.formId, target.email, target.stores.join("・"), result, invFormatNow()]);
+      SpreadsheetApp.flush();
+      if (result === INV_RESULT_SENT) { sentCount++; Utilities.sleep(INV_GRAPH_INTERVAL_MS); } else { failedCount++; }
+    }
+    console.log(`今回 ${sentCount} 通送信（失敗 ${failedCount} 件）。` + (remaining > 0 ? `残り ${remaining} 件は、もう一度 startDuplicateApology を実行してください。` : "すべて完了しました。") + `記録は「${DUP_LOG_SHEET_NAME}」シートにあります。`);
+  } finally {
+    try { lock.releaseLock(); } catch (e) { /* 影響なし */ }
+  }
+}
