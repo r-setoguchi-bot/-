@@ -281,3 +281,43 @@ function startDuplicateApology() {
     try { lock.releaseLock(); } catch (e) { /* 影響なし */ }
   }
 }
+
+// ===== 控えメールが重複して届いたお客様の一覧を、シートに書き出す（お客様には、何も送らない） =====
+// 「回答集計」の「控えメール」の列が、時が1桁の日時（例: 9:41:03）の行を、「重複対象一覧」シートに書き出す。
+// 「概算の重複回数」は、回答の日時から、控えメールを止めた日時（DUP_STOPPED_AT）までの間に、2時間ごとの集計が、何回動いたかの目安。
+const DUP_LIST_SHEET_NAME = "重複対象一覧";
+const DUP_STOPPED_AT = "2026/10/18 10:30";   // RESP_MAIL_MODE を off にした、おおよその日時
+
+function listDuplicateReceiptTargets() {
+  const ss = invGetSpreadsheet();
+  const sheet = ss.getSheetByName("回答集計");
+  if (!sheet || sheet.getLastRow() < 2) throw new Error("「回答集計」シートに、データがありません。");
+  const values = sheet.getDataRange().getDisplayValues();
+  const header = values[0];
+  const col = name => header.indexOf(name);
+  const colMail = col("控えメール"), colAt = col("回答日時"), colName = col("ご担当者名"), colEmail = col("メールアドレス"), colForm = col("フォームID");
+  if ([colMail, colAt, colName, colEmail, colForm].some(c => c < 0)) throw new Error("「回答集計」シートの見出しが、想定と違います。");
+
+  const stoppedAt = new Date(DUP_STOPPED_AT.replace(/-/g, "/")).getTime();
+  const parse = text => { const m = /^(\d{4})\/(\d{1,2})\/(\d{1,2})\s+(\d{1,2}):(\d{2}):(\d{2})$/.exec(String(text).trim()); return m ? new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime() : null; };
+
+  const byForm = {};
+  const rows = [];
+  for (let i = 1; i < values.length; i++) {
+    const mark = String(values[i][colMail] || "").trim();
+    if (!/^\d{4}\/\d{1,2}\/\d{1,2}\s+\d:\d{2}:\d{2}$/.test(mark)) continue;
+    const formId = values[i][colForm];
+    if (byForm[formId]) { byForm[formId][0] += "・" + values[i][0]; continue; }
+    const t = parse(values[i][colAt]);
+    const estimate = t ? Math.max(0, Math.floor((stoppedAt - t) / (2 * 60 * 60 * 1000))) : "";
+    byForm[formId] = [values[i][0], values[i][colAt], values[i][colName], values[i][colEmail], estimate, formId];
+    rows.push(byForm[formId]);
+  }
+  let out = ss.getSheetByName(DUP_LIST_SHEET_NAME);
+  if (!out) out = ss.insertSheet(DUP_LIST_SHEET_NAME);
+  out.clear();
+  const head = ["対象店舗", "回答日時", "ご担当者名", "メールアドレス", "概算の重複回数", "フォームID"];
+  out.getRange(1, 1, 1, head.length).setValues([head]);
+  if (rows.length > 0) out.getRange(2, 1, rows.length, head.length).setValues(rows);
+  console.log(`重複して届いた可能性のあるお客様: ${rows.length} 件。シート「${DUP_LIST_SHEET_NAME}」に書き出しました（お客様には、何も送っていません）。`);
+}
