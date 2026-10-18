@@ -175,6 +175,13 @@ const DUP_SUBJECT = "【お詫び】年末年始廃棄物回収アンケート �
 // 控えメールが重複して届いた可能性のあるフォーム（控えメールの列が、時が1桁の日時のもの）
 function dupTargets_() {
   const ss = invGetSpreadsheet();
+  // 先に listDuplicateReceiptTargets で作った「重複対象一覧」があれば、それを使う（その後に再回答があっても、対象から外れないように）
+  const snap = ss.getSheetByName(DUP_LIST_SHEET_NAME);
+  if (snap && snap.getLastRow() > 1) {
+    return snap.getRange(2, 1, snap.getLastRow() - 1, 6).getDisplayValues()
+      .filter(row => row[5])
+      .map(row => ({ formId: row[5], email: String(row[3] || "").trim(), stores: String(row[0]).split("\n") }));
+  }
   const sheet = ss.getSheetByName("回答集計");
   if (!sheet || sheet.getLastRow() < 2) return [];
   const values = sheet.getDataRange().getDisplayValues();
@@ -307,13 +314,14 @@ function listDuplicateReceiptTargets() {
     const mark = String(values[i][colMail] || "").trim();
     if (!/^\d{4}\/\d{1,2}\/\d{1,2}\s+\d:\d{2}:\d{2}$/.test(mark)) continue;
     const formId = values[i][colForm];
-    if (byForm[formId]) { byForm[formId][0] += "・" + values[i][0]; continue; }
+    if (byForm[formId]) { byForm[formId][0] += "\n" + values[i][0]; continue; }
     const t = parse(values[i][colAt]);
     const estimate = t ? Math.max(0, Math.floor((stoppedAt - t) / (2 * 60 * 60 * 1000))) : "";
     byForm[formId] = [values[i][0], values[i][colAt], values[i][colName], values[i][colEmail], estimate, formId];
     rows.push(byForm[formId]);
   }
   let out = ss.getSheetByName(DUP_LIST_SHEET_NAME);
+  if (out && out.getLastRow() > 1) throw new Error(`「${DUP_LIST_SHEET_NAME}」シートは、すでに作ってあります。作り直すと、その後に再回答したお客様が対象から外れるため、上書きしません。作り直す場合は、シートを削除してから、もう一度実行してください。`);
   if (!out) out = ss.insertSheet(DUP_LIST_SHEET_NAME);
   out.clear();
   const head = ["対象店舗", "回答日時", "ご担当者名", "メールアドレス", "概算の重複回数", "フォームID"];
