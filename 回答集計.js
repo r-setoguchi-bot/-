@@ -536,6 +536,7 @@ function respGetMailSettings() {
 //   印: 回答日時のみ=お客様に送信済 / 「テスト:」+回答日時=テスト送信済 / 「失敗:」+回答日時=送信を試みて失敗（自動では再送しない）
 function respSendReceiptIfNeeded(form, rows, dateHeaders, previousMailed, mail) {
   if (mail.mode === "off") return "";
+  previousMailed = respNormalizeMark_(previousMailed);   // シートの表示（例: 9:41:03）と、こちらの形式（09:41:03）の違いで、二重に送らないようにそろえる
 
   const answeredAt = rows[0][1];
   const sentMark = answeredAt;
@@ -570,6 +571,16 @@ function respSendReceiptIfNeeded(form, rows, dateHeaders, previousMailed, mail) 
     console.error(`控えメールを送れませんでした: ${form.formId} / ${e}`);
     return mail.mode === "test" ? "" : failMark;
   }
+}
+
+// 控えメールの印（回答日時）を、比べるために、同じ形（yyyy/MM/dd HH:mm:ss）にそろえる。
+// シートに書くと、日時として解釈され、時が1桁（例: 9:41:03）で表示されるため、そのままでは、一致せず、二重に送ってしまう
+function respNormalizeMark_(mark) {
+  const text = String(mark || "").trim();
+  const m = /^(テスト:|失敗:)?(\d{4})\/(\d{1,2})\/(\d{1,2})\s+(\d{1,2}):(\d{2}):(\d{2})$/.exec(text);
+  if (!m) return text;
+  const pad = n => ("0" + n).slice(-2);
+  return (m[1] || "") + m[2] + "/" + pad(m[3]) + "/" + pad(m[4]) + " " + pad(m[5]) + ":" + m[6] + ":" + m[7];
 }
 
 // メールを送る（Microsoft Graph。送信元は MS_MAIL_SENDER）
