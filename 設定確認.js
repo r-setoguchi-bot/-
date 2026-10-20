@@ -476,3 +476,31 @@ function listNotInvited() {
   rows.forEach(r => { counts[r[0]] = (counts[r[0]] || 0) + 1; });
   console.log(`案内を送っていない店舗: ${rows.length} 件 ${JSON.stringify(counts)}。シート「案内未送付一覧」に書き出しました。`);
 }
+
+// ===== 「除外」にした店舗の一覧を、シートに書き出す（お客様には、何も送らない） =====
+// 「リスト」シートで、フォーム作成状況が「除外」の行を、契約者ごとに並べて、「除外一覧」シートに書き出す。
+function listExcluded() {
+  const ss = invGetSpreadsheet();
+  const src = ss.getSheetByName(INV_LIST_SHEET_NAME);
+  if (!src) throw new Error(`シート「${INV_LIST_SHEET_NAME}」が見つかりません。`);
+  const values = src.getDataRange().getDisplayValues();
+  const head = values[0];
+  const idx = name => head.indexOf(name);
+  const cols = ["契約者", "店舗名", "業者名", "メールアドレス", "案内等送付先メールアドレス:(to)", "送付先別：e-mail", "契約時の顧客担当：メールアドレス", "店舗住所"];
+  const colStatus = idx("フォーム作成状況");
+  if (colStatus < 0 || cols.some(c => idx(c) < 0)) throw new Error("「リスト」シートの見出しが、想定と違います。");
+  const rows = [];
+  for (let i = 1; i < values.length; i++) {
+    if (values[i][colStatus] !== "除外") continue;
+    rows.push([i + 1].concat(cols.map(c => values[i][idx(c)])));
+  }
+  rows.sort((a, b) => String(a[1]).localeCompare(String(b[1]), "ja") || String(a[2]).localeCompare(String(b[2]), "ja"));
+  let out = ss.getSheetByName("除外一覧");
+  if (!out) out = ss.insertSheet("除外一覧");
+  out.clear();
+  const outHead = ["リストの行"].concat(cols);
+  out.getRange(1, 1, 1, outHead.length).setValues([outHead]);
+  if (rows.length > 0) out.getRange(2, 1, rows.length, outHead.length).setValues(rows);
+  const owners = new Set(rows.map(r => r[1]));
+  console.log(`除外にしている店舗: ${rows.length} 件（契約者: ${owners.size} 社）。シート「除外一覧」に書き出しました。`);
+}
