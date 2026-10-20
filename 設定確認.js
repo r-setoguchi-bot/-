@@ -452,3 +452,27 @@ function continueOpenFormAccess() {
 function openAccessDeleteTriggers_() {
   ScriptApp.getProjectTriggers().forEach(t => { if (t.getHandlerFunction() === OPENACCESS_HANDLER) ScriptApp.deleteTrigger(t); });
 }
+
+// ===== 案内メールを送っていない顧客の一覧を、シートに書き出す（お客様には、何も送らない） =====
+// 「契約状況一覧」で、状況が「フォーム作成済」ではない店舗（未作成・要確認）を、「案内未送付一覧」シートに書き出す。
+function listNotInvited() {
+  const ss = invGetSpreadsheet();
+  const src = ss.getSheetByName("契約状況一覧");
+  if (!src) throw new Error("「契約状況一覧」シートが見つかりません。");
+  const values = src.getDataRange().getDisplayValues();
+  const head = values[0];
+  const idx = name => head.indexOf(name);
+  const cols = ["状況", "店舗名", "契約者", "送信先アドレス", "理由", "その他のアドレス（優先順）", "形式が正しくないもの", "契約管理URL"];
+  if (cols.some(c => idx(c) < 0)) throw new Error("「契約状況一覧」の見出しが、想定と違います。");
+  const rows = values.slice(1).filter(r => r[idx("状況")] && r[idx("状況")] !== "フォーム作成済")
+    .map(r => cols.map(c => r[idx(c)]));
+  rows.sort((a, b) => a[0].localeCompare(b[0], "ja") || a[4].localeCompare(b[4], "ja"));
+  let out = ss.getSheetByName("案内未送付一覧");
+  if (!out) out = ss.insertSheet("案内未送付一覧");
+  out.clear();
+  out.getRange(1, 1, 1, cols.length).setValues([cols]);
+  if (rows.length > 0) out.getRange(2, 1, rows.length, cols.length).setValues(rows);
+  const counts = {};
+  rows.forEach(r => { counts[r[0]] = (counts[r[0]] || 0) + 1; });
+  console.log(`案内を送っていない店舗: ${rows.length} 件 ${JSON.stringify(counts)}。シート「案内未送付一覧」に書き出しました。`);
+}
