@@ -194,6 +194,11 @@ function collectFormResponses() {
     const savedCursor = Number(props.getProperty(RESP_CURSOR_PROPERTY) || 0);
     nextIndex = savedCursor < forms.length ? savedCursor : 0;
 
+    // 見出しが違うと、前回までの集計（控えメールの印も）が消えて、お客様に控えメールが重複して届くため、作り直さずに止める
+    const existingSheet = ss.getSheetByName(RESP_OUTPUT_SHEET_NAME);
+    if (existingSheet && existingSheet.getLastRow() > 1 && existingSheet.getRange(1, 1, 1, outputHeader.length).getDisplayValues()[0].join("\t") !== outputHeader.join("\t")) {
+      throw new Error(`「${RESP_OUTPUT_SHEET_NAME}」シートの見出しが、今のものと違うため、集計を止めました（前回までの集計を消さないため）。見出しを元に戻してください。作り直す場合は、シートの中身を消してから、もう一度実行してください。`);
+    }
     const rowsByStore = respLoadExistingRows(ss, outputHeader);
     const mailedByStore = {};                       // 今回、控えメールを送った（または送ろうとした）店舗
     const mailSettings = respGetMailSettings();
