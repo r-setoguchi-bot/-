@@ -392,7 +392,8 @@ function respLoadExistingRows(ss, outputHeader, quiet) {
   const sheet = ss.getSheetByName(RESP_OUTPUT_SHEET_NAME);
   if (!sheet || sheet.getLastRow() < 2) return rowsByStore;
 
-  const values = sheet.getDataRange().getDisplayValues();
+  // W列より右は、集計の列ではない（COUNTIFなど、人が入れた式や見出し）。見出しの比較にも、読み込みにも含めない
+  const values = sheet.getRange(1, 1, sheet.getLastRow(), outputHeader.length).getDisplayValues();
   if (values[0].join("\t") !== outputHeader.join("\t")) {
     if (!quiet) console.warn("「回答集計」シートの見出しが今のものと違うため、前回までの集計は引き継がずに作り直します。");
     return rowsByStore;
@@ -424,7 +425,7 @@ function respWriteOutputSheet(ss, outputHeader, rowsByStore, mailedByStore) {
     return base.concat([afterRequest], keep);
   }).sort((a, b) => (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0)); // 回答が古い順
 
-  sheet.clear();
+  sheet.getRange(1, 1, sheet.getMaxRows(), outputHeader.length).clear();   // 集計の列（A〜V列）だけ消す。W列より右の、人が入れた式は残す
   sheet.getRange(1, 1, rows.length + 1, outputHeader.length).setValues([outputHeader].concat(rows));
 
   if (rows.length > 0) {
