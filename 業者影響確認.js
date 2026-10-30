@@ -64,3 +64,23 @@ function listVendorImpact() {
   const noguchiAffected = rows.filter(r => r[0].indexOf("1/4") === 0).length;
   console.log(`光栄和・野口興業の店舗: ${rows.length} 件。影響あり: 光栄和(12/29) ${koeiwaAffected} 件、野口興業(1/4) ${noguchiAffected} 件。シート「${VENDOR_IMPACT_SHEET_NAME}」に書き出しました（kintone は変更していません）。`);
 }
+
+// ===== 指定した店舗の、契約種別・収集業者・回収曜日を、ログに出す（影響の一覧と、手元の一覧の差を調べる用） =====
+// 読み取りだけ。店名は、全角半角・空白の違いを無視して、部分一致で探す。
+const VENDOR_CHECK_NAMES = ["株式会社オシエテ", "ルマイン池袋"];
+
+function checkVendorOfStores() {
+  const config = klistGetKintoneConfig();
+  const fieldCodes = klistResolveFieldCodes(config);
+  const records = klistFetchRecords(config, fieldCodes);
+  const norm = text => String(text).normalize("NFKC").replace(/\s/g, "");
+  VENDOR_CHECK_NAMES.forEach(name => {
+    const hits = records.filter(record => norm(klistValue(record, fieldCodes.storeName)).indexOf(norm(name)) !== -1);
+    if (hits.length === 0) { console.log(`【${name}】 kintone の契約管理に、見つかりません。`); return; }
+    hits.forEach(record => {
+      const flags = klistWeekdayFlags(klistSelectedOptions(record, fieldCodes.burnable));
+      const weekdays = KLIST_WEEKDAYS.split("").filter((_, i) => flags[i]).join("");
+      console.log(`【${name}】 レコード番号=${record.$id.value} / 店名=${klistValue(record, fieldCodes.storeName)} / 契約種別=${klistValue(record, fieldCodes.contractType)} / 収集業者=${klistValue(record, fieldCodes.vendor)} / 可燃の回収曜日=${weekdays || "（なし）"} / 市区町村=${klistValue(record, KLIST_ADDRESS_CODES.city)}`);
+    });
+  });
+}
