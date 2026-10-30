@@ -23,8 +23,9 @@ const EXTRA_DATE_TARGET_SHEET = "追加日程の対象";
 const EXTRA_DATE_PENDING_SHEET = "追加日程 回答状況";
 // あなたが個別に対応するお客様（自動の対象から外す）。全角半角・空白の違いは、無視する
 const EXTRA_DATE_EXCLUDE_CUSTOMERS = ["株式会社鶏ヤロー", "ＤｉｎｅＶｉｔａ　Ｇｒｏｕｐ株式会社"];
-// 「業者影響確認」と「リスト」で、店名が違う店舗（業者影響確認の「店名|契約者」→ リストの店名）
-const EXTRA_DATE_STORE_ALIASES = { "炭火と酒　くろや　田町店|株式会社集Ｅｎｔｅｒｐｒｉｓｅ": "くろや" };
+// 「業者影響確認」と「リスト」で、店名が違う店舗（業者影響確認の「店名|契約者」→ リストの店名）。今は、なし
+// （「炭火と酒　くろや　田町店」は、リストの「くろや」とは別の店舗。リストに行がないので、フォームがない）
+const EXTRA_DATE_STORE_ALIASES = {};
 
 function extraNorm_(text) { return String(text).normalize("NFKC").replace(/\s/g, ""); }
 
