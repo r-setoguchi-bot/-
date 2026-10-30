@@ -93,6 +93,7 @@ const RESP_COL_STORE = 0;   // A列: 店舗名
 const RESP_COL_EMAIL = 1;   // B列: メールアドレス
 const RESP_COL_DATE_START = 3;  // D列〜H列: 希望日（「○」の日だけ設問がある）
 const RESP_COL_DATE_END = 7;
+const RESP_COL_EXTRA_DATES = [18, 19];  // S列・T列: 業者の日程の追加で足した希望日（12/29・1/4など。「○」の日だけ設問がある）。見出しが空なら使わない
 const RESP_COL_FORM_URL = 8;    // I列: フォームURL
 const RESP_COL_FORM_ID = 9;     // J列: フォームID
 const RESP_COL_STATUS = 10;     // K列: フォーム作成状況
@@ -185,7 +186,7 @@ function collectFormResponses() {
       throw new Error(`シート「${RESP_LIST_SHEET_NAME}」が見つかりません。`);
     }
     const data = listSheet.getDataRange().getDisplayValues();
-    const headers = data[0].slice(RESP_COL_DATE_START, RESP_COL_DATE_END + 1);
+    const headers = data[0].slice(RESP_COL_DATE_START, RESP_COL_DATE_END + 1).concat(RESP_COL_EXTRA_DATES.map(col => data[0][col] || ""));
     const outputHeader = respBuildOutputHeader(headers);
     const forms = respGroupFormsFromList(data);
     totalForms = forms.length;
@@ -203,7 +204,8 @@ function collectFormResponses() {
     const mailedByStore = {};                       // 今回、控えメールを送った（または送ろうとした）店舗
     const mailSettings = respGetMailSettings();
     const mailedColumn = outputHeader.indexOf(RESP_HEADER_MAILED);
-    const dateHeaders = headers.filter(h => h);
+    const dateHeaders = headers.slice(0, RESP_COL_DATE_END - RESP_COL_DATE_START + 1).filter(h => h);
+    const extraHeaders = headers.slice(RESP_COL_DATE_END - RESP_COL_DATE_START + 1).filter(h => h);
 
     while (nextIndex < forms.length) {
       if (Date.now() - startTime > RESP_TIME_LIMIT_MS) break;
@@ -214,7 +216,7 @@ function collectFormResponses() {
         if (rows.length > 0) {
           const before = rowsByStore[rows[0][0]];
           const previousMailed = before && before[mailedColumn] ? before[mailedColumn] : "";
-          const mark = respSendReceiptIfNeeded(form, rows, dateHeaders, previousMailed, mailSettings);
+          const mark = respSendReceiptIfNeeded(form, rows, dateHeaders, previousMailed, mailSettings, extraHeaders);
           rows.forEach(row => {
             if (mark) mailedByStore[row[0]] = mark;
           });
@@ -280,15 +282,17 @@ function closeRequestedForms() {
 }
 
 // 「回答集計」シートの見出し（日付の列は、「リスト」の見出しのうち空でないもの）
+// 通常の希望日（D〜H列）は今までの位置、業者の日程の追加で足した希望日（S・T列）は、いちばん右に並べる（既存の列の位置を動かさない）
 function respBuildOutputHeader(headers) {
-  return ["店舗名", "回答日時", "特別回収"].concat(headers.filter(h => h),
+  const normalCount = RESP_COL_DATE_END - RESP_COL_DATE_START + 1;
+  return ["店舗名", "回答日時", "特別回収"].concat(headers.slice(0, normalCount).filter(h => h),
     ["ご担当者名", "電話番号", "コメント", "メールアドレス", "フォームID", "回答回数", "再回答", "依頼後の回答"],
-    RESP_KEEP_HEADERS);
+    RESP_KEEP_HEADERS, headers.slice(normalCount).filter(h => h));
 }
 
 // 見出しから、店舗ごとの行のうち「フォームの回答から作る部分」の列数を求める（店舗名〜再回答）
 function respBaseLength(outputHeader) {
-  return outputHeader.length - 1 - RESP_KEEP_HEADERS.length;
+  return outputHeader.indexOf(RESP_HEADER_REQUESTED) - 1;
 }
 
 // 「リスト」から、フォームごとの店舗（と、設問のある日）を取り出す
@@ -308,7 +312,7 @@ function respGroupFormsFromList(data) {
       name: row[RESP_COL_STORE],
       email: row[RESP_COL_EMAIL],
       address: String(row[RESP_COL_ADDRESS] || "").trim(),
-      offered: row.slice(RESP_COL_DATE_START, RESP_COL_DATE_END + 1).map(mark => mark === "○")
+      offered: row.slice(RESP_COL_DATE_START, RESP_COL_DATE_END + 1).concat(RESP_COL_EXTRA_DATES.map(col => row[col] || "")).map(mark => mark === "○")
     });
   }
   return forms;
@@ -335,8 +339,10 @@ function respReadFormResponses(form, headers) {
       reresponse = same ? RESP_RERESPONSE_SAME : RESP_RERESPONSE_CHANGED;
     }
 
-    return [store.name, answeredAt, current.wantLabel].concat(current.dateCells,
-      [parsed.contactName, parsed.phone, parsed.comment, store.email, form.formId, responses.length, reresponse]);
+    const normalCount = headers.slice(0, RESP_COL_DATE_END - RESP_COL_DATE_START + 1).filter(h => h).length;
+    return [store.name, answeredAt, current.wantLabel].concat(current.dateCells.slice(0, normalCount),
+      [parsed.contactName, parsed.phone, parsed.comment, store.email, form.formId, responses.length, reresponse],
+      current.dateCells.slice(normalCount));   // 業者の日程の追加で足した希望日は、行の最後に付ける
   });
 }
 
@@ -414,15 +420,20 @@ function respWriteOutputSheet(ss, outputHeader, rowsByStore, mailedByStore) {
   // 書き込む直前のシートから、手入力・自動記録の列（業者依頼済など）を取り込む
   const current = respLoadExistingRows(ss, outputHeader, true);
 
+  const extraCount = outputHeader.length - outputHeader.indexOf(RESP_HEADER_MAILED) - 1;
   const rows = Object.keys(rowsByStore).map(store => {
-    const base = rowsByStore[store].slice(0, baseLength);
+    const full = rowsByStore[store];
+    const base = full.slice(0, baseLength);
+    // 今回フォームから読んだ行は「基本の列＋追加の希望日」、前回までの集計から引き継いだ行は「全列」。追加の希望日を取り出す
+    const extras = (full.length === outputHeader.length ? full.slice(baseLength + 1 + RESP_KEEP_HEADERS.length) : full.slice(baseLength));
+    while (extras.length < extraCount) extras.push("");
     const kept = current[store] ? current[store].slice(baseLength + 1) : [];
     const keep = RESP_KEEP_HEADERS.map((_, i) => kept[i] || "");
     if (mailedByStore && mailedByStore[store]) keep[RESP_KEEP_HEADERS.indexOf(RESP_HEADER_MAILED)] = mailedByStore[store];
     const requestedAt = keep[1];
     const answeredAt = base[1];
     const afterRequest = requestedAt && answeredAt > requestedAt ? "あり" : "";
-    return base.concat([afterRequest], keep);
+    return base.concat([afterRequest], keep, extras.slice(0, extraCount));
   }).sort((a, b) => (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0)); // 回答が古い順
 
   sheet.getRange(1, 1, sheet.getMaxRows(), outputHeader.length).clear();   // 集計の列（A〜V列）だけ消す。W列より右の、人が入れた式は残す
@@ -540,7 +551,7 @@ function respGetMailSettings() {
 
 // 回答1件につき、控えメールを1回だけ送る。送った（または送れなかった）印の文字列を返す。何もしなかったときは空文字
 //   印: 回答日時のみ=お客様に送信済 / 「テスト:」+回答日時=テスト送信済 / 「失敗:」+回答日時=送信を試みて失敗（自動では再送しない）
-function respSendReceiptIfNeeded(form, rows, dateHeaders, previousMailed, mail) {
+function respSendReceiptIfNeeded(form, rows, dateHeaders, previousMailed, mail, extraHeaders) {
   if (mail.mode === "off") return "";
   previousMailed = respNormalizeMark_(previousMailed);   // シートの表示（例: 9:41:03）と、こちらの形式（09:41:03）の違いで、二重に送らないようにそろえる
 
@@ -561,7 +572,7 @@ function respSendReceiptIfNeeded(form, rows, dateHeaders, previousMailed, mail) 
 
   const addresses = {};
   form.stores.forEach(store => { addresses[store.name] = store.address; });
-  const message = respBuildReceiptMail(rows, dateHeaders, form.formUrl, addresses);
+  const message = respBuildReceiptMail(rows, dateHeaders, form.formUrl, addresses, extraHeaders);
   const subjectPrefix = mail.mode === "test" ? "【テスト】" : "";
   const bodyPrefix = mail.mode === "test" ? `（テスト送信です。本来の宛先: ${customerEmail}）\n\n` : "";
   const options = { to: to, subject: subjectPrefix + message.subject, body: bodyPrefix + message.body, name: RESP_MAIL_SENDER_NAME };
@@ -661,7 +672,7 @@ function respGraphSend_(options) {
 }
 
 // 1つのフォームの回答（店舗ごとの行）から、控えメールの件名と本文を作る
-function respBuildReceiptMail(rows, dateHeaders, formUrl, addresses) {
+function respBuildReceiptMail(rows, dateHeaders, formUrl, addresses, extraHeaders) {
   const D = dateHeaders.length;
   const first = rows[0];
   const answeredAt = first[1];
@@ -681,6 +692,9 @@ function respBuildReceiptMail(rows, dateHeaders, formUrl, addresses) {
     address: (addresses || {})[row[0]] || "",
     want: row[2],
     days: dateHeaders.map((header, i) => ({ header: header, cell: row[3 + i] }))
+      // 業者の日程の追加で足した希望日は、希望の有無を答えた店舗にだけ載せ、日付の順に並べる
+      .concat((extraHeaders || []).map((header, i) => ({ header: header, cell: row[3 + D + 7 + i] })).filter(d => d.cell === "○" || d.cell === "×"))
+      .sort((a, b) => respDayOrder_(a.header) - respDayOrder_(b.header))
   }));
 
   const lines = [];
@@ -734,6 +748,14 @@ function respBuildReceiptMail(rows, dateHeaders, formUrl, addresses) {
 
   const subject = responseCount > 1 ? RESP_MAIL_SUBJECT.replace("の控え", "の控え（再回答）") : RESP_MAIL_SUBJECT;
   return { subject: subject, body: lines.join("\n"), htmlBody: h.join("") };
+}
+
+// 「12月29日(火)」「1月4日(月)」のような見出しを、日付の順に並べるための数にする（12月→1月の順）
+function respDayOrder_(header) {
+  const m = /(\d{1,2})月(\d{1,2})日/.exec(String(header).normalize("NFKC"));
+  if (!m) return 0;
+  const month = Number(m[1]) >= 6 ? Number(m[1]) : Number(m[1]) + 12;
+  return month * 100 + Number(m[2]);
 }
 
 // 控えメールの文面を確かめるため、サンプルのメールを RESP_MAIL_TEST_TO に送る（お客様には送らない）
