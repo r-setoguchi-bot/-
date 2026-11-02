@@ -115,3 +115,31 @@ function countRowsWaitingForForm() {
   console.log(`フォームを作る対象（状況が空でアドレスのある行）: ${waiting.length} 行。`);
   waiting.forEach(w => console.log(w));
 }
+
+// 「契約状況一覧」で「未作成」の店舗が、「リスト_kintone」「リスト」のどこにあるかを調べて、シート「未作成の内訳」に書き出す（読み取りと、このシートへの書き出しだけ）
+function diagnoseUnformedStores() {
+  const ss = invGetSpreadsheet();
+  const status = ss.getSheetByName("契約状況一覧").getDataRange().getDisplayValues();
+  const sh = status[0];
+  const iStore = sh.indexOf("店舗名"), iCust = sh.indexOf("契約者"), iState = sh.indexOf("状況"), iReason = sh.indexOf("理由");
+  const kint = ss.getSheetByName("リスト_kintone").getDataRange().getDisplayValues();
+  const list = ss.getSheetByName(INV_LIST_SHEET_NAME).getDataRange().getDisplayValues();
+  const kintMap = {}, listMap = {};
+  for (let i = 1; i < kint.length; i++) kintMap[newcKey_(kint[i][0], kint[i][16])] = i + 1;
+  for (let i = 1; i < list.length; i++) listMap[newcKey_(list[i][0], list[i][16])] = i + 1;
+  const rows = [];
+  for (let i = 1; i < status.length; i++) {
+    if (status[i][iState] !== "未作成") continue;
+    const key = newcKey_(status[i][iStore], status[i][iCust]);
+    const lr = listMap[key];
+    rows.push([status[i][iStore], status[i][iCust], kintMap[key] ? "ある（" + kintMap[key] + "行）" : "ない", lr ? "ある（" + lr + "行）" : "ない",
+      lr ? (list[lr - 1][10] || "（空）") : "", lr ? (list[lr - 1][9] ? "あり" : "なし") : "", status[i][iReason] || ""]);
+  }
+  let out = ss.getSheetByName("未作成の内訳");
+  if (!out) out = ss.insertSheet("未作成の内訳");
+  out.clear();
+  const head = ["店舗名", "契約者", "リスト_kintone", "リスト", "リストの状況", "リストにフォームID", "契約状況一覧の理由"];
+  out.getRange(1, 1, 1, head.length).setValues([head]);
+  if (rows.length > 0) out.getRange(2, 1, rows.length, head.length).setValues(rows);
+  console.log(`「未作成」の店舗: ${rows.length} 件。リスト_kintoneにない: ${rows.filter(r => r[2] === "ない").length} 件、リストにある: ${rows.filter(r => r[3] !== "ない").length} 件。シート「未作成の内訳」に書き出しました。`);
+}
