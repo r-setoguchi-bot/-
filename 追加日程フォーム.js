@@ -15,8 +15,8 @@
 const EXTRA_DATE_HEADERS = ["12月29日(火)", "1月4日(月)"];
 const EXTRA_DATE_COLS = [18, 19];                 // 「リスト」の S列・T列（0始まり）
 const EXTRA_DATE_VENDOR_FEES = { "12月29日(火)": { "光栄和": "8,000円" } };   // 日付ごとの、業者別の料金（なければ、店舗の通常の特別回収料金）
-const EXTRA_DATE_NOTICE_MARK = "【日程追加のお知らせ】";
-const EXTRA_DATE_FORM_NOTICE = "【日程追加のお知らせ】一部の店舗で、収集業者の都合により、特別回収の日が追加されました。該当する店舗のページに「【日程追加のお知らせ】」と書いてあります。すでにご回答いただいた方も、追加された日について、お手数ですが、改めてご回答ください（前回と同じ内容を選んだうえで、追加の日もお答えください。最新のご回答を有効とします）。";
+const EXTRA_DATE_NOTICE_MARK = "【収集日のお知らせ】";
+const EXTRA_DATE_FORM_NOTICE = "【収集日のお知らせ】一部の店舗では、収集業者の年末年始の営業の都合により、通常の収集ができなくなった日があり、その日は有料の特別回収となります。ご迷惑をおかけし、申し訳ございません。該当する店舗のページに「【収集日のお知らせ】」と書いてあります。すでにご回答いただいた方も、お手数ですが、その日について改めてご回答ください（最新のご回答を有効とします）。ご回答がない場合、その日の収集は行いません。";
 const EXTRA_DATE_MODE_PROPERTY = "EXTRA_DATE_MODE";
 const EXTRA_DATE_RECORD_SHEET = "追加日程 設問追加記録";
 const EXTRA_DATE_TARGET_SHEET = "追加日程の対象";
@@ -179,11 +179,11 @@ function addExtraDateQuestion_(formId, store, header, vendor, dryRun, noticedFor
     .setTitle(questionTitle)
     .setChoiceValues(["希望する", "希望しない"])
     .setRequired(true)
-    .setHelpText(`${EXTRA_DATE_NOTICE_MARK}${header}の特別回収が追加されました。特別回収料金：${fee}/1日`);
+    .setHelpText(`${EXTRA_DATE_NOTICE_MARK}${header}は、収集業者の営業の都合により通常の収集ができず、特別回収（有料）となります。特別回収料金：${fee}/1日。ご回答がない場合、この日の収集は行いません。`);
   form.moveItem(question.getIndex(), last + 1);
 
   const sectionHeader = items[headerIndex].asSectionHeaderItem();
-  const note = `${EXTRA_DATE_NOTICE_MARK}${header}の特別回収が追加されました（${fee}/1日）。`;
+  const note = `${EXTRA_DATE_NOTICE_MARK}${header}は通常の収集ができず、特別回収（有料：${fee}/1日）となります。`;
   if (sectionHeader.getHelpText().indexOf(note) === -1) sectionHeader.setHelpText(`${sectionHeader.getHelpText()}\n${note}`);
 
   if (!noticedForms.has(formId)) {
