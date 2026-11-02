@@ -60,7 +60,10 @@ function migrateResponseSheetForExtraDates() {
 }
 
 // 5. 対象の店舗に「○」を入れる（「業者影響確認」シートと、「リスト」から）
-function prepareExtraDates() {
+// 新しく「リスト」に足した行（フォームがまだない行）に、「○」を入れる。フォームを作る前に実行する（フォーム作成に、追加の日の設問が入る）
+function prepareExtraDatesForNewRows() { prepareExtraDates(true); }
+
+function prepareExtraDates(forNewRows) {
   const ss = invGetSpreadsheet();
   const impactSheet = ss.getSheetByName("業者影響確認");
   if (!impactSheet) throw new Error("先に listVendorImpact を実行してください。");
@@ -88,7 +91,10 @@ function prepareExtraDates() {
     const rowIndex = rowByKey[extraNorm_(listName) + "|" + extraNorm_(customer)];
     if (rowIndex === undefined) { report.push([store, customer, header, "", "「リスト」に行がない（フォームを新しく作る必要あり）"]); return; }
     const listRow = listValues[rowIndex];
-    if (!listRow[9] || listRow[10] !== "送信済") { report.push([store, customer, header, rowIndex + 1, "フォームがない、または状況が送信済ではない"]); return; }
+    const ready = forNewRows === true
+      ? (!listRow[9] && listRow[10] !== "送信済" && listRow[10] !== "除外")
+      : (listRow[9] && listRow[10] === "送信済");
+    if (!ready) { report.push([store, customer, header, rowIndex + 1, forNewRows === true ? "新しい行ではない（フォームがある、または除外）" : "フォームがない、または状況が送信済ではない"]); return; }
     const cell = list.getRange(rowIndex + 1, EXTRA_DATE_COLS[dateIndex] + 1);
     if (cell.getDisplayValue() === "○") { report.push([store, customer, header, rowIndex + 1, "すでに「○」が入っている"]); return; }
     cell.setValue("○");

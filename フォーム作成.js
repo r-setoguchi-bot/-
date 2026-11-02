@@ -336,6 +336,18 @@ ${deadlineText}◆ 次の画面で、店舗ごとに、各日の回収を「希�
       }
     });
 
+    // 業者の日程の追加（12/29・1/4）の設問。「リスト」の S列・T列が「○」の店舗だけ（追加日程フォーム.js を使う）
+    if (typeof addExtraDateQuestion_ === "function" && typeof EXTRA_DATE_COLS !== "undefined") {
+      const noticedForms = new Set();
+      stores.forEach(store => {
+        EXTRA_DATE_COLS.forEach((col, k) => {
+          if (store.rowData[col] !== "○") return;
+          const outcome = addExtraDateQuestion_(form.getId(), store.storeName, EXTRA_DATE_HEADERS[k], store.vendor, false, noticedForms);
+          if (outcome.indexOf("追加した") !== 0) throw new Error(`追加の日の設問を足せませんでした: ${store.storeName} / ${EXTRA_DATE_HEADERS[k]} / ${outcome}`);
+        });
+      });
+    }
+
     return {
       formUrl: form.getPublishedUrl(),
       formId: form.getId(),
