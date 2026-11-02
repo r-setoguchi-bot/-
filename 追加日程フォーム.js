@@ -180,7 +180,8 @@ function addExtraDateQuestion_(formId, store, header, vendor, dryRun, noticedFor
     .setChoiceValues(["希望する", "希望しない"])
     .setRequired(true)
     .setHelpText(`${EXTRA_DATE_NOTICE_MARK}${header}は、収集業者の営業の都合により通常の収集ができず、特別回収（有料）となります。特別回収料金：${fee}/1日。ご回答がない場合、この日の収集は行いません。`);
-  form.moveItem(question.getIndex(), last + 1);
+  // 12/29 は、日付順にするため、その店舗のページの、いちばん上（見出しの次）に置く。それ以外は、最後に置く
+  form.moveItem(question.getIndex(), header === EXTRA_DATE_HEADERS[0] ? headerIndex + 1 : last + 1);
 
   const sectionHeader = items[headerIndex].asSectionHeaderItem();
   const note = `${EXTRA_DATE_NOTICE_MARK}${header}は通常の収集ができず、特別回収（有料：${fee}/1日）となります。`;
@@ -230,4 +231,29 @@ function listExtraDatePending() {
   if (rows.length > 0) out.getRange(2, 1, rows.length, head.length).setValues(rows);
   const count = label => rows.filter(r => r[0] === label).length;
   console.log(`追加の日程の対象 ${rows.length} 件: 回答済み・追加の日が未回答 ${count("回答済み・追加の日が未回答")} 件、未回答（フォーム全体）${count("未回答（フォーム全体）")} 件、追加の日も回答済み ${count("追加の日も回答済み")} 件。シート「${EXTRA_DATE_PENDING_SHEET}」に書き出しました。`);
+}
+
+// 12/29 の設問を、その店舗のページの、いちばん上（見出しの次）に置き直す（日付順にするため）。すでに、その位置なら、何もしない。
+// 「追加日程 設問追加記録」シートに記録のある 12/29 の設問だけが、対象
+function fixExtraDateOrder() {
+  const record = invGetSpreadsheet().getSheetByName(EXTRA_DATE_RECORD_SHEET);
+  if (!record || record.getLastRow() < 2) { console.log("記録がありません。"); return; }
+  const rows = record.getRange(2, 1, record.getLastRow() - 1, 3).getDisplayValues().filter(r => r[2] === EXTRA_DATE_HEADERS[0]);
+  let moved = 0, already = 0, failed = 0;
+  rows.forEach(r => {
+    try {
+      const form = FormApp.openById(r[0]);
+      const items = form.getItems();
+      const headerIndex = items.findIndex(item => item.getType() === FormApp.ItemType.SECTION_HEADER && item.getTitle() === `【${r[1]}】の収集希望について`);
+      const question = items.find(item => item.getTitle() === `【${r[1]}】${r[2]}の収集を希望しますか？`);
+      if (headerIndex < 0 || !question) { failed++; console.error(`見つかりません: ${r[1]}`); return; }
+      if (question.getIndex() === headerIndex + 1) { already++; return; }
+      form.moveItem(question.getIndex(), headerIndex + 1);
+      moved++;
+    } catch (e) {
+      failed++;
+      console.error(`置き直せませんでした: ${r[1]} / ${e}`);
+    }
+  });
+  console.log(`12/29 の設問 ${rows.length} 件: 置き直した ${moved} 件、すでに正しい位置 ${already} 件、失敗 ${failed} 件。`);
 }
