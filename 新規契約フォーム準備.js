@@ -143,3 +143,40 @@ function diagnoseUnformedStores() {
   if (rows.length > 0) out.getRange(2, 1, rows.length, head.length).setValues(rows);
   console.log(`「未作成」の店舗: ${rows.length} 件。リスト_kintoneにない: ${rows.filter(r => r[2] === "ない").length} 件、リストにある: ${rows.filter(r => r[3] !== "ない").length} 件。シート「未作成の内訳」に書き出しました。`);
 }
+
+// ===== 新しく作ったフォームだけ、お客様が回答できる設定にする =====
+// 「リスト」の NEWC_FIRST_ROW 行目以降のフォームだけ、①ログイン必須の解除、②リンクを知っている全員が回答できる設定、にする。
+// 全フォームを見る startFixFormLogin / startOpenFormAccess（設定確認.js）より、はるかに少ない回数で済む。何度実行しても、同じ結果になる
+const NEWC_FIRST_ROW = 1140;
+
+function fixAccessForNewForms() {
+  const startTime = Date.now();
+  const list = invGetSpreadsheet().getSheetByName(INV_LIST_SHEET_NAME).getDataRange().getDisplayValues();
+  const ids = [];
+  for (let i = NEWC_FIRST_ROW - 1; i < list.length; i++) {
+    const id = list[i][9];
+    if (id && list[i][10] === "送信済" && ids.indexOf(id) === -1) ids.push(id);
+  }
+  let login = 0, loginAlready = 0, access = 0, accessAlready = 0, errors = 0, remaining = 0;
+  for (let n = 0; n < ids.length; n++) {
+    if (Date.now() - startTime > 4.5 * 60 * 1000) { remaining = ids.length - n; break; }
+    const id = ids[n];
+    try {
+      const form = openAccessRetry_(() => FormApp.openById(id));
+      if (form.requiresLogin()) {
+        openAccessRetry_(() => form.setRequireLogin(false));
+        if (form.requiresLogin()) throw new Error("ログイン必須を解除できませんでした");
+        login++;
+      } else {
+        loginAlready++;
+      }
+      const result = openAccessRetry_(() => openAccessOne_(id));
+      if (result === "changed") access++; else accessAlready++;
+    } catch (e) {
+      errors++;
+      console.error(`設定できませんでした: 末尾=${String(id).slice(-6)} / ${e}`);
+    }
+    Utilities.sleep(1000);
+  }
+  console.log(`新しいフォーム ${ids.length} 件: ログイン必須を解除 ${login} 件（もともと不要 ${loginAlready} 件）、全員が回答できる設定に変更 ${access} 件（もともと全員可 ${accessAlready} 件）、エラー ${errors} 件。` + (remaining > 0 ? `時間切れで ${remaining} 件が残りました。もう一度実行してください。` : ""));
+}
