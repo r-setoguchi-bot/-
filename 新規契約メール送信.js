@@ -32,6 +32,9 @@ function listNewContractMailTargets() {
   for (let i = 1; i < NEWC_FIRST_ROW - 1 && i < list.length; i++) {
     if (list[i][9] && list[i][10] === "送信済" && list[i][16]) hadForm.add(extraNorm_(list[i][16]));   // 同じ契約者（会社）。アドレスが違っていても、同じ会社なら「あり」
   }
+  // 新しい行より前から、あるフォーム（新店舗を、今あるフォームに足したときは、ここに当たる）
+  const existingFormIds = new Set();
+  for (let i = 1; i < NEWC_FIRST_ROW - 1 && i < list.length; i++) if (list[i][9] && list[i][10] === "送信済") existingFormIds.add(list[i][9]);
   const byForm = {};
   const rows = [];
   for (let i = NEWC_FIRST_ROW - 1; i < list.length; i++) {
@@ -46,7 +49,7 @@ function listNewContractMailTargets() {
   }
   const outRows = rows.map(t => [
     t.stores.join("\n"), t.customer, t.email,
-    hadForm.has(extraNorm_(t.customer)) ? "あり" : "",
+    existingFormIds.has(t.formId) ? "追加" : (hadForm.has(extraNorm_(t.customer)) ? "あり" : ""),
     hold.some(h => extraNorm_(t.customer).indexOf(h) !== -1) ? "保留" : "",
     t.formId, t.url
   ]);
@@ -64,10 +67,48 @@ function newcMailTargets_() {
   if (!sheet || sheet.getLastRow() < 2) throw new Error(`先に listNewContractMailTargets を実行して、「${NEWCMAIL_LIST_SHEET_NAME}」を作ってください。`);
   return sheet.getRange(2, 1, sheet.getLastRow() - 1, 7).getDisplayValues()
     .filter(row => row[5] && row[4] !== "保留")
-    .map(row => ({ stores: String(row[0]).split("\n"), customer: row[1], email: String(row[2] || "").trim(), note: row[3] === "あり", formId: row[5], url: row[6], key: row[5] }));
+    .map(row => ({ stores: String(row[0]).split("\n"), customer: row[1], email: String(row[2] || "").trim(), note: row[3] === "あり", add: row[3] === "追加", formId: row[5], url: row[6], key: row[5] }));
+}
+
+// 新店舗を、今あるフォームに足したお客様向け。回答があれば、前回の回答を入力済みにしたリンクを付ける
+function newcMailBuildAdd_(target, resolved) {
+  const lines = [];
+  lines.push("ご担当者様", "");
+  lines.push("平素より大変お世話になっております。株式会社クリメンです。");
+  lines.push("この度は、新たな店舗のご契約をいただき、誠にありがとうございます。");
+  lines.push("年末年始の特別回収につきまして、新しい店舗の分も、ご希望をお伺いします。", "");
+  lines.push("新しい店舗は、以前お送りしたアンケートと同じフォームに、追加しました。", "");
+  if (target.customer) lines.push("【ご契約者】", target.customer, "");
+  lines.push("【新しい店舗】");
+  target.stores.forEach(store => lines.push(`・${store}`));
+  lines.push("");
+  lines.push(`■特別回収期間：${INV_PERIOD_TEXT}`);
+  lines.push("　※1月1日は回収できません。");
+  lines.push("■回収対象：可燃ごみのみ");
+  lines.push("■回収時間：各回収日の当日の早朝から午前中");
+  lines.push("■特別回収料金：店舗ごとに異なります。アンケート内の各店舗の設問でご確認ください。", "");
+  lines.push(`■ご回答期限：${INV_DEADLINE_TEXT}まで`, "");
+  if (resolved.answered) {
+    lines.push("下のリンクには、前回のご回答が入力済みです。フォームの最後にある、新しい店舗のページに、ご回答をお願いいたします（前回のご回答は、そのままで構いません）。");
+  } else {
+    lines.push("下記のアンケートフォームから、ご回答をお願いいたします。新しい店舗のページは、フォームの最後にあります。以前のアンケートに、まだご回答いただいていない場合は、すべての店舗のページに、ご回答ください。");
+  }
+  lines.push(resolved.url, "");
+  lines.push("【ご回答について】");
+  lines.push("・フォームの次の画面で、店舗ごとに、各日の回収を「希望する」「希望しない」からお選びください。");
+  lines.push("・特別回収を希望されない場合も、すべての日について「希望しない」を選択してご回答ください。");
+  lines.push("・通常の可燃回収曜日以外は回収できません。希望日は、回収に伺う日付でお選びください。");
+  lines.push("・ご回答のあと、回答内容の控えをこのメールアドレスにお送りします。");
+  lines.push("・回答内容を変更する場合は、同じフォームから再度ご回答ください（最新のご回答を有効とします）。");
+  lines.push(`　変更のご希望は${INV_DEADLINE_TEXT}までにお願いいたします。`, "");
+  if (INV_CONTACT) lines.push(`ご不明な点は、${INV_CONTACT}までご連絡ください。`, "");
+  if (INV_NOREPLY_TEXT) lines.push(INV_NOREPLY_TEXT, "");
+  lines.push("お忙しいところ恐れ入りますが、よろしくお願いいたします。", "", INV_SENDER_NAME);
+  return { subject: "【株式会社クリメン】年末年始（12/30〜1/3）の特別回収：新しい店舗のアンケートのお願い", body: lines.join("\n") };
 }
 
 function newcMailBuild_(target) {
+  if (target.add) return newcMailBuildAdd_(target, exmailResolve_(target));
   const lines = [];
   lines.push("ご担当者様", "");
   lines.push("平素より大変お世話になっております。株式会社クリメンです。");
@@ -109,13 +150,14 @@ function sendTestNewContractMails() {
   console.log(`対象: 全 ${targets.length} 通（保留を除く）。宛先が正しくないもの: ${invalid} 件。`);
   if (targets.length === 0) throw new Error("対象がありません。");
   const withNote = targets.filter(t => t.note)[0];
-  const withoutNote = targets.filter(t => !t.note)[0];
-  [withNote, withoutNote].filter(Boolean).forEach(target => {
+  const withoutNote = targets.filter(t => !t.note && !t.add)[0];
+  const withAdd = targets.filter(t => t.add)[0];
+  [withNote, withoutNote, withAdd].filter(Boolean).forEach(target => {
     const message = newcMailBuild_(target);
     invSend(testTo, "【テスト】" + message.subject, `（テスト送信です。本来の宛先: ${target.email}）\n\n` + message.body, from);
     Utilities.sleep(INV_GRAPH_INTERVAL_MS);
   });
-  console.log(`テストメールを ${testTo} に送りました（注記あり: ${withNote ? "送った" : "対象なし"}、注記なし: ${withoutNote ? "送った" : "対象なし"}）。送信元: ${from}`);
+  console.log(`テストメールを ${testTo} に送りました（注記あり: ${withNote ? "送った" : "対象なし"}、注記なし: ${withoutNote ? "送った" : "対象なし"}、今あるフォームに追加: ${withAdd ? "送った" : "対象なし"}）。送信元: ${from}`);
 }
 
 // 3. 本番の送信
@@ -153,7 +195,7 @@ function startNewContractMails() {
           result = INV_RESULT_FAILED;
         }
       }
-      logSheet.appendRow([target.key, target.email, target.stores.join("・"), target.note ? "別フォームの注記あり" : "", result, invFormatNow()]);
+      logSheet.appendRow([target.key, target.email, target.stores.join("・"), target.add ? "今あるフォームに追加" : (target.note ? "別フォームの注記あり" : ""), result, invFormatNow()]);
       SpreadsheetApp.flush();
       if (result === INV_RESULT_SENT) { sentCount++; Utilities.sleep(INV_GRAPH_INTERVAL_MS); } else { failedCount++; }
     }
