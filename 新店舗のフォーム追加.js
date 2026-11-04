@@ -11,21 +11,33 @@ const ADDSTORE_PLAN_SHEET = "新店舗のフォーム追加計画";
 const ADDSTORE_RECORD_SHEET = "新店舗 フォーム追加記録";
 const ADDSTORE_MODE_PROPERTY = "ADDSTORE_MODE";
 
+// アドレスが違っても、同じ契約者なら、今あるフォームに足す（お客様には、元のアドレスに送る）契約者。全角半角・空白の違いは、無視する
+const ADDSTORE_MATCH_BY_CUSTOMER = ["ＩＦＲＥＡ　ＤＩＮＩＮＧ", "エイブルジャパン"];
+
 function addstorePlan_() {
   const list = invGetSpreadsheet().getSheetByName(INV_LIST_SHEET_NAME).getDataRange().getDisplayValues();
   const existing = {};
+  const existingByCustomer = {};   // 同じ契約者の、今あるフォーム（日程変更の「○」がある行を、優先する）
   for (let i = 1; i < NEWC_FIRST_ROW - 1 && i < list.length; i++) {
     const r = list[i];
     if (!r[9] || r[10] !== "送信済" || !r[16]) continue;
     const key = String(r[1]).trim().toLowerCase() + "|" + extraNorm_(r[16]);
     if (!existing[key]) existing[key] = { formId: r[9], url: r[8] };
+    const ck = extraNorm_(r[16]);
+    const hasExtra = EXTRA_DATE_COLS.some(c => r[c] === "○");
+    if (!existingByCustomer[ck] || (hasExtra && !existingByCustomer[ck].hasExtra)) existingByCustomer[ck] = { formId: r[9], url: r[8], hasExtra: hasExtra };
   }
+  const byCustomerList = ADDSTORE_MATCH_BY_CUSTOMER.map(extraNorm_);
   const plan = [];
   for (let i = NEWC_FIRST_ROW - 1; i < list.length; i++) {
     const r = list[i];
     if (!r[9] || r[10] !== "送信済") continue;
     const key = String(r[1]).trim().toLowerCase() + "|" + extraNorm_(r[16]);
-    const ex = existing[key];
+    let ex = existing[key];
+    if (!ex) {
+      const ck = extraNorm_(r[16]);
+      if (byCustomerList.some(h => ck.indexOf(h) !== -1)) ex = existingByCustomer[ck];
+    }
     if (!ex || ex.formId === r[9]) continue;
     plan.push({ rowNumber: i + 1, store: r[0], customer: r[16], email: r[1], vendor: r[2], address: r[17], newFormId: r[9], exFormId: ex.formId, exUrl: ex.url, row: r });
   }
