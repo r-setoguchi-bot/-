@@ -27,10 +27,10 @@ function listNewContractMailTargets() {
 
   const list = ss.getSheetByName(INV_LIST_SHEET_NAME).getDataRange().getDisplayValues();
   const hold = EXMAIL_HOLD_CUSTOMERS.map(extraNorm_);
-  // 新しい行より前に、同じ会社・同じアドレスで、フォームがある店舗
+  // 新しい行より前に、同じ会社（契約者）で、フォームがある店舗
   const hadForm = new Set();
   for (let i = 1; i < NEWC_FIRST_ROW - 1 && i < list.length; i++) {
-    if (list[i][9] && list[i][10] === "送信済") hadForm.add(String(list[i][1]).trim().toLowerCase() + "|" + extraNorm_(list[i][16]));
+    if (list[i][9] && list[i][10] === "送信済" && list[i][16]) hadForm.add(extraNorm_(list[i][16]));   // 同じ契約者（会社）。アドレスが違っていても、同じ会社なら「あり」
   }
   const byForm = {};
   const rows = [];
@@ -46,7 +46,7 @@ function listNewContractMailTargets() {
   }
   const outRows = rows.map(t => [
     t.stores.join("\n"), t.customer, t.email,
-    hadForm.has(t.email.toLowerCase() + "|" + extraNorm_(t.customer)) ? "あり" : "",
+    hadForm.has(extraNorm_(t.customer)) ? "あり" : "",
     hold.some(h => extraNorm_(t.customer).indexOf(h) !== -1) ? "保留" : "",
     t.formId, t.url
   ]);
