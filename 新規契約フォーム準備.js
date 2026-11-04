@@ -180,3 +180,32 @@ function fixAccessForNewForms() {
   }
   console.log(`新しいフォーム ${ids.length} 件: ログイン必須を解除 ${login} 件（もともと不要 ${loginAlready} 件）、全員が回答できる設定に変更 ${access} 件（もともと全員可 ${accessAlready} 件）、エラー ${errors} 件。` + (remaining > 0 ? `時間切れで ${remaining} 件が残りました。もう一度実行してください。` : ""));
 }
+
+// ===== フォームの編集ができない原因を調べる（読み取りと、テスト店舗のフォームへの「同じ内容の書き直し」だけ。お客様のフォームは、変更しない）=====
+function diagnoseFormsAccess() {
+  const list = invGetSpreadsheet().getSheetByName(INV_LIST_SHEET_NAME).getDataRange().getDisplayValues();
+  const pick = {};
+  pick["新しいフォーム（1141行目）"] = list[NEWC_FIRST_ROW][9];
+  pick["古いフォーム（2行目）"] = list[1][9];
+  for (let i = 1; i < list.length; i++) if (list[i][0] === "テスト店舗（削除予定）") pick["テスト店舗のフォーム"] = list[i][9];
+  const me = Session.getEffectiveUser().getEmail();
+  console.log(`実行しているアカウントが、ドライブの所有者と同じか、を調べます。`);
+  Object.keys(pick).forEach(label => {
+    const id = pick[label];
+    const step = (name, fn) => {
+      try { const v = fn(); console.log(`${label} / ${name}: 成功${v === undefined ? "" : "（" + v + "）"}`); return true; }
+      catch (e) { console.error(`${label} / ${name}: 失敗 ${e}`); return false; }
+    };
+    if (!id) { console.error(`${label}: フォームIDが空です`); return; }
+    let form = null;
+    step("DriveApp でファイルを開く", () => DriveApp.getFileById(id).getName().slice(0, 8) + "…");
+    step("所有者が実行アカウントと同じか", () => DriveApp.getFileById(id).getOwner().getEmail() === me);
+    step("FormApp.openById", () => { form = FormApp.openById(id); });
+    if (form) {
+      step("題名を読む", () => form.getTitle().slice(0, 8) + "…");
+      step("回答受付かを読む", () => form.isAcceptingResponses());
+      step("ログイン必須かを読む", () => form.requiresLogin());
+      if (label === "テスト店舗のフォーム") step("説明を同じ内容で書き直す（編集のテスト）", () => { form.setDescription(form.getDescription()); });
+    }
+  });
+}
