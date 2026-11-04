@@ -157,28 +157,33 @@ function fixAccessForNewForms() {
     const id = list[i][9];
     if (id && list[i][10] === "送信済" && ids.indexOf(id) === -1) ids.push(id);
   }
-  let login = 0, loginAlready = 0, access = 0, accessAlready = 0, errors = 0, remaining = 0;
+  let login = 0, loginAlready = 0, loginSkipped = 0, access = 0, accessAlready = 0, errors = 0, remaining = 0;
   for (let n = 0; n < ids.length; n++) {
     if (Date.now() - startTime > 4.5 * 60 * 1000) { remaining = ids.length - n; break; }
     const id = ids[n];
+    // ログイン必須の確認は、いま「フォームを編集できませんでした」と出て読めないことがある。失敗しても先に進む
     try {
-      const form = openAccessRetry_(() => FormApp.openById(id));
+      const form = FormApp.openById(id);
       if (form.requiresLogin()) {
-        openAccessRetry_(() => form.setRequireLogin(false));
-        if (form.requiresLogin()) throw new Error("ログイン必須を解除できませんでした");
+        form.setRequireLogin(false);
         login++;
       } else {
         loginAlready++;
       }
+    } catch (e) {
+      loginSkipped++;
+    }
+    // お客様の回答に必要な設定: 回答者ビューを、リンクを知っている全員に共有する
+    try {
       const result = openAccessRetry_(() => openAccessOne_(id));
       if (result === "changed") access++; else accessAlready++;
     } catch (e) {
       errors++;
-      console.error(`設定できませんでした: 末尾=${String(id).slice(-6)} / ${e}`);
+      console.error(`全員が回答できる設定にできませんでした: 末尾=${String(id).slice(-6)} / ${e}`);
     }
-    Utilities.sleep(1000);
+    Utilities.sleep(500);
   }
-  console.log(`新しいフォーム ${ids.length} 件: ログイン必須を解除 ${login} 件（もともと不要 ${loginAlready} 件）、全員が回答できる設定に変更 ${access} 件（もともと全員可 ${accessAlready} 件）、エラー ${errors} 件。` + (remaining > 0 ? `時間切れで ${remaining} 件が残りました。もう一度実行してください。` : ""));
+  console.log(`新しいフォーム ${ids.length} 件: 全員が回答できる設定に変更 ${access} 件（もともと全員可 ${accessAlready} 件）、エラー ${errors} 件。ログイン必須: 解除 ${login} 件、もともと不要 ${loginAlready} 件、確認できず ${loginSkipped} 件。` + (remaining > 0 ? `時間切れで ${remaining} 件が残りました。もう一度実行してください。` : ""));
 }
 
 // ===== フォームの編集ができない原因を調べる（読み取りと、テスト店舗のフォームへの「同じ内容の書き直し」だけ。お客様のフォームは、変更しない）=====
