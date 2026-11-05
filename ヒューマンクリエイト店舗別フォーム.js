@@ -2,7 +2,7 @@
 // お客様には、メールを送らない（案内は、あなたが送る）。送信先アドレスの紐づけ（「リスト」のB列）は、変えない。
 //   1. previewHqSplit … 分ける対象を、ログに出す（変更しない）
 //   2. applyHqSplit   … 店舗ごとに新しいフォームを作り、「リスト」のI列・J列を付け替える。
-//                        今までの共有フォームは、回答を残したまま、回答の受付を終了する
+//                        回答済みの2店舗は、今までの共有フォームのまま残し、他の店舗のページだけを共有フォームから消す
 //                        （スクリプトプロパティ HQSPLIT_MODE が on のときだけ動く。時間切れのときは、もう一度実行する）
 //   3. listHqForms    … 12店舗の、店舗名・送信先・フォームURLを、シート「ヒューマンクリエイト フォーム一覧」に書き出す
 //   4. 終わったら、HQSPLIT_MODE を削除する
@@ -11,7 +11,49 @@ const HQ_CUSTOMER = "株式会社ＨｕｍａｎＱｒｅａｔｅ";
 const HQ_OLD_FORM_SUFFIX = "3ocNGCQU";            // 今まで、10店舗で共有していたフォームのID（末尾）
 const HQSPLIT_MODE_PROPERTY = "HQSPLIT_MODE";
 const HQ_LIST_SHEET = "ヒューマンクリエイト フォーム一覧";
-const HQ_CLOSED_MESSAGE = "このフォームは、受付を終了しました。新しくご案内した、店舗ごとのフォームから、ご回答をお願いします。";
+// 回答済みのため、今までの共有フォームのまま残す店舗
+const HQ_KEEP_STORES = ["Ｂｉｓｔｒｏ　Ｕｎ　Ｔｒｏｉｓ／鮨匠　一石三鳥／鳥影　一石三鳥", "一石三鳥　韓邸"];
+
+function hqIsTarget_(x) {
+  return x.row[10] === "送信済" && String(x.row[9]).slice(-HQ_OLD_FORM_SUFFIX.length) === HQ_OLD_FORM_SUFFIX
+    && !HQ_KEEP_STORES.some(k => extraNorm_(k) === extraNorm_(x.row[0]));
+}
+
+// 共有フォームから、分けた店舗のページ・設問を消し、【対象店舗】とページの題名を整える（回答のある店舗は、そのまま）
+function hqTrimOldForm_(oldId, movedNames) {
+  const form = FormApp.openById(oldId);
+  const items = form.getItems();
+  movedNames.forEach(name => {
+    const prefix = `【${name}】`;
+    for (let i = items.length - 1; i >= 0; i--) {
+      const it = items[i];
+      const title = it.getTitle();
+      if (it.getType() === FormApp.ItemType.SECTION_HEADER && title === `【${name}】の収集希望について`) {
+        // 直前のページ区切りも消す
+        if (i > 0 && items[i - 1].getType() === FormApp.ItemType.PAGE_BREAK) { form.deleteItem(items[i - 1]); items.splice(i - 1, 1); i--; }
+        form.deleteItem(it); items.splice(i, 1);
+      } else if (title.indexOf(prefix) === 0) {
+        form.deleteItem(it); items.splice(i, 1);
+      }
+    }
+  });
+  const keepNames = [];
+  form.getItems().forEach(it => {
+    const m = it.getType() === FormApp.ItemType.SECTION_HEADER && it.getTitle().match(/^【(.+)】の収集希望について$/);
+    if (m) keepNames.push(m[1]);
+  });
+  const desc = form.getDescription();
+  const dm = desc.match(/【対象店舗】\n([^\n]*)/);
+  if (dm) form.setDescription(desc.replace(dm[0], () => "【対象店舗】\n" + keepNames.join("・")));
+  let k = 0;
+  form.getItems().forEach(it => {
+    if (it.getType() === FormApp.ItemType.PAGE_BREAK && /^希望日の選択/.test(it.getTitle())) {
+      k++;
+      it.setTitle(keepNames.length > 1 ? `希望日の選択（${k}/${keepNames.length}店舗目）` : "希望日の選択");
+    }
+  });
+  return keepNames.length;
+}
 
 function hqRows_() {
   const data = invGetSpreadsheet().getSheetByName(INV_LIST_SHEET_NAME).getDataRange().getDisplayValues();
@@ -24,7 +66,7 @@ function hqRows_() {
 
 function previewHqSplit() {
   const r = hqRows_();
-  const targets = r.rows.filter(x => x.row[10] === "送信済" && String(x.row[9]).slice(-HQ_OLD_FORM_SUFFIX.length) === HQ_OLD_FORM_SUFFIX);
+  const targets = r.rows.filter(hqIsTarget_);
   let responses = "確認できず";
   const oldId = targets.length ? targets[0].row[9] : null;
   if (oldId) { try { responses = FormApp.openById(oldId).getResponses().length; } catch (e) { /* 確認できず */ } }
@@ -46,8 +88,9 @@ function applyHqSplit() {
     const listSheet = invGetSpreadsheet().getSheetByName(INV_LIST_SHEET_NAME);
     const folder = getFormFolder();
     const r = hqRows_();
-    const targets = r.rows.filter(x => x.row[10] === "送信済" && String(x.row[9]).slice(-HQ_OLD_FORM_SUFFIX.length) === HQ_OLD_FORM_SUFFIX);
+    const targets = r.rows.filter(hqIsTarget_);
     if (targets.length) oldId = targets[0].row[9];
+    const moved = [];
     for (let n = 0; n < targets.length; n++) {
       if (Date.now() - startTime > 4 * 60 * 1000) { remaining = targets.length - n; break; }
       const t = targets[n];
@@ -62,23 +105,22 @@ function applyHqSplit() {
         listSheet.getRange(t.rowNumber, 9, 1, 2).setValues([[result.formUrl, result.formId]]);   // I列・J列だけ付け替える（B列の宛先は、そのまま）
         SpreadsheetApp.flush();
         done++;
+        moved.push(t.row[0]);
         console.log(`${t.rowNumber}行目: 店舗別のフォームを作って、付け替えました。`);
       } catch (e) {
         failed++;
         console.error(`${t.rowNumber}行目: 失敗 ${e}`);
       }
     }
-    // 全部、付け替えられたら、共有フォームの受付を終了する（回答は残る）
-    if (remaining === 0 && failed === 0 && oldId) {
-      const form = FormApp.openById(oldId);
-      form.setCustomClosedFormMessage(HQ_CLOSED_MESSAGE);
-      form.setAcceptingResponses(false);
-      console.log("今までの共有フォームの、回答の受付を終了しました（回答は残っています）。");
+    // 分けた店舗のページを、共有フォームから消す（回答済みの店舗だけが残る）
+    if (moved.length > 0 && oldId) {
+      const left = hqTrimOldForm_(oldId, moved);
+      console.log(`今までの共有フォームから、分けた ${moved.length} 店舗のページを消しました（残った店舗: ${left} 件、回答は残っています）。`);
     }
   } finally {
     try { lock.releaseLock(); } catch (e) { /* 影響なし */ }
   }
-  console.log(`今回 ${done} 件を店舗別にしました（失敗 ${failed} 件）。` + (remaining > 0 ? `時間切れで ${remaining} 件が残りました。もう一度実行してください。` : "") + (failed > 0 ? "失敗があったので、共有フォームの受付はまだ終了していません。もう一度実行してください。" : ""));
+  console.log(`今回 ${done} 件を店舗別にしました（失敗 ${failed} 件）。` + (remaining > 0 ? `時間切れで ${remaining} 件が残りました。もう一度実行してください。` : "") + (failed > 0 ? "失敗があったので、もう一度実行してください（付け替え済みの店舗は、飛ばされます）。" : ""));
 }
 
 // 3. 12店舗の一覧をシートに書き出す（あなたが、お客様にメールするときの、元の表）
