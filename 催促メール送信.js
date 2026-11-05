@@ -154,7 +154,12 @@ function startReminders() {
     return;
   }
   const lock = LockService.getUserLock();
-  if (!lock.tryLock(10 * 1000)) { console.log("別の処理が動いているためスキップしました。"); return; }
+  if (!lock.tryLock(30 * 1000)) {
+    remDeleteTriggers_();
+    ScriptApp.newTrigger(REM_HANDLER).timeBased().after(2 * 60 * 1000).create();
+    console.log("別の処理が動いているため、2分後に、もう一度試します。");
+    return;
+  }
   const startTime = Date.now();
   let sent = 0, failed = 0, skipped = 0, remaining = 0;
   try {
