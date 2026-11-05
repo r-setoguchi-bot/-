@@ -107,7 +107,8 @@ function remBuildMail_(f) {
   lines.push("【対象店舗】");
   f.stores.forEach(s => lines.push(`・${s}`));
   lines.push("");
-  lines.push(`■ご回答期限：${INV_DEADLINE_TEXT}まで`, "");
+  lines.push(`■ご回答期限：${INV_DEADLINE_TEXT}まで`);
+  lines.push("　※ご回答がない場合、年末年始の特別回収を行えない可能性があります。", "");
   lines.push("お手数ですが、下記のアンケートフォームから、ご回答をお願いいたします。");
   lines.push(f.formUrl, "");
   lines.push("【ご回答について】");
