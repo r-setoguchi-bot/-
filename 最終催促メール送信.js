@@ -163,3 +163,30 @@ function sendTestFinalR15() { remfTest_(REMF_ROUNDS.r15); }
 function startFinalR15() { remfStart_(REMF_ROUNDS.r15); }
 function continueFinalR15() { remfStart_(REMF_ROUNDS.r15); }
 function stopFinalR15() { remfDeleteTriggers_(REMF_ROUNDS.r15); console.log("11/15用の催促メールの自動送信を停止しました。"); }
+
+// ---- 11/15用: 自動で送り始める予約 ----
+// setupAutoFinalR15 を実行すると、REMF_AUTO_R15_AT に、autoStartFinalR15 が自動で動く予約ができる。
+// autoStartFinalR15 は、今日が REMF_AUTO_R15_DATE でなければ、何もしない。REMIND15_MAIL_MODE が on でなければ、送らない。
+// 取り消すときは cancelAutoFinalR15
+const REMF_AUTO_R15_AT = "2026/11/15 09:00";
+const REMF_AUTO_R15_DATE = "2026/11/15";
+const REMF_AUTO_R15_HANDLER = "autoStartFinalR15";
+
+function setupAutoFinalR15() {
+  cancelAutoFinalR15();
+  const when = Utilities.parseDate(REMF_AUTO_R15_AT, "Asia/Tokyo", "yyyy/MM/dd HH:mm");
+  if (when.getTime() <= Date.now()) throw new Error(`${REMF_AUTO_R15_AT} は、すでに過ぎています。`);
+  ScriptApp.newTrigger(REMF_AUTO_R15_HANDLER).timeBased().at(when).create();
+  console.log(`${REMF_AUTO_R15_AT}（日本時間）に、自動で送り始める予約を作りました。送るには、REMIND15_MAIL_MODE が on である必要があります。`);
+}
+
+function cancelAutoFinalR15() {
+  ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === REMF_AUTO_R15_HANDLER).forEach(t => ScriptApp.deleteTrigger(t));
+  console.log("11/15用の自動送信の予約を、取り消しました（なければ、何もしていません）。");
+}
+
+function autoStartFinalR15() {
+  const today = Utilities.formatDate(new Date(), "Asia/Tokyo", "yyyy/MM/dd");
+  if (today !== REMF_AUTO_R15_DATE) { console.log(`今日は ${today} で、${REMF_AUTO_R15_DATE} ではないため、送りません。`); return; }
+  remfStart_(REMF_ROUNDS.r15);
+}
