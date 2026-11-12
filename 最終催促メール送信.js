@@ -3,7 +3,9 @@
 // 11/12用と11/15用は、関数・記録シート・安全装置（スクリプトプロパティ）が別。11/15に、11/12の記録に引っかからずに、もう一度送れる。
 //
 // 【11/12用】 previewFinalR12 → sendTestFinalR12 → startFinalR12（REMIND12_MAIL_MODE が on のとき）／ 止めるとき stopFinalR12
-// 【11/15用】 previewFinalR15 → sendTestFinalR15 → startFinalR15（REMIND15_MAIL_MODE が on のとき）／ 止めるとき stopFinalR15
+// 【11/15用 9:00】 previewFinalR15 → sendTestFinalR15 → startFinalR15（REMIND15_MAIL_MODE が on のとき）／ 止めるとき stopFinalR15
+// 【11/15用 17:00】 previewFinalR15b → sendTestFinalR15b → startFinalR15b（REMIND15_MAIL_MODE が on のとき）／ 止めるとき stopFinalR15b
+// 【11/15の自動】 setupAutoFinalR15 で、9:00 と 17:00 の予約を作る（cancelAutoFinalR15 で取り消し）
 // 終わったら、それぞれの MODE を削除する
 
 const REMF_ROUNDS = {
@@ -22,6 +24,15 @@ const REMF_ROUNDS = {
     subject: "【株式会社クリメン】【本日が回答期限です】年末年始の特別回収アンケートのご回答のお願い",
     headline: "【本日が、回答期限です】",
     intro: "年末年始の特別回収のアンケートについて、本日が回答期限です。\n現時点で、ご回答をいただけておりません。",
+    deadlineLine: () => `★ご回答期限：本日 ${INV_DEADLINE_TEXT}まで`,
+    pushLine: "本日中のご回答を、お願いいたします。"
+  },
+  r15b: {
+    key: "r15b", mode: "REMIND15_MAIL_MODE", handler: "continueFinalR15b",
+    log: "催促メール1115b 送信記録", target: "催促メール1115b 対象一覧",
+    subject: "【株式会社クリメン】【本日が回答期限です・本日中にご回答をお願いします】年末年始の特別回収アンケート",
+    headline: "【本日が、回答期限です。本日中にご回答をお願いします】",
+    intro: "年末年始の特別回収のアンケートについて、本日が回答期限です。\n朝にもご案内しましたが、現時点で、ご回答をいただけておりません。",
     deadlineLine: () => `★ご回答期限：本日 ${INV_DEADLINE_TEXT}まで`,
     pushLine: "本日中のご回答を、お願いいたします。"
   }
@@ -164,29 +175,44 @@ function startFinalR15() { remfStart_(REMF_ROUNDS.r15); }
 function continueFinalR15() { remfStart_(REMF_ROUNDS.r15); }
 function stopFinalR15() { remfDeleteTriggers_(REMF_ROUNDS.r15); console.log("11/15用の催促メールの自動送信を停止しました。"); }
 
-// ---- 11/15用: 自動で送り始める予約 ----
-// setupAutoFinalR15 を実行すると、REMF_AUTO_R15_AT に、autoStartFinalR15 が自動で動く予約ができる。
-// autoStartFinalR15 は、今日が REMF_AUTO_R15_DATE でなければ、何もしない。REMIND15_MAIL_MODE が on でなければ、送らない。
+// ---- 11/15用（17:00の2回目） ----
+function previewFinalR15b() { remfPreview_(REMF_ROUNDS.r15b); }
+function sendTestFinalR15b() { remfTest_(REMF_ROUNDS.r15b); }
+function startFinalR15b() { remfStart_(REMF_ROUNDS.r15b); }
+function continueFinalR15b() { remfStart_(REMF_ROUNDS.r15b); }
+function stopFinalR15b() { remfDeleteTriggers_(REMF_ROUNDS.r15b); console.log("11/15 17:00用の催促メールの自動送信を停止しました。"); }
+
+// ---- 11/15用: 自動で送り始める予約（9:00 と 17:00）----
+// setupAutoFinalR15 を実行すると、9:00 と 17:00 に、それぞれ自動で動く予約ができる。
+// 動く関数は、今日が 11/15 でなければ、何もしない。REMIND15_MAIL_MODE が on でなければ、送らない。
 // 取り消すときは cancelAutoFinalR15
-const REMF_AUTO_R15_AT = "2026/11/15 09:00";
 const REMF_AUTO_R15_DATE = "2026/11/15";
-const REMF_AUTO_R15_HANDLER = "autoStartFinalR15";
+const REMF_AUTO_R15_SLOTS = [
+  { at: "2026/11/15 09:00", handler: "autoStartFinalR15" },
+  { at: "2026/11/15 17:00", handler: "autoStartFinalR15b" }
+];
 
 function setupAutoFinalR15() {
   cancelAutoFinalR15();
-  const when = Utilities.parseDate(REMF_AUTO_R15_AT, "Asia/Tokyo", "yyyy/MM/dd HH:mm");
-  if (when.getTime() <= Date.now()) throw new Error(`${REMF_AUTO_R15_AT} は、すでに過ぎています。`);
-  ScriptApp.newTrigger(REMF_AUTO_R15_HANDLER).timeBased().at(when).create();
-  console.log(`${REMF_AUTO_R15_AT}（日本時間）に、自動で送り始める予約を作りました。送るには、REMIND15_MAIL_MODE が on である必要があります。`);
+  REMF_AUTO_R15_SLOTS.forEach(slot => {
+    const when = Utilities.parseDate(slot.at, "Asia/Tokyo", "yyyy/MM/dd HH:mm");
+    if (when.getTime() <= Date.now()) throw new Error(`${slot.at} は、すでに過ぎています。`);
+    ScriptApp.newTrigger(slot.handler).timeBased().at(when).create();
+    console.log(`${slot.at}（日本時間）に、自動で送り始める予約を作りました。`);
+  });
+  console.log("送るには、REMIND15_MAIL_MODE が on である必要があります。");
 }
 
 function cancelAutoFinalR15() {
-  ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === REMF_AUTO_R15_HANDLER).forEach(t => ScriptApp.deleteTrigger(t));
+  const handlers = REMF_AUTO_R15_SLOTS.map(s => s.handler);
+  ScriptApp.getProjectTriggers().filter(t => handlers.indexOf(t.getHandlerFunction()) !== -1).forEach(t => ScriptApp.deleteTrigger(t));
   console.log("11/15用の自動送信の予約を、取り消しました（なければ、何もしていません）。");
 }
 
-function autoStartFinalR15() {
+function remfAutoGuard_() {
   const today = Utilities.formatDate(new Date(), "Asia/Tokyo", "yyyy/MM/dd");
-  if (today !== REMF_AUTO_R15_DATE) { console.log(`今日は ${today} で、${REMF_AUTO_R15_DATE} ではないため、送りません。`); return; }
-  remfStart_(REMF_ROUNDS.r15);
+  if (today !== REMF_AUTO_R15_DATE) { console.log(`今日は ${today} で、${REMF_AUTO_R15_DATE} ではないため、送りません。`); return false; }
+  return true;
 }
+function autoStartFinalR15() { if (remfAutoGuard_()) remfStart_(REMF_ROUNDS.r15); }
+function autoStartFinalR15b() { if (remfAutoGuard_()) remfStart_(REMF_ROUNDS.r15b); }
