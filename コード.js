@@ -307,6 +307,19 @@ function formatEventLines(calendarEvents, withDate, maxLines) {
 }
 
 /**
+ * 「出勤情報」として共有されている終日予定かどうかを判定する。
+ * 件名に「10:30-15:00」のような時間帯が入っている終日予定（各メンバーの勤務時間）と、
+ * 件名が「オフィス」の終日予定（勤務場所）を出勤情報とみなす。
+ */
+function isAttendanceEvent(calendarEvent) {
+  if (!calendarEvent.isAllDay) return false;
+  const title = String(calendarEvent.title).trim();
+  if (title === "オフィス") return true;
+  // 時刻の区切り（: ：）と、範囲を表すさまざまなハイフン・波線に対応する
+  return /\d{1,2}[:：]\d{2}\s*[-‐‑–—―−ーｰ~〜～]\s*\d{1,2}[:：]\d{2}/.test(title);
+}
+
+/**
  * 今週・来週の予定と未完了タスクをAIに渡し、「何があるから、何の用意が必要か」の助言文を作る。
  * 予定が無い場合やAIの呼び出しに失敗した場合は空文字を返す（朝のご報告自体は止めない）。
  */
@@ -352,17 +365,29 @@ ${taskText}
  */
 function buildCalendarBriefing(now, openTaskLines) {
   const today = startOfDay(now);
-  const todayEvents = getCalendarEvents(today, addDays(today, 1));
+  const allTodayEvents = getCalendarEvents(today, addDays(today, 1));
+  // 今日の分だけは出勤情報も知らせる（予定とは別枠で表示する）
+  const todayAttendance = allTodayEvents.filter(calendarEvent => isAttendanceEvent(calendarEvent));
+  const todayEvents = allTodayEvents.filter(calendarEvent => !isAttendanceEvent(calendarEvent));
 
+  // 今週・来週の見通しからは、出勤情報を除く
   const upcomingRange = getUpcomingRange(now);
-  const upcomingEvents = getCalendarEvents(upcomingRange.start, upcomingRange.end);
+  const upcomingEvents = getCalendarEvents(upcomingRange.start, upcomingRange.end)
+    .filter(calendarEvent => !isAttendanceEvent(calendarEvent));
   const advice = buildPreparationAdvice(upcomingEvents, openTaskLines, now);
 
-  const todaySection = "■ 今日の予定\n" +
-    (todayEvents.length > 0 ? formatEventLines(todayEvents, false, 15).join("\n") : "・予定は入っておりません");
+  const attendanceSection = todayAttendance.length > 0
+    ? "■ 今日の出勤\n" + todayAttendance.slice(0, 15).map(calendarEvent => `・${calendarEvent.title}`).join("\n")
+    : "";
+
+  const todaySection = [
+    attendanceSection,
+    "■ 今日の予定\n" +
+      (todayEvents.length > 0 ? formatEventLines(todayEvents, false, 15).join("\n") : "・予定は入っておりません")
+  ].filter(section => section).join("\n\n");
 
   const upcomingSection = "■ 今週・来週の予定\n" +
-    (upcomingEvents.length > 0 ? formatEventLines(upcomingEvents, true, 15).join("\n") : "・予定は入っておりません");
+    (upcomingEvents.length > 0 ? formatEventLines(upcomingEvents, true, 25).join("\n") : "・予定は入っておりません");
 
   const adviceSection = advice ? "■ 用意しておくとよいこと\n" + advice : "";
 
@@ -620,7 +645,9 @@ function answerCalendarQuery(queryData, now) {
     ? formatDateWithWeekday(rangeStart)
     : `${formatDateWithWeekday(rangeStart)}〜${formatDateWithWeekday(rangeEnd)}`;
 
-  const calendarEvents = getCalendarEvents(rangeStart, addDays(rangeEnd, 1));
+  // 1日だけの確認では出勤情報も含め、複数日の確認では出勤情報を除いて見やすくする
+  const calendarEvents = getCalendarEvents(rangeStart, addDays(rangeEnd, 1))
+    .filter(calendarEvent => isSingleDay || !isAttendanceEvent(calendarEvent));
   if (calendarEvents.length === 0) {
     return `📅 ${rangeLabel} のご予定は、カレンダーには入っておりません。`;
   }
