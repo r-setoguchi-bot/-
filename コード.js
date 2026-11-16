@@ -179,10 +179,204 @@ function processQueue() {
 }
 
 /**
- * 期限が本日・明日・または超過しているタスクについて、Google Chatへリマインドを送信する関数
- * 時間主導型トリガー（1日1回）での実行を想定
+ * ====================================================================
+ * Googleカレンダー連携：日付まわりの共通関数
+ * （スクリプトのタイムゾーンは appsscript.json で Asia/Tokyo に設定済み）
+ * ====================================================================
  */
-function sendTaskReminders() {
+
+const WEEKDAY_LABELS = ["日", "月", "火", "水", "木", "金", "土"];
+
+/**
+ * 指定した日時の「その日の0時0分」を返す
+ */
+function startOfDay(date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+/**
+ * 指定した日時から days 日後の日時を返す（時刻はそのまま）
+ */
+function addDays(date, days) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate() + days, date.getHours(), date.getMinutes());
+}
+
+/**
+ * 日付を「11/20(金)」の形式にする
+ */
+function formatDateWithWeekday(date) {
+  return `${date.getMonth() + 1}/${date.getDate()}(${WEEKDAY_LABELS[date.getDay()]})`;
+}
+
+/**
+ * 時刻を「14:00」の形式にする
+ */
+function formatTime(date) {
+  return Utilities.formatDate(date, "Asia/Tokyo", "HH:mm");
+}
+
+/**
+ * 「YYYY/MM/DD」と「HH:mm」の文字列から日時を組み立てる。
+ * 時刻が空なら0時0分とする。日付として成立しない場合は null を返す。
+ */
+function parseDateTime(dateStr, timeStr) {
+  const dateMatch = String(dateStr || "").trim().match(/^(\d{4})(?:\/|-)(\d{1,2})(?:\/|-)(\d{1,2})$/);
+  if (!dateMatch) return null;
+
+  const year = Number(dateMatch[1]);
+  const month = Number(dateMatch[2]);
+  const day = Number(dateMatch[3]);
+
+  let hours = 0;
+  let minutes = 0;
+  const timeMatch = String(timeStr || "").trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (timeMatch) {
+    hours = Number(timeMatch[1]);
+    minutes = Number(timeMatch[2]);
+    if (hours > 23 || minutes > 59) return null;
+  }
+
+  const result = new Date(year, month - 1, day, hours, minutes);
+  // 「2/30」のような存在しない日付は自動で繰り上がってしまうため、ここで弾く
+  if (result.getMonth() !== month - 1 || result.getDate() !== day) return null;
+  return result;
+}
+
+/**
+ * 「HH:mm」形式の時刻文字列かどうかを判定する
+ */
+function isTimeString(timeStr) {
+  return /^\d{1,2}:\d{2}$/.test(String(timeStr || "").trim());
+}
+
+/**
+ * 「明日」から「来週の日曜日」までの期間を返す（今週・来週の予定の見通し用）。
+ * end は期間に含まれない終端（来週日曜の翌日0時）。
+ */
+function getUpcomingRange(now) {
+  const today = startOfDay(now);
+  const daysUntilSunday = (7 - today.getDay()) % 7; // 今日が日曜なら0
+  return {
+    start: addDays(today, 1),
+    end: addDays(today, daysUntilSunday + 8)
+  };
+}
+
+/**
+ * Googleカレンダー（実行ユーザーのメインカレンダー）から、指定期間の予定を取得する。
+ * 「欠席」と回答済みの予定は除外し、開始日時の早い順に並べて返す。
+ */
+function getCalendarEvents(rangeStart, rangeEnd) {
+  const events = CalendarApp.getDefaultCalendar().getEvents(rangeStart, rangeEnd);
+  return events
+    .filter(event => event.getMyStatus() !== CalendarApp.GuestStatus.NO)
+    .map(event => {
+      const isAllDay = event.isAllDayEvent();
+      return {
+        title: event.getTitle() || "（件名なし）",
+        start: isAllDay ? event.getAllDayStartDate() : event.getStartTime(),
+        end: isAllDay ? event.getAllDayEndDate() : event.getEndTime(),
+        isAllDay: isAllDay,
+        location: event.getLocation() || ""
+      };
+    })
+    .sort((a, b) => a.start.getTime() - b.start.getTime());
+}
+
+/**
+ * 予定1件を1行のテキストにする。withDate=true の場合は先頭に日付を付ける
+ */
+function formatEventLine(calendarEvent, withDate) {
+  const datePart = withDate ? formatDateWithWeekday(calendarEvent.start) + " " : "";
+  const timePart = calendarEvent.isAllDay
+    ? "終日"
+    : `${formatTime(calendarEvent.start)}〜${formatTime(calendarEvent.end)}`;
+  const locationPart = calendarEvent.location ? `（${calendarEvent.location}）` : "";
+  return `・${datePart}${timePart}　${calendarEvent.title}${locationPart}`;
+}
+
+/**
+ * 予定の一覧を、最大件数で区切ってテキスト行の配列にする（超過分は「ほか◯件」と表示）
+ */
+function formatEventLines(calendarEvents, withDate, maxLines) {
+  const lines = calendarEvents.slice(0, maxLines).map(calendarEvent => formatEventLine(calendarEvent, withDate));
+  if (calendarEvents.length > maxLines) {
+    lines.push(`　ほか${calendarEvents.length - maxLines}件`);
+  }
+  return lines;
+}
+
+/**
+ * 今週・来週の予定と未完了タスクをAIに渡し、「何があるから、何の用意が必要か」の助言文を作る。
+ * 予定が無い場合やAIの呼び出しに失敗した場合は空文字を返す（朝のご報告自体は止めない）。
+ */
+function buildPreparationAdvice(upcomingEvents, openTaskLines, now) {
+  if (upcomingEvents.length === 0) return "";
+
+  const nowStr = `${formatDateWithWeekday(now)} ${formatTime(now)}`;
+  const eventText = formatEventLines(upcomingEvents, true, 40).join("\n");
+  const taskText = openTaskLines.length > 0 ? openTaskLines.slice(0, 20).join("\n") : "（なし）";
+
+  const prompt = `
+あなたは瀬戸口さんの優秀な専属秘書です。現在の日時は【${nowStr}】です。
+以下は瀬戸口さんの今週・来週の予定と、未完了のタスクです。
+予定を見渡し、事前の用意が必要そうなものだけを選んで、「いつ何があるので、何をいつまでに用意しておくとよいか」を助言してください。
+
+【ルール】
+- 最大5件。日付が近く、重要そうなものを優先する。
+- 1件につき1〜2行で、「・11/20(金) 予定名 → 用意しておくこと」の形式にする。
+- 予定の件名・場所・タスクから読み取れる範囲で助言し、書かれていない事実を作らない。
+- 関連しそうな未完了タスクがあれば、その予定と結び付けて触れる。
+- 用意が不要そうな予定（定例の集まり、休み、移動など）は書かない。
+- 該当が1件も無ければ「特に事前の用意が必要な予定は見当たりません。」とだけ書く。
+- 見出し・前置き・締めの挨拶は書かず、記号の「*」や「#」も使わない。本文のみを出力する。
+
+【今週・来週の予定】
+${eventText}
+
+【未完了のタスク】
+${taskText}
+`;
+
+  try {
+    const advice = callGemini(prompt, false);
+    return advice ? advice.trim() : "";
+  } catch (e) {
+    console.error("準備の助言の生成に失敗しました: " + e.toString());
+    return "";
+  }
+}
+
+/**
+ * 朝のご報告のうち、カレンダーに関する部分（今日の予定／今週・来週の予定／準備の助言）を組み立てる
+ */
+function buildCalendarBriefing(now, openTaskLines) {
+  const today = startOfDay(now);
+  const todayEvents = getCalendarEvents(today, addDays(today, 1));
+
+  const upcomingRange = getUpcomingRange(now);
+  const upcomingEvents = getCalendarEvents(upcomingRange.start, upcomingRange.end);
+  const advice = buildPreparationAdvice(upcomingEvents, openTaskLines, now);
+
+  const todaySection = "■ 今日の予定\n" +
+    (todayEvents.length > 0 ? formatEventLines(todayEvents, false, 15).join("\n") : "・予定は入っておりません");
+
+  const upcomingSection = "■ 今週・来週の予定\n" +
+    (upcomingEvents.length > 0 ? formatEventLines(upcomingEvents, true, 15).join("\n") : "・予定は入っておりません");
+
+  const adviceSection = advice ? "■ 用意しておくとよいこと\n" + advice : "";
+
+  return { todaySection, upcomingSection, adviceSection };
+}
+
+/**
+ * ⏰ 朝のご報告：今日の予定＋期限が近いタスク＋今週・来週の予定と、そのための用意をまとめてChatへ送信する関数
+ * 時間主導型トリガー（1日1回・朝）での実行を想定
+ *
+ * - カレンダーの内容は、直近でやり取りのあったスペース（瀬戸口さんとの会話）にのみ送る
+ * - タスクのリマインドは、これまで通りタスクを登録したスペースごとに送る
+ */
+function sendMorningBriefing() {
   const sheetUrl = PropertiesService.getScriptProperties().getProperty("SPREADSHEET_URL");
   const spreadsheet = SpreadsheetApp.openByUrl(sheetUrl);
   const taskSheet = getRequiredSheet(spreadsheet, "Task_List");
@@ -190,18 +384,31 @@ function sendTaskReminders() {
 
   const now = new Date();
   const todayStr = Utilities.formatDate(now, "Asia/Tokyo", "yyyy/MM/dd");
-  const tomorrowStr = Utilities.formatDate(new Date(now.getTime() + 24 * 60 * 60 * 1000), "Asia/Tokyo", "yyyy/MM/dd");
+  const tomorrowStr = Utilities.formatDate(addDays(now, 1), "Asia/Tokyo", "yyyy/MM/dd");
 
   // スペース（送信先）ごとにリマインド内容をまとめるためのバケツ
   const remindersBySpace = {};
+  // AIに「用意しておくとよいこと」を考えてもらう材料として、未完了タスクの一覧も集める
+  const openTaskLines = [];
 
   for (let i = 1; i < data.length; i++) {
     const status = data[i][5];         // F列: ステータス
-    const deadlineDate = data[i][3];   // D列: 期限日付
+    const taskContent = data[i][2];    // C列: タスク内容
+    const assignedPerson = data[i][7]; // H列: 担当者
     const lastRemindedAt = data[i][6]; // G列: 最終リマインド日時
     const spaceName = data[i][9];      // J列: スペース名
 
-    if (status === "完了" || !deadlineDate || !spaceName) continue;
+    // D列: 期限日付（セルが日付型になっていても文字列でも比較できるよう、文字列に揃える）
+    const rawDeadline = data[i][3];
+    const deadlineDate = Object.prototype.toString.call(rawDeadline) === "[object Date]"
+      ? Utilities.formatDate(rawDeadline, "Asia/Tokyo", "yyyy/MM/dd")
+      : String(rawDeadline || "");
+
+    if (status === "完了" || !taskContent) continue;
+
+    openTaskLines.push(`・${taskContent}（期限 ${deadlineDate || "未定"}／担当：${assignedPerson || "未定"}／状況：${status}）`);
+
+    if (!deadlineDate || !spaceName) continue;
 
     // 同じ日に既にリマインド済みならスキップ（重複送信防止）
     const lastRemindedDateStr = lastRemindedAt
@@ -220,9 +427,6 @@ function sendTaskReminders() {
       continue; // まだ期限に余裕があるタスクは対象外
     }
 
-    const taskContent = data[i][2];    // C列: タスク内容
-    const assignedPerson = data[i][7]; // H列: 担当者
-
     if (!remindersBySpace[spaceName]) remindersBySpace[spaceName] = [];
     remindersBySpace[spaceName].push({
       rowNum: i + 1,
@@ -230,9 +434,47 @@ function sendTaskReminders() {
     });
   }
 
+  // カレンダーの内容を送るスペースを決め、カレンダー部分を組み立てる
+  const calendarSpaceName = getDefaultSpaceName(spreadsheet);
+  let calendarBriefing = null;
+  if (calendarSpaceName) {
+    try {
+      calendarBriefing = buildCalendarBriefing(now, openTaskLines);
+    } catch (e) {
+      console.error("カレンダーの読み取りに失敗しました: " + e.toString());
+      calendarBriefing = {
+        todaySection: "■ 今日の予定\n⚠️ カレンダーを読み取れませんでした。",
+        upcomingSection: "",
+        adviceSection: ""
+      };
+    }
+    // タスクのリマインドが無い日でも、カレンダーの報告は送る
+    if (!remindersBySpace[calendarSpaceName]) remindersBySpace[calendarSpaceName] = [];
+  } else {
+    console.log("送信先スペースが特定できなかったため、カレンダーの報告は省略しました。");
+  }
+
   for (const spaceName in remindersBySpace) {
     const items = remindersBySpace[spaceName];
-    const message = "🤖 秘書より、本日のタスクリマインドです。\n\n" + items.map(item => item.line).join("\n");
+    const taskLines = items.map(item => item.line).join("\n");
+    let message;
+
+    if (spaceName === calendarSpaceName && calendarBriefing) {
+      const sections = [
+        calendarBriefing.todaySection,
+        "■ 期限が近いタスク\n" + (items.length > 0 ? taskLines : "・期限が近いタスクはありません"),
+        calendarBriefing.upcomingSection,
+        calendarBriefing.adviceSection
+      ].filter(section => section);
+      message = `🤖 瀬戸口さん、おはようございます。${formatDateWithWeekday(now)} の朝のご報告です。\n\n` + sections.join("\n\n");
+    } else {
+      message = "🤖 秘書より、本日のタスクリマインドです。\n\n" + taskLines;
+    }
+
+    // Chatの1メッセージあたりの文字数上限に収まるよう、長すぎる場合は末尾を切り詰める
+    if (message.length > 3900) {
+      message = message.substring(0, 3900) + "\n…（長いため以降は省略しました）";
+    }
 
     try {
       sendPushReply(spaceName, message);
@@ -240,28 +482,151 @@ function sendTaskReminders() {
       const timestamp = Utilities.formatDate(now, "Asia/Tokyo", "yyyy/MM/dd HH:mm:ss");
       items.forEach(item => taskSheet.getRange(item.rowNum, 7).setValue(timestamp));
     } catch (e) {
-      console.error("リマインド送信に失敗しました（" + spaceName + "）: " + e.message);
+      console.error("朝のご報告の送信に失敗しました（" + spaceName + "）: " + e.message);
     }
   }
 }
 
 /**
- * sendTaskRemindersを1日1回（午前9時）自動実行するトリガーを設定する関数
+ * 以前の関数名（タスクのリマインドのみだった頃の名前）で登録済みのトリガーがあっても動くよう、
+ * 朝のご報告へ処理を引き継ぐ
+ */
+function sendTaskReminders() {
+  sendMorningBriefing();
+}
+
+/**
+ * sendMorningBriefingを1日1回（午前9時）自動実行するトリガーを設定する関数
  * GASエディタでこの関数を1回だけ手動実行してください
  */
 function setupReminderTrigger() {
-  // 重複登録を防ぐため、既存の同名トリガーを削除してから作り直す
+  // 重複登録を防ぐため、既存の同じ役割のトリガーを削除してから作り直す
   ScriptApp.getProjectTriggers().forEach(trigger => {
-    if (trigger.getHandlerFunction() === "sendTaskReminders") {
+    const handler = trigger.getHandlerFunction();
+    if (handler === "sendMorningBriefing" || handler === "sendTaskReminders") {
       ScriptApp.deleteTrigger(trigger);
     }
   });
 
-  ScriptApp.newTrigger("sendTaskReminders")
+  ScriptApp.newTrigger("sendMorningBriefing")
     .timeBased()
     .atHour(9)
     .everyDays(1)
     .create();
+}
+
+/**
+ * チャットで依頼された予定をGoogleカレンダーに登録し、登録結果の報告文を返す関数
+ * - 日付や件名が読み取れない場合、過去の日付の場合は、登録せずに聞き返す
+ * - 開始時刻が無い場合は終日の予定として登録する
+ * - 終了時刻が無い場合は開始から1時間の予定として登録する
+ * - 同じ件名・同じ開始日時の予定が既にある場合は二重登録しない
+ */
+function addCalendarEventFromIntent(eventData, now) {
+  const title = String(eventData.eventTitle || "").trim();
+  const startDay = parseDateTime(eventData.startDate, "");
+
+  if (!title || !startDay) {
+    return "⚠️ 秘書より確認です。カレンダーに登録する予定の「日付」または「件名」が読み取れませんでした。お手数ですが、「11/20の14時からA社打ち合わせをカレンダーに登録して」のようにご指示いただけますか。";
+  }
+
+  if (startDay.getTime() < startOfDay(now).getTime()) {
+    return `⚠️ 秘書より確認です。「${title}」の日付が ${formatDateWithWeekday(startDay)}（${startDay.getFullYear()}年）と過去の日付になっております。誤って登録しないよう保留にしました。お手数ですが、日付を改めてご指示いただけますか。`;
+  }
+
+  const calendar = CalendarApp.getDefaultCalendar();
+  const options = {};
+  if (eventData.location) options.location = String(eventData.location);
+  if (eventData.description) options.description = String(eventData.description);
+  const locationNote = eventData.location ? `\n・場所：${eventData.location}` : "";
+
+  // 開始時刻が無い場合：終日の予定として登録する
+  if (!isTimeString(eventData.startTime)) {
+    const endDay = parseDateTime(eventData.endDate, "");
+    const isMultiDay = endDay && endDay.getTime() > startDay.getTime();
+    const lastDay = isMultiDay ? endDay : startDay;
+
+    const isDuplicate = calendar.getEvents(startDay, addDays(lastDay, 1)).some(existing =>
+      existing.isAllDayEvent() &&
+      existing.getTitle() === title &&
+      existing.getAllDayStartDate().getTime() === startDay.getTime()
+    );
+    const whenText = isMultiDay
+      ? `${formatDateWithWeekday(startDay)}〜${formatDateWithWeekday(endDay)} 終日`
+      : `${formatDateWithWeekday(startDay)} 終日`;
+
+    if (isDuplicate) {
+      return `📅 秘書より報告です。${whenText}「${title}」は、すでにカレンダーに登録されておりましたので、二重登録は控えました。`;
+    }
+
+    if (isMultiDay) {
+      calendar.createAllDayEvent(title, startDay, addDays(endDay, 1), options); // 終了日は「含まれない終端」で指定する
+    } else {
+      calendar.createAllDayEvent(title, startDay, options);
+    }
+
+    return `📅 承知いたしました。カレンダーに登録いたしました。\n・${whenText}　「${title}」${locationNote}\n\n時刻のご指定がなかったため、終日の予定として登録しております。時刻が決まりましたらお申し付けください。`;
+  }
+
+  // 開始時刻がある場合：時間帯つきの予定として登録する
+  const start = parseDateTime(eventData.startDate, eventData.startTime);
+  if (!start) {
+    return `⚠️ 秘書より確認です。「${title}」の開始時刻がうまく読み取れませんでした。お手数ですが、「14時から」のように時刻を改めてご指示いただけますか。`;
+  }
+
+  let end = isTimeString(eventData.endTime)
+    ? parseDateTime(eventData.endDate || eventData.startDate, eventData.endTime)
+    : null;
+  let endNote = "";
+  if (!end || end.getTime() <= start.getTime()) {
+    end = new Date(start.getTime() + 60 * 60 * 1000);
+    endNote = "\n\n終了時刻のご指定がなかったため、1時間の予定として登録しております。";
+  }
+
+  const isSameDay = startOfDay(start).getTime() === startOfDay(end).getTime();
+  const whenText = isSameDay
+    ? `${formatDateWithWeekday(start)} ${formatTime(start)}〜${formatTime(end)}`
+    : `${formatDateWithWeekday(start)} ${formatTime(start)}〜${formatDateWithWeekday(end)} ${formatTime(end)}`;
+
+  const isDuplicate = calendar.getEvents(start, end).some(existing =>
+    !existing.isAllDayEvent() &&
+    existing.getTitle() === title &&
+    existing.getStartTime().getTime() === start.getTime()
+  );
+  if (isDuplicate) {
+    return `📅 秘書より報告です。${whenText}「${title}」は、すでにカレンダーに登録されておりましたので、二重登録は控えました。`;
+  }
+
+  calendar.createEvent(title, start, end, options);
+
+  return `📅 承知いたしました。カレンダーに登録いたしました。\n・${whenText}　「${title}」${locationNote}${endNote}`;
+}
+
+/**
+ * チャットで尋ねられた期間の予定をGoogleカレンダーから読み取り、一覧の報告文を返す関数
+ */
+function answerCalendarQuery(queryData, now) {
+  const MAX_RANGE_DAYS = 31;
+
+  const rangeStart = parseDateTime(queryData.rangeStartDate, "") || startOfDay(now);
+  let rangeEnd = parseDateTime(queryData.rangeEndDate, "") || rangeStart;
+  if (rangeEnd.getTime() < rangeStart.getTime()) rangeEnd = rangeStart;
+  if (rangeEnd.getTime() > addDays(rangeStart, MAX_RANGE_DAYS - 1).getTime()) {
+    rangeEnd = addDays(rangeStart, MAX_RANGE_DAYS - 1);
+  }
+
+  const isSingleDay = rangeStart.getTime() === rangeEnd.getTime();
+  const rangeLabel = isSingleDay
+    ? formatDateWithWeekday(rangeStart)
+    : `${formatDateWithWeekday(rangeStart)}〜${formatDateWithWeekday(rangeEnd)}`;
+
+  const calendarEvents = getCalendarEvents(rangeStart, addDays(rangeEnd, 1));
+  if (calendarEvents.length === 0) {
+    return `📅 ${rangeLabel} のご予定は、カレンダーには入っておりません。`;
+  }
+
+  return `📅 ${rangeLabel} のご予定は以下の${calendarEvents.length}件です。\n\n` +
+    formatEventLines(calendarEvents, !isSingleDay, 30).join("\n");
 }
 
 /**
@@ -530,11 +895,11 @@ function handleUserIntent(userInput, userName, spaceName) {
   const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
   if (!apiKey) return "⚠️ エラー: APIキーが設定されていません。";
 
-  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=" + apiKey;
-
-  // 「明日」「来週」などの言葉を理解できるよう、現在の日時を教える
+  // 「明日」「来週の月曜」などの言葉を理解できるよう、現在の日時と曜日を教える
   const now = new Date();
-  const todayStr = Utilities.formatDate(now, "Asia/Tokyo", "yyyy年MM月dd日 HH:mm");
+  const todayStr = Utilities.formatDate(now, "Asia/Tokyo", "yyyy年MM月dd日") +
+                   `（${WEEKDAY_LABELS[now.getDay()]}曜日）` +
+                   Utilities.formatDate(now, "Asia/Tokyo", " HH:mm");
 
   const systemPrompt = `
 あなたは瀬戸口さんの優秀な専属秘書botです。
@@ -544,7 +909,7 @@ function handleUserIntent(userInput, userName, spaceName) {
 「${userInput}」
 
 【指示】
-瀬戸口さんのメッセージの意図を以下の4つのいずれかに分類し、必ず指定されたJSONフォーマットの文字列のみを出力してください（余計な解説文などは一切含めないでください）。
+瀬戸口さんのメッセージの意図を以下の6つのいずれかに分類し、必ず指定されたJSONフォーマットの文字列のみを出力してください（余計な解説文などは一切含めないでください）。
 
 1. メッセージが「新しいタスクの依頼や追加」である場合（例：「明日までに資料作成」「タスクに追加して」など）
 {
@@ -579,60 +944,110 @@ function handleUserIntent(userInput, userName, spaceName) {
   "action": "chat",
   "replyMessage": "秘書らしい丁寧で明るい返答"
 }
+
+5. メッセージが「Googleカレンダーへの予定の登録」を求めている場合（例：「20日の14時からA社打ち合わせ、カレンダーに登録しといて」「来週月曜に歯医者の予定を入れて」など。「カレンダー」「予定を入れて」「スケジュール登録」といった言葉がある場合はタスクではなくこちら）
+{
+  "action": "calendar_add",
+  "eventTitle": "予定の件名",
+  "startDate": "YYYY/MM/DD (開始日。不明な場合は空文字)",
+  "startTime": "HH:mm (開始時刻。終日の予定や時刻が不明な場合は空文字)",
+  "endDate": "YYYY/MM/DD (複数日にまたがる場合のみ終了日。それ以外は空文字)",
+  "endTime": "HH:mm (終了時刻。不明な場合は空文字)",
+  "location": "場所（不明な場合は空文字）",
+  "description": "予定に添えるメモ（なければ空文字）",
+  "replyMessage": "予定を登録する旨の、秘書らしい丁寧な返答"
+}
+
+6. メッセージが「Googleカレンダーの予定の確認」を求めている場合（例：「今日の予定は？」「来週の予定を教えて」「明日なにがあったっけ」など）
+{
+  "action": "calendar_query",
+  "rangeStartDate": "YYYY/MM/DD (確認したい期間の最初の日)",
+  "rangeEndDate": "YYYY/MM/DD (確認したい期間の最後の日。1日だけなら最初の日と同じ)",
+  "replyMessage": "予定を確認する旨の、秘書らしい丁寧な返答"
+}
 `;
 
-  const payload = {
-    "contents": [{ "parts": [{ "text": systemPrompt }] }],
-    "generationConfig": {
-      "responseMimeType": "application/json"
-    }
-  };
-
-  const options = {
-    "method": "post",
-    "contentType": "application/json",
-    "payload": JSON.stringify(payload),
-    "muteHttpExceptions": true
-  };
-
+  let aiResponse;
   try {
-    const response = UrlFetchApp.fetch(url, options);
-    const json = JSON.parse(response.getContentText());
-
-    if (json.candidates && json.candidates[0].content.parts[0].text) {
-      const aiResponse = json.candidates[0].content.parts[0].text;
-      
-      try {
-        // AIが返したJSON文字列をプログラムで使える形（オブジェクト）に変換
-        const cleanJsonStr = aiResponse.replace(/```json/g, "").replace(/```/g, "").trim();
-        const resultData = JSON.parse(cleanJsonStr);
-
-        // 新規タスク登録の処理
-        if (resultData.action === "task") {
-          writeTaskToSheet(resultData, userName, spaceName);
-          return resultData.replyMessage;
-        }
-        
-        // 既存タスクの進捗更新処理（新機能！）
-        if (resultData.action === "update_task") {
-          return updateTaskInSheets(resultData, userName);
-        }
-        
-        // 要約結果や下書き、会話などそのままチャットに返す処理
-        return resultData.replyMessage;
-
-      } catch (parseError) {
-        console.error("AI応答のJSON解析に失敗しました: " + parseError.message + " / 応答内容: " + aiResponse);
-        return "⚠️ 申し訳ありません。AIからの応答をうまく読み取れませんでした。お手数ですが、もう一度お試しください。";
-      }
-    } else {
-      console.error("Geminiの応答に想定した内容が含まれていませんでした: " + JSON.stringify(json));
-      return "⚠️ 申し訳ありません。ただいまAIとの通信で問題が発生しております。少し時間をおいて再度お試しください。";
-    }
+    aiResponse = callGemini(systemPrompt, true);
   } catch (e) {
     console.error("Gemini API呼び出しでエラーが発生しました: " + e.toString());
     return "⚠️ 申し訳ありません。ただいまシステムに問題が発生しております。少し時間をおいて再度お試しください。";
   }
+
+  if (!aiResponse) {
+    return "⚠️ 申し訳ありません。ただいまAIとの通信で問題が発生しております。少し時間をおいて再度お試しください。";
+  }
+
+  let resultData;
+  try {
+    // AIが返したJSON文字列をプログラムで使える形（オブジェクト）に変換
+    const cleanJsonStr = aiResponse.replace(/```json/g, "").replace(/```/g, "").trim();
+    resultData = JSON.parse(cleanJsonStr);
+  } catch (parseError) {
+    console.error("AI応答のJSON解析に失敗しました: " + parseError.message + " / 応答内容: " + aiResponse);
+    return "⚠️ 申し訳ありません。AIからの応答をうまく読み取れませんでした。お手数ですが、もう一度お試しください。";
+  }
+
+  // 新規タスク登録の処理
+  if (resultData.action === "task") {
+    writeTaskToSheet(resultData, userName, spaceName);
+    return resultData.replyMessage;
+  }
+
+  // 既存タスクの進捗更新処理
+  if (resultData.action === "update_task") {
+    return updateTaskInSheets(resultData, userName);
+  }
+
+  // カレンダーへの予定登録・予定確認の処理
+  if (resultData.action === "calendar_add" || resultData.action === "calendar_query") {
+    try {
+      return resultData.action === "calendar_add"
+        ? addCalendarEventFromIntent(resultData, now)
+        : answerCalendarQuery(resultData, now);
+    } catch (calendarError) {
+      console.error("カレンダー操作でエラーが発生しました: " + calendarError.toString());
+      return "⚠️ 申し訳ありません。カレンダーの操作に失敗しました。少し時間をおいて再度お試しください。";
+    }
+  }
+
+  // 要約結果や下書き、会話などそのままチャットに返す処理
+  return resultData.replyMessage;
+}
+
+/**
+ * Gemini APIを呼び出し、応答テキストを返す共通関数。
+ * useJsonMode=true の場合はJSONモードを強制する。
+ * 応答に本文が含まれていない場合は null を返し、通信自体の失敗は例外を投げる。
+ */
+function callGemini(promptText, useJsonMode) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
+  if (!apiKey) throw new Error("スクリプトプロパティ 'GEMINI_API_KEY' が未設定です。");
+
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=" + apiKey;
+
+  const payload = {
+    "contents": [{ "parts": [{ "text": promptText }] }]
+  };
+  if (useJsonMode) {
+    payload.generationConfig = { "responseMimeType": "application/json" };
+  }
+
+  const response = UrlFetchApp.fetch(url, {
+    "method": "post",
+    "contentType": "application/json",
+    "payload": JSON.stringify(payload),
+    "muteHttpExceptions": true
+  });
+
+  const json = JSON.parse(response.getContentText());
+  const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) {
+    console.error("Geminiの応答に想定した内容が含まれていませんでした: " + JSON.stringify(json));
+    return null;
+  }
+  return text;
 }
 
 /**
