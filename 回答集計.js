@@ -353,7 +353,7 @@ function respBuildStoreAnswer(parsed, store, headers) {
     if (!header) return;                                    // 見出しの無い列（期間が短いときの余り）は使わない
     if (!store.offered[i]) { dateCells.push(""); return; }  // 設問が無かった日
     if (parsed.want === RESP_CHOICE_NOT_WANT) { dateCells.push("×"); return; }  // 旧形式のフォーム：「希望しない」で送信した場合は、全日程が「×」
-    const answer = (parsed.dateAnswers[store.name] || {})[header];
+    const answer = (parsed.dateAnswers[respNameKey_(store.name)] || {})[header];
     dateCells.push(answer === RESP_ANSWER_YES ? "○" : answer === RESP_ANSWER_NO ? "×" : "");
   });
 
@@ -366,6 +366,8 @@ function respBuildStoreAnswer(parsed, store, headers) {
   }
   return { wantLabel: wantLabel, dateCells: dateCells };
 }
+
+function respNameKey_(name) { return String(name || "").replace(/[\s\u3000]+/g, ""); }
 
 // 1件の回答を、質問の文言をもとに分類する
 function respParseResponse(response) {
@@ -382,7 +384,7 @@ function respParseResponse(response) {
     else {
       const match = RESP_DATE_QUESTION_PATTERN.exec(title);
       if (match) {
-        const storeName = match[1];
+        const storeName = respNameKey_(match[1]);   // 設問の店名の空白のゆれ（全角・半角・前後）を無視して突き合わせる
         const dateHeader = match[2];
         if (!parsed.dateAnswers[storeName]) parsed.dateAnswers[storeName] = {};
         parsed.dateAnswers[storeName][dateHeader] = answer;
