@@ -153,17 +153,27 @@ function processQueue() {
 
       try {
         // AI解析メインエンジンを呼び出し、処理結果のテキストを得る
-        const replyText = handleUserIntent(userInput, userName, spaceName);
+        // （「もう一回やって」などに対応できるよう、直前のやり取りも渡す）
+        const recentConversation = getRecentConversation(data, i, spaceName, new Date());
+        let replyText = handleUserIntent(userInput, userName, spaceName, recentConversation);
+
+        // 万一返答が空でも、Chatへの送信が失敗しないよう定型文に置き換える
+        if (!replyText || !String(replyText).trim()) {
+          replyText = "⚠️ 申し訳ありません。ご指示の内容をうまく読み取れませんでした。お手数ですが、言い方を変えてもう一度お試しください。";
+        }
 
         // サービスアカウントを使ってチャットスペースへ非同期プッシュ送信（返信）
-        sendPushReply(spaceName, replyText);
+        // 長い返答は、Chatの文字数上限に収まるよう複数通に分けて送る
+        splitMessageForChat(String(replyText), 3800).forEach(part => sendPushReply(spaceName, part));
 
         // ステータスを「Done（完了）」に更新
         queueSheet.getRange(rowNum, 6).setValue("Done");
+        data[i][5] = "Done"; // 同じ回の後続メッセージが「直前のやり取り」として参照できるように
 
       } catch (error) {
         console.error("キュー処理エラー: " + error.message);
         queueSheet.getRange(rowNum, 6).setValue("Error: " + error.message);
+        data[i][5] = "Error: " + error.message;
         try {
           sendPushReply(spaceName, "⚠️ 申し訳ありません。処理中にエラーが発生しました。少し時間をおいて再度お試しください。");
         } catch (notifyError) {
@@ -733,7 +743,7 @@ function sendMorningBriefing() {
       ? Utilities.formatDate(rawDeadline, "Asia/Tokyo", "yyyy/MM/dd")
       : String(rawDeadline || "");
 
-    if (status === "完了" || !taskContent) continue;
+    if (isClosedTaskStatus(status) || !taskContent) continue;
 
     openTaskLines.push(`・${taskContent}（期限 ${deadlineDate || "未定"}／担当：${assignedPerson || "未定"}／状況：${status}）`);
 
@@ -1264,7 +1274,7 @@ function setupDailyReportTrigger() {
 /**
  * Gemini APIを呼び出してユーザーの意図（新規タスク・進捗更新・要約・会話）を判断し、適切に処理する関数
  */
-function handleUserIntent(userInput, userName, spaceName) {
+function handleUserIntent(userInput, userName, spaceName, recentConversation) {
   const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
   if (!apiKey) return "⚠️ エラー: APIキーが設定されていません。";
 
@@ -1274,17 +1284,36 @@ function handleUserIntent(userInput, userName, spaceName) {
                    `（${WEEKDAY_LABELS[now.getDay()]}曜日）` +
                    Utilities.formatDate(now, "Asia/Tokyo", " HH:mm");
 
+  // 「もう一回やって」などに対応できるよう、直前のやり取りも伝える
+  const historyText = recentConversation && recentConversation.length > 0
+    ? recentConversation.join("\n")
+    : "（直前のやり取りはありません）";
+
   const systemPrompt = `
 あなたは瀬戸口さんの優秀な専属秘書botです。
 現在の日時は【${todayStr}】です。
 
-瀬戸口さん（${userName}）からのメッセージ:
+【直前のやり取り（古い順。参考情報）】
+${historyText}
+
+瀬戸口さん（${userName}）からの今回のメッセージ:
 「${userInput}」
 
 【指示】
-瀬戸口さんのメッセージの意図を以下の6つのいずれかに分類し、必ず指定されたJSONフォーマットの文字列のみを出力してください（余計な解説文などは一切含めないでください）。
+今回のメッセージに含まれる依頼を、以下の8種類の「アクション」に分けてください。
+- 1通のメッセージに依頼が複数ある場合は、依頼ごとに1つずつアクションを作り、書かれている順に並べてください。
+- 「もう一回やって」「さっきのお願い」のように直前のやり取りを指している場合は、直前のやり取りのうち「エラーで未完了」になっている依頼の内容から、改めてアクションを作ってください。「処理済み」の依頼は、明確に頼まれない限り繰り返さないでください。
+- 何を指しているのか判断できない場合は、"chat" アクションで、何をすればよいかを丁寧に聞き返してください。
+- replyMessage は必ず空でない文章にしてください。
 
-1. メッセージが「新しいタスクの依頼や追加」である場合（例：「明日までに資料作成」「タスクに追加して」など）
+出力は、次の形のJSONの文字列のみとしてください（余計な解説文などは一切含めないでください）。
+{
+  "actions": [ アクション, アクション, ... ]
+}
+
+アクションの種類:
+
+1. 「新しいタスクの依頼や追加」（例：「明日までに資料作成」「タスクに追加して」など）
 {
   "action": "task",
   "taskContent": "タスクの具体的な内容",
@@ -1295,10 +1324,10 @@ function handleUserIntent(userInput, userName, spaceName) {
   "replyMessage": "タスクを新規登録した旨の、秘書らしい丁寧な返答"
 }
 
-2. メッセージが「既存タスクの進捗更新・経緯の追記・完了報告」である場合（例：「資料作成の件、A社から来週まで待ってと連絡あった」「週報タスク終わったよ」「〇〇の件は今山田くんがボール持ってる」など）
+2. 「既存タスクの進捗更新・経緯の追記・完了報告」（例：「資料作成の件、A社から来週まで待ってと連絡あった」「週報タスク終わったよ」「〇〇の件は今山田くんがボール持ってる」など）
 {
   "action": "update_task",
-  "targetTaskKeyword": "どの既存タスクに関する進捗か特定するためのキーワード（タスク内容に含まれていそうな象徴的な言葉）",
+  "targetTaskKeyword": "どの既存タスクに関する進捗か特定するためのキーワード（タスク内容に含まれていそうな象徴的な言葉。「」で括られた言葉があればそのまま使う）",
   "progressDetail": "今回新しく記録する対応内容や経緯の具体的なディテール",
   "assignedPerson": "現在のボール保持者・担当者（誰のところで止まっているか、誰が今動くべきか）",
   "statusSummary": "最新の状況を一言で表すサマリー（例：「先方連絡待ち」「完了」「山田さん対応中」など）",
@@ -1306,19 +1335,26 @@ function handleUserIntent(userInput, userName, spaceName) {
   "replyMessage": "進捗履歴をしっかりとノートに記録した旨の、秘書らしい丁寧な報告返答"
 }
 
-3. メッセージが「文章の要約や下書きの作成」を求めている場合（例：「この文章を要約して」「返信メールを作って」など）
+3. 「既存タスクの削除・取り消し」（例：「〇〇のタスク消して」「〇〇はもうやらなくていいから外して」など。終わったという報告ではなく、一覧から外したい場合）
+{
+  "action": "delete_task",
+  "targetTaskKeyword": "削除するタスクを特定するためのキーワード（「」で括られた言葉があればそのまま使う）",
+  "replyMessage": "タスクを削除する旨の、秘書らしい丁寧な返答"
+}
+
+4. 「文章の要約や下書きの作成」（例：「この文章を要約して」「返信メールを作って」など）
 {
   "action": "summary_or_draft",
   "replyMessage": "しっかり要約・下書きした内容を、秘書らしく丁寧に見やすく整えた文章"
 }
 
-4. それ以外の「ただの会話や質問」の場合
+5. それ以外の「ただの会話や質問」
 {
   "action": "chat",
   "replyMessage": "秘書らしい丁寧で明るい返答"
 }
 
-5. メッセージが「Googleカレンダーへの予定の登録」を求めている場合（例：「20日の14時からA社打ち合わせ、カレンダーに登録しといて」「来週月曜に歯医者の予定を入れて」など。「カレンダー」「予定を入れて」「スケジュール登録」といった言葉がある場合はタスクではなくこちら）
+6. 「Googleカレンダーへの新しい予定の登録」（例：「20日の14時からA社打ち合わせ、カレンダーに登録しといて」「来週月曜に歯医者の予定を入れて」など。「カレンダー」「予定を入れて」「スケジュール登録」といった言葉がある場合はタスクではなくこちら）
 {
   "action": "calendar_add",
   "eventTitle": "予定の件名",
@@ -1331,7 +1367,18 @@ function handleUserIntent(userInput, userName, spaceName) {
   "replyMessage": "予定を登録する旨の、秘書らしい丁寧な返答"
 }
 
-6. メッセージが「Googleカレンダーの予定の確認」を求めている場合（例：「今日の予定は？」「来週の予定を教えて」「明日なにがあったっけ」など）
+7. 「Googleカレンダーにすでにある予定の日時の変更」（例：「アンケート締切を29日に変更して」「A社打ち合わせを15時からにずらして」「明日の面談を来週月曜に移して」など）
+{
+  "action": "calendar_update",
+  "targetEventKeyword": "変更する予定を特定するための、予定の件名に含まれていそうな言葉",
+  "targetDate": "YYYY/MM/DD (変更前の予定の日付が分かる場合のみ。不明なら空文字)",
+  "newStartDate": "YYYY/MM/DD (変更後の日付。日付は変えず時刻だけ変える場合は、変更前の日付)",
+  "newStartTime": "HH:mm (変更後の開始時刻。時刻の指定がなければ空文字)",
+  "newEndTime": "HH:mm (変更後の終了時刻。指定がなければ空文字)",
+  "replyMessage": "予定を変更する旨の、秘書らしい丁寧な返答"
+}
+
+8. 「Googleカレンダーの予定の確認」（例：「今日の予定は？」「来週の予定を教えて」「明日なにがあったっけ」など）
 {
   "action": "calendar_query",
   "rangeStartDate": "YYYY/MM/DD (確認したい期間の最初の日)",
@@ -1362,31 +1409,77 @@ function handleUserIntent(userInput, userName, spaceName) {
     return "⚠️ 申し訳ありません。AIからの応答をうまく読み取れませんでした。お手数ですが、もう一度お試しください。";
   }
 
-  // 新規タスク登録の処理
-  if (resultData.action === "task") {
-    writeTaskToSheet(resultData, userName, spaceName);
-    return resultData.replyMessage;
+  const actions = normalizeIntentActions(resultData);
+  if (actions.length === 0) {
+    console.error("AI応答にアクションが含まれていませんでした: " + aiResponse);
+    return "⚠️ 申し訳ありません。ご指示の内容をうまく読み取れませんでした。お手数ですが、言い方を変えてもう一度お試しください。";
   }
 
-  // 既存タスクの進捗更新処理
-  if (resultData.action === "update_task") {
-    return updateTaskInSheets(resultData, userName);
-  }
-
-  // カレンダーへの予定登録・予定確認の処理
-  if (resultData.action === "calendar_add" || resultData.action === "calendar_query") {
+  // 1通に依頼が複数ある場合も、1つずつ順に処理する（1つが失敗しても残りは続ける）
+  const MAX_ACTIONS = 5;
+  const replies = actions.slice(0, MAX_ACTIONS).map(action => {
     try {
-      return resultData.action === "calendar_add"
-        ? addCalendarEventFromIntent(resultData, now)
-        : answerCalendarQuery(resultData, now);
-    } catch (calendarError) {
-      console.error("カレンダー操作でエラーが発生しました: " + calendarError.toString());
-      return "⚠️ 申し訳ありません。カレンダーの操作に失敗しました。少し時間をおいて再度お試しください。";
+      return executeIntentAction(action, userName, spaceName, now);
+    } catch (actionError) {
+      console.error(`「${action.action}」の処理でエラーが発生しました: ` + actionError.toString());
+      return "⚠️ 申し訳ありません。ご指示の一部の処理に失敗しました。少し時間をおいて再度お試しください。";
     }
+  }).filter(reply => reply && String(reply).trim());
+
+  if (actions.length > MAX_ACTIONS) {
+    replies.push(`⚠️ 一度に承れるご指示は${MAX_ACTIONS}件までのため、残りの${actions.length - MAX_ACTIONS}件は改めてお送りください。`);
   }
 
-  // 要約結果や下書き、会話などそのままチャットに返す処理
-  return resultData.replyMessage;
+  return replies.length > 0
+    ? replies.join("\n\n")
+    : "⚠️ 申し訳ありません。ご指示の内容をうまく読み取れませんでした。お手数ですが、言い方を変えてもう一度お試しください。";
+}
+
+/**
+ * AIの応答（{"actions":[...]} の形、アクション1つだけの形、配列の形のいずれか）を、アクションの配列にそろえる
+ */
+function normalizeIntentActions(resultData) {
+  let actions;
+  if (Array.isArray(resultData)) {
+    actions = resultData;
+  } else if (resultData && Array.isArray(resultData.actions)) {
+    actions = resultData.actions;
+  } else if (resultData && resultData.action) {
+    actions = [resultData];
+  } else {
+    actions = [];
+  }
+  return actions.filter(action => action && typeof action === "object" && action.action);
+}
+
+/**
+ * アクション1件を実行し、チャットに返す報告文を返す
+ */
+function executeIntentAction(action, userName, spaceName, now) {
+  switch (action.action) {
+    case "task":
+      writeTaskToSheet(action, userName, spaceName);
+      return action.replyMessage || `📝 承知いたしました。タスク「${action.taskContent}」を登録いたしました。`;
+
+    case "update_task":
+      return updateTaskInSheets(action, userName);
+
+    case "delete_task":
+      return deleteTaskFromIntent(action, userName);
+
+    case "calendar_add":
+      return addCalendarEventFromIntent(action, now);
+
+    case "calendar_update":
+      return updateCalendarEventFromIntent(action, now);
+
+    case "calendar_query":
+      return answerCalendarQuery(action, now);
+
+    default:
+      // 要約・下書き・会話などは、AIの返答をそのまま返す
+      return action.replyMessage;
+  }
 }
 
 /**
@@ -1452,16 +1545,28 @@ function writeTaskToSheet(taskData, userName, spaceName) {
   ]);
 }
 
+// タスクの「終わった」扱いのステータス（リマインドや検索の対象から外す）
+const CLOSED_TASK_STATUSES = ["完了", "削除"];
+
+/**
+ * タスクのステータスが「完了」「削除」など、もう追いかけなくてよいものかを判定する
+ */
+function isClosedTaskStatus(status) {
+  return CLOSED_TASK_STATUSES.indexOf(String(status || "").trim()) !== -1;
+}
+
 /**
  * タスク一覧のデータからキーワードに一致する行を全て探す（配列インデックスの配列を返す）。
  * 最新のタスクを優先するため下の行から逆順に検索する。
- * onlyIncomplete=true の場合は「完了」ステータスの行を除外して検索する（誤爆防止）。
+ * onlyIncomplete=true の場合は「完了」「削除」の行を除外して検索する（誤爆防止）。
+ * 「削除」の行は、onlyIncomplete=false でも対象にしない。
  */
 function findMatchingTaskRowIndexes(taskDataRange, keyword, onlyIncomplete) {
   const matches = [];
   for (let i = taskDataRange.length - 1; i >= 1; i--) {
-    const status = String(taskDataRange[i][5]); // F列: ステータス
-    if (onlyIncomplete && status === "完了") continue;
+    const status = String(taskDataRange[i][5]).trim(); // F列: ステータス
+    if (status === "削除") continue;
+    if (onlyIncomplete && isClosedTaskStatus(status)) continue;
 
     const taskContent = String(taskDataRange[i][2]).toLowerCase(); // C列: タスク内容
     if (taskContent.indexOf(keyword) !== -1) {
@@ -1469,6 +1574,53 @@ function findMatchingTaskRowIndexes(taskDataRange, keyword, onlyIncomplete) {
     }
   }
   return matches;
+}
+
+/**
+ * キーワードから対象のタスクを1件に絞り込む。
+ * - まず未完了のタスクから探し、無ければ完了済みも含めて探す
+ * - 候補が複数あっても、タスク内容がキーワードと完全に一致するものが1件だけなら、それを選ぶ
+ * 1件に絞れた場合は { index }、絞れない場合は { message }（聞き返しの文）を返す。
+ */
+function findTargetTask(taskDataRange, keywordText, verb) {
+  const keyword = String(keywordText || "").replace(/[「」『』]/g, "").trim().toLowerCase();
+  if (!keyword) {
+    return { message: `⚠️ 秘書より確認です。${verb}タスクがどれか読み取れませんでした。お手数ですが、タスク名を添えて改めてご指示いただけますか。` };
+  }
+
+  let matches = findMatchingTaskRowIndexes(taskDataRange, keyword, true);
+  if (matches.length === 0) {
+    matches = findMatchingTaskRowIndexes(taskDataRange, keyword, false);
+  }
+
+  if (matches.length > 1) {
+    const exactMatches = matches.filter(i => String(taskDataRange[i][2]).trim().toLowerCase() === keyword);
+    if (exactMatches.length === 1) matches = exactMatches;
+  }
+
+  if (matches.length === 0) {
+    return { message: `⚠️ 秘書より報告です。「${keywordText}」に該当するタスクが一覧から見つけられませんでした。お手数ですが、正確な名前でご指示いただけますか。` };
+  }
+
+  if (matches.length > 1) {
+    // 候補が複数ある場合は誤爆を避けるため、自動で決めつけずユーザーに確認を求める
+    const candidateList = matches.slice(0, 5)
+      .map(i => `・${taskDataRange[i][2]}（期限 ${formatTaskDeadline(taskDataRange[i][3]) || "未定"}）`)
+      .join("\n");
+    return { message: `⚠️ 秘書より確認です。「${keywordText}」に該当するタスクが複数見つかりました。誤って別のタスクを${verb.replace(/する$/, "")}しないよう、どのタスクか改めてご指示いただけますか。\n\n候補:\n${candidateList}` };
+  }
+
+  return { index: matches[0] };
+}
+
+/**
+ * タスクの期限（D列）を「2026/08/15」の形の文字列にする（日付型のセルにも対応）
+ */
+function formatTaskDeadline(value) {
+  if (Object.prototype.toString.call(value) === "[object Date]") {
+    return Utilities.formatDate(value, "Asia/Tokyo", "yyyy/MM/dd");
+  }
+  return String(value || "").trim();
 }
 
 /**
@@ -1481,29 +1633,10 @@ function updateTaskInSheets(updateData, userName) {
   const logSheet = getRequiredSheet(spreadsheet, "対応履歴ログ");
 
   const taskDataRange = taskSheet.getDataRange().getValues();
-  const keyword = updateData.targetTaskKeyword.toLowerCase();
+  const target = findTargetTask(taskDataRange, updateData.targetTaskKeyword, "更新する");
+  if (target.message) return target.message;
 
-  // 誤爆防止のため、まず「未完了」タスクの中から探し、
-  // 見つからなかった場合のみ完了済みタスクも含めて再検索する
-  let matches = findMatchingTaskRowIndexes(taskDataRange, keyword, true);
-  if (matches.length === 0) {
-    matches = findMatchingTaskRowIndexes(taskDataRange, keyword, false);
-  }
-
-  if (matches.length === 0) {
-    // 検索キーワードに一致するタスクがなかった場合
-    return `⚠️ 秘書より報告です。「${updateData.targetTaskKeyword}」に該当するタスクが一覧から見つけられませんでした。お手数ですが、正確な名前でご指示いただくか、新規タスクとしてご登録ください。`;
-  }
-
-  if (matches.length > 1) {
-    // 候補が複数ある場合は誤爆を避けるため、自動で決めつけずユーザーに確認を求める
-    const candidateList = matches.slice(0, 5)
-      .map(i => `・${taskDataRange[i][0]}: ${taskDataRange[i][2]}`)
-      .join("\n");
-    return `⚠️ 秘書より確認です。「${updateData.targetTaskKeyword}」に該当するタスクが複数見つかりました。誤って別のタスクを更新しないよう、より具体的なキーワードで改めてご指示いただけますか。\n\n候補:\n${candidateList}`;
-  }
-
-  const matchedIndex = matches[0];
+  const matchedIndex = target.index;
   const foundRowIndex = matchedIndex + 1; // 行番号（1始まり）
   const taskId = taskDataRange[matchedIndex][0]; // A列: タスクID
 
@@ -1531,7 +1664,158 @@ function updateTaskInSheets(updateData, userName) {
     updateData.assignedPerson  // E: 担当者（ボール保持者）
   ]);
 
-  return updateData.replyMessage;
+  return updateData.replyMessage ||
+    `📝 承知いたしました。タスク「${taskDataRange[matchedIndex][2]}」の進捗を記録いたしました。`;
+}
+
+/**
+ * チャットで頼まれたタスクを一覧から外す関数。
+ * 行そのものは消さず、ステータスを「削除」にする（後から経緯を確認でき、元にも戻せるようにするため）。
+ */
+function deleteTaskFromIntent(deleteData, userName) {
+  const sheetUrl = PropertiesService.getScriptProperties().getProperty("SPREADSHEET_URL");
+  const spreadsheet = SpreadsheetApp.openByUrl(sheetUrl);
+  const taskSheet = getRequiredSheet(spreadsheet, "Task_List");
+  const logSheet = getRequiredSheet(spreadsheet, "対応履歴ログ");
+
+  const taskDataRange = taskSheet.getDataRange().getValues();
+  const target = findTargetTask(taskDataRange, deleteData.targetTaskKeyword, "削除する");
+  if (target.message) return target.message;
+
+  const row = taskDataRange[target.index];
+  const rowNum = target.index + 1;
+  const now = new Date();
+  const timestamp = Utilities.formatDate(now, "Asia/Tokyo", "yyyy/MM/dd HH:mm:ss");
+
+  taskSheet.getRange(rowNum, 6).setValue("削除");                     // F列: ステータス
+  taskSheet.getRange(rowNum, 9).setValue("チャットの指示で削除");     // I列: 最新の状況サマリー
+
+  logSheet.appendRow([
+    generateUniqueId("L", now), // A: 履歴ID
+    row[0],                     // B: タスクID
+    timestamp,                  // C: 記録日時
+    "チャットの指示でタスクを削除しました", // D: 対応内容・経緯
+    userName                    // E: 担当者
+  ]);
+
+  const deadline = formatTaskDeadline(row[3]);
+  return `🗑️ 承知いたしました。タスク「${row[2]}」${deadline ? `（期限 ${deadline}）` : ""}を一覧から外しました。今後のリマインドにも出てまいりません。\n※表の行は残し、ステータスを「削除」にしております。`;
+}
+
+/**
+ * チャットで頼まれた、カレンダーにすでにある予定の日時を変更する関数
+ * - 件名に指定の言葉を含む予定を探し、1件に絞れた場合だけ変更する
+ * - 繰り返しの予定や、他の方から招待された予定は変更せず、ご自身での変更をお願いする
+ * - 時刻の指定がなければ、元の時刻・長さのまま日付だけを動かす
+ */
+function updateCalendarEventFromIntent(updateData, now) {
+  const keyword = String(updateData.targetEventKeyword || "").replace(/[「」『』]/g, "").trim();
+  if (!keyword) {
+    return "⚠️ 秘書より確認です。変更する予定がどれか読み取れませんでした。お手数ですが、予定の件名を添えて改めてご指示いただけますか。";
+  }
+
+  const newDay = parseDateTime(updateData.newStartDate, "");
+  if (!newDay) {
+    return `⚠️ 秘書より確認です。「${keyword}」の変更後の日付が読み取れませんでした。お手数ですが、「29日に変更して」のように日付を添えてご指示いただけますか。`;
+  }
+  const today = startOfDay(now);
+  if (newDay.getTime() < today.getTime()) {
+    return `⚠️ 秘書より確認です。「${keyword}」の変更後の日付が ${formatDateWithWeekday(newDay)}（${newDay.getFullYear()}年）と過去の日付になっております。誤って変更しないよう保留にしました。日付を改めてご指示いただけますか。`;
+  }
+
+  // 探す期間：元の日付が分かればその日、分からなければ1週間前から4か月先まで
+  const targetDay = parseDateTime(updateData.targetDate, "");
+  const searchStart = targetDay || addDays(today, -7);
+  const searchEnd = targetDay ? addDays(targetDay, 1) : addDays(today, 120);
+
+  const calendar = CalendarApp.getDefaultCalendar();
+  const lowerKeyword = keyword.toLowerCase();
+  const candidates = calendar.getEvents(searchStart, searchEnd)
+    .filter(event => String(event.getTitle() || "").toLowerCase().indexOf(lowerKeyword) !== -1);
+
+  const describe = event => {
+    if (event.isAllDayEvent()) return `${formatDateWithWeekday(event.getAllDayStartDate())} 終日`;
+    return `${formatDateWithWeekday(event.getStartTime())} ${formatTime(event.getStartTime())}〜${formatTime(event.getEndTime())}`;
+  };
+
+  if (candidates.length === 0) {
+    return `⚠️ 秘書より報告です。「${keyword}」を件名に含む予定が、カレンダーに見つかりませんでした。お手数ですが、予定の件名を確認のうえ改めてご指示いただけますか。`;
+  }
+
+  // 繰り返しの予定は、1つの言葉で全ての回が見つかるため、まとめて1件として扱う
+  const isSeries = candidates.length > 1 && candidates.every(event => event.isRecurringEvent());
+  if (candidates.length > 1 && !isSeries) {
+    const list = candidates.slice(0, 5).map(event => `・${describe(event)}　${event.getTitle()}`).join("\n");
+    return `⚠️ 秘書より確認です。「${keyword}」を件名に含む予定が複数ありました。誤って別の予定を動かさないよう、変更前の日付も添えて改めてご指示いただけますか。\n\n候補:\n${list}`;
+  }
+
+  const event = candidates[0];
+  const title = event.getTitle();
+
+  if (event.isRecurringEvent()) {
+    return `⚠️ 秘書より報告です。「${title}」は繰り返しの予定のため、誤って全ての回を動かさないよう、変更は控えました。お手数ですが、Googleカレンダーで直接ご変更ください。`;
+  }
+  if (typeof event.isOwnedByMe === "function" && !event.isOwnedByMe()) {
+    return `⚠️ 秘書より報告です。「${title}」は他の方から招待された予定のため、こちらでは変更できませんでした。主催者の方にご依頼いただくか、Googleカレンダーで直接ご確認ください。`;
+  }
+
+  const beforeText = describe(event);
+  const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+  if (event.isAllDayEvent() && !isTimeString(updateData.newStartTime)) {
+    // 終日の予定：日数（何日間か）はそのままに、開始日を動かす
+    const oldStart = event.getAllDayStartDate();
+    const oldEnd = event.getAllDayEndDate(); // 終了日の翌日（含まれない終端）
+    const dayCount = Math.max(1, Math.round((oldEnd.getTime() - oldStart.getTime()) / ONE_DAY_MS));
+    if (dayCount === 1) {
+      event.setAllDayDate(newDay);
+    } else {
+      event.setAllDayDates(newDay, addDays(newDay, dayCount));
+    }
+    const afterText = dayCount === 1
+      ? `${formatDateWithWeekday(newDay)} 終日`
+      : `${formatDateWithWeekday(newDay)}〜${formatDateWithWeekday(addDays(newDay, dayCount - 1))} 終日`;
+    return `📅 承知いたしました。カレンダーの予定を変更いたしました。\n・「${title}」\n・変更前：${beforeText}\n・変更後：${afterText}`;
+  }
+
+  // 時間帯つきの予定（または終日の予定に時刻が指定された場合）
+  const oldDurationMs = event.isAllDayEvent()
+    ? 60 * 60 * 1000
+    : event.getEndTime().getTime() - event.getStartTime().getTime();
+  const startTimeText = isTimeString(updateData.newStartTime)
+    ? updateData.newStartTime
+    : formatTime(event.getStartTime());
+  const newStart = parseDateTime(updateData.newStartDate, startTimeText);
+  if (!newStart) {
+    return `⚠️ 秘書より確認です。「${title}」の変更後の時刻が読み取れませんでした。お手数ですが、「15時から」のように時刻を改めてご指示いただけますか。`;
+  }
+  let newEnd = isTimeString(updateData.newEndTime) ? parseDateTime(updateData.newStartDate, updateData.newEndTime) : null;
+  if (!newEnd || newEnd.getTime() <= newStart.getTime()) {
+    newEnd = new Date(newStart.getTime() + oldDurationMs);
+  }
+
+  event.setTime(newStart, newEnd);
+  const afterText = `${formatDateWithWeekday(newStart)} ${formatTime(newStart)}〜${formatTime(newEnd)}`;
+  return `📅 承知いたしました。カレンダーの予定を変更いたしました。\n・「${title}」\n・変更前：${beforeText}\n・変更後：${afterText}`;
+}
+
+/**
+ * 処理キューから、同じスペースでの直前のやり取り（30分以内・最大3件）を取り出す。
+ * 「もう一回やって」のような指示を、AIが理解できるようにするために使う。
+ */
+function getRecentConversation(queueData, currentIndex, spaceName, now) {
+  const WINDOW_MS = 30 * 60 * 1000;
+  const lines = [];
+  for (let j = currentIndex - 1; j >= 1 && lines.length < 3; j--) {
+    if (queueData[j][4] !== spaceName) continue; // E列: スペース名
+    const receivedAt = new Date(queueData[j][1]); // B列: 受付日時
+    if (isNaN(receivedAt.getTime()) || now.getTime() - receivedAt.getTime() > WINDOW_MS) break;
+
+    const status = String(queueData[j][5] || ""); // F列: ステータス
+    const result = status === "Done" ? "処理済み" : status.indexOf("Error") === 0 ? "エラーで未完了" : "処理中";
+    lines.unshift(`・${formatTime(receivedAt)}「${compactText(queueData[j][3], 300)}」→ ${result}`);
+  }
+  return lines;
 }
 
 /**
