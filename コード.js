@@ -130,6 +130,9 @@ function processQueue() {
 
     if (lastRow < 2) return; // データがなければ終了
 
+    // G列（秘書の返答）の見出しが無ければ付ける
+    if (!queueSheet.getRange(1, 7).getValue()) queueSheet.getRange(1, 7).setValue("秘書の返答");
+
     const data = queueSheet.getDataRange().getValues();
     const now = new Date();
 
@@ -166,16 +169,21 @@ function processQueue() {
         // 長い返答は、Chatの文字数上限に収まるよう複数通に分けて送る
         splitMessageForChat(String(replyText), 3800).forEach(part => sendPushReply(spaceName, part));
 
-        // ステータスを「Done（完了）」に更新
+        // ステータスを「Done（完了）」に更新し、G列に秘書の返答を残す（次の会話で文脈として使う）
         queueSheet.getRange(rowNum, 6).setValue("Done");
+        queueSheet.getRange(rowNum, 7).setValue(String(replyText));
         data[i][5] = "Done"; // 同じ回の後続メッセージが「直前のやり取り」として参照できるように
+        data[i][6] = String(replyText);
 
       } catch (error) {
         console.error("キュー処理エラー: " + error.message);
         queueSheet.getRange(rowNum, 6).setValue("Error: " + error.message);
         data[i][5] = "Error: " + error.message;
+        const errorReply = "⚠️ 申し訳ありません。処理中にエラーが発生しました。少し時間をおいて再度お試しください。";
+        queueSheet.getRange(rowNum, 7).setValue(errorReply);
+        data[i][6] = errorReply;
         try {
-          sendPushReply(spaceName, "⚠️ 申し訳ありません。処理中にエラーが発生しました。少し時間をおいて再度お試しください。");
+          sendPushReply(spaceName, errorReply);
         } catch (notifyError) {
           console.error("エラー通知の送信にも失敗: " + notifyError.message);
         }
@@ -1284,27 +1292,44 @@ function handleUserIntent(userInput, userName, spaceName, recentConversation) {
                    `（${WEEKDAY_LABELS[now.getDay()]}曜日）` +
                    Utilities.formatDate(now, "Asia/Tokyo", " HH:mm");
 
-  // 「もう一回やって」などに対応できるよう、直前のやり取りも伝える
+  // 続きの会話（「それ29日にして」「タスクじゃなくてカレンダー」など）を理解できるよう、直前の会話を伝える
   const historyText = recentConversation && recentConversation.length > 0
     ? recentConversation.join("\n")
-    : "（直前のやり取りはありません）";
+    : "（今日はまだやり取りがありません）";
+
+  // 「アンケート」がタスクなのか予定なのか等を判断できるよう、手元のタスクと予定も見せる
+  const context = buildAssistantContext(now);
 
   const systemPrompt = `
-あなたは瀬戸口さんの優秀な専属秘書botです。
+あなたは瀬戸口さんの専属秘書です。会話の流れと、下にある瀬戸口さんのタスク・予定を踏まえて、
+人間の有能な秘書のように意図を汲んで対応してください。
 現在の日時は【${todayStr}】です。
 
-【直前のやり取り（古い順。参考情報）】
+【瀬戸口さんの未完了タスク】
+${context.taskText}
+
+【瀬戸口さんのカレンダーの予定（今日から2週間）】
+${context.eventText}
+
+【これまでの会話（古い順）】
 ${historyText}
 
-瀬戸口さん（${userName}）からの今回のメッセージ:
+【瀬戸口さん（${userName}）からの今回のメッセージ】
 「${userInput}」
 
-【指示】
+【考え方】
+- 今回のメッセージは、これまでの会話の続きとして読んでください。「それ」「さっきの」「やっぱり」「タスクじゃない」などは、直前の会話が何を指していたかで判断します。
+- 秘書が直前に勘違いして返答していた場合（例：予定のことをタスクと取り違えた）、今回のメッセージはその訂正です。訂正の内容に沿って、元の依頼を改めて実行してください。
+- 言葉が指すものは、上のタスク一覧と予定一覧で確かめてください。たとえば「アンケート締切」が予定一覧にだけあるなら、それは予定の話です。タスクと予定の両方に当てはまりそうな場合は、決めつけずに聞き返してください。
+- 予定やタスクの名前は、一覧にある正式な名前を使ってください（例：「アンケート締切」→「アンケート完全締切」）。
+- 「もう一回やって」は、これまでの会話のうち「エラーで処理が完了していません」となっている依頼、または秘書がうまく対応できなかった依頼を、改めて実行することです。きちんと完了済みの依頼は、明確に頼まれない限り繰り返さないでください。
+- 「明日の予定は？」「今週忙しい？」「資料作成の期限いつだっけ」のような質問は、上の一覧を使って具体的に答えてください（"chat" アクションで答えてかまいません）。
+- 何を頼まれているのか本当に判断できない場合だけ、"chat" アクションで、何をすればよいかを短く具体的に聞き返してください（候補があれば挙げてください）。
+- 返答は丁寧に、ただし前置きは短く、要点から書いてください。replyMessage は必ず空でない文章にしてください。
+
+【出力のしかた】
 今回のメッセージに含まれる依頼を、以下の8種類の「アクション」に分けてください。
 - 1通のメッセージに依頼が複数ある場合は、依頼ごとに1つずつアクションを作り、書かれている順に並べてください。
-- 「もう一回やって」「さっきのお願い」のように直前のやり取りを指している場合は、直前のやり取りのうち「エラーで未完了」になっている依頼の内容から、改めてアクションを作ってください。「処理済み」の依頼は、明確に頼まれない限り繰り返さないでください。
-- 何を指しているのか判断できない場合は、"chat" アクションで、何をすればよいかを丁寧に聞き返してください。
-- replyMessage は必ず空でない文章にしてください。
 
 出力は、次の形のJSONの文字列のみとしてください（余計な解説文などは一切含めないでください）。
 {
@@ -1436,6 +1461,46 @@ ${historyText}
 }
 
 /**
+ * AIに渡す「手元の情報」（未完了タスクの一覧と、今日から2週間の予定）を組み立てる。
+ * 読み取りに失敗しても会話は続けられるよう、失敗した部分は「読み取れませんでした」とだけ書く。
+ */
+function buildAssistantContext(now) {
+  let taskText = "（タスクはありません）";
+  try {
+    const sheetUrl = PropertiesService.getScriptProperties().getProperty("SPREADSHEET_URL");
+    const taskData = getRequiredSheet(SpreadsheetApp.openByUrl(sheetUrl), "Task_List").getDataRange().getValues();
+    const taskLines = [];
+    for (let i = 1; i < taskData.length; i++) {
+      const row = taskData[i];
+      if (!row[2] || isClosedTaskStatus(row[5])) continue;
+      const deadline = formatTaskDeadline(row[3]);
+      taskLines.push(`・${row[2]}（期限 ${deadline || "未定"}${row[4] ? " " + row[4] : ""}／担当 ${row[7] || "未定"}／状況 ${row[8] || row[5] || "未完了"}）`);
+    }
+    if (taskLines.length > 0) {
+      taskText = taskLines.slice(-30).join("\n");
+    }
+  } catch (e) {
+    console.error("会話用のタスク一覧の読み取りに失敗しました: " + e.toString());
+    taskText = "（読み取れませんでした）";
+  }
+
+  let eventText = "（予定はありません）";
+  try {
+    const today = startOfDay(now);
+    const events = getCalendarEvents(today, addDays(today, 15))
+      .filter(calendarEvent => !isAttendanceEvent(calendarEvent));
+    if (events.length > 0) {
+      eventText = formatEventLines(events, true, 60).join("\n");
+    }
+  } catch (e) {
+    console.error("会話用の予定一覧の読み取りに失敗しました: " + e.toString());
+    eventText = "（読み取れませんでした）";
+  }
+
+  return { taskText, eventText };
+}
+
+/**
  * AIの応答（{"actions":[...]} の形、アクション1つだけの形、配列の形のいずれか）を、アクションの配列にそろえる
  */
 function normalizeIntentActions(resultData) {
@@ -1491,7 +1556,10 @@ function callGemini(promptText, useJsonMode) {
   const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
   if (!apiKey) throw new Error("スクリプトプロパティ 'GEMINI_API_KEY' が未設定です。");
 
-  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=" + apiKey;
+  // 使うモデル（スクリプトプロパティ GEMINI_MODEL で切り替え可能。未設定なら gemini-3.5-flash）。
+  // 指定のモデルが使えない場合（名前の誤り・提供終了など）に備え、軽量版を予備として用意する
+  const primaryModel = PropertiesService.getScriptProperties().getProperty("GEMINI_MODEL") || "gemini-3.5-flash";
+  const fallbackModel = "gemini-3.5-flash-lite";
 
   const payload = {
     "contents": [{ "parts": [{ "text": promptText }] }]
@@ -1500,17 +1568,27 @@ function callGemini(promptText, useJsonMode) {
     payload.generationConfig = { "responseMimeType": "application/json" };
   }
 
-  const response = UrlFetchApp.fetch(url, {
-    "method": "post",
-    "contentType": "application/json",
-    "payload": JSON.stringify(payload),
-    "muteHttpExceptions": true
-  });
+  const requestModel = model => {
+    const url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + apiKey;
+    const response = UrlFetchApp.fetch(url, {
+      "method": "post",
+      "contentType": "application/json",
+      "payload": JSON.stringify(payload),
+      "muteHttpExceptions": true
+    });
+    return { code: response.getResponseCode(), json: JSON.parse(response.getContentText()) };
+  };
 
-  const json = JSON.parse(response.getContentText());
-  const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
+  let result = requestModel(primaryModel);
+  // モデルが見つからない（404）・指定が不正（400）の場合だけ、予備のモデルでやり直す
+  if ((result.code === 404 || result.code === 400) && primaryModel !== fallbackModel) {
+    console.error(`モデル「${primaryModel}」が使えなかったため「${fallbackModel}」でやり直します: ` + JSON.stringify(result.json));
+    result = requestModel(fallbackModel);
+  }
+
+  const text = result.json.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!text) {
-    console.error("Geminiの応答に想定した内容が含まれていませんでした: " + JSON.stringify(json));
+    console.error("Geminiの応答に想定した内容が含まれていませんでした: " + JSON.stringify(result.json));
     return null;
   }
   return text;
@@ -1800,22 +1878,29 @@ function updateCalendarEventFromIntent(updateData, now) {
 }
 
 /**
- * 処理キューから、同じスペースでの直前のやり取り（30分以内・最大3件）を取り出す。
- * 「もう一回やって」のような指示を、AIが理解できるようにするために使う。
+ * 処理キューから、同じスペースでの直前の会話（12時間以内・最大10往復）を取り出す。
+ * 瀬戸口さんの発言と、それに対する秘書の返答（G列）を、古い順に並べて返す。
+ * 「それ29日にして」「タスクじゃなくてカレンダー」のような続きの会話を、AIが理解できるようにするために使う。
  */
 function getRecentConversation(queueData, currentIndex, spaceName, now) {
-  const WINDOW_MS = 30 * 60 * 1000;
-  const lines = [];
-  for (let j = currentIndex - 1; j >= 1 && lines.length < 3; j--) {
+  const WINDOW_MS = 12 * 60 * 60 * 1000;
+  const MAX_EXCHANGES = 10;
+  const exchanges = [];
+  for (let j = currentIndex - 1; j >= 1 && exchanges.length < MAX_EXCHANGES; j--) {
     if (queueData[j][4] !== spaceName) continue; // E列: スペース名
     const receivedAt = new Date(queueData[j][1]); // B列: 受付日時
     if (isNaN(receivedAt.getTime()) || now.getTime() - receivedAt.getTime() > WINDOW_MS) break;
 
     const status = String(queueData[j][5] || ""); // F列: ステータス
-    const result = status === "Done" ? "処理済み" : status.indexOf("Error") === 0 ? "エラーで未完了" : "処理中";
-    lines.unshift(`・${formatTime(receivedAt)}「${compactText(queueData[j][3], 300)}」→ ${result}`);
+    const reply = String(queueData[j][6] || "").trim(); // G列: 秘書の返答
+    const statusNote = status.indexOf("Error") === 0 ? "（※エラーで処理が完了していません）"
+                     : status === "Done" ? "" : "（※処理中）";
+
+    const lines = [`[${formatTime(receivedAt)}] 瀬戸口さん：「${compactText(queueData[j][3], 400)}」`];
+    lines.push(reply ? `　　秘書：「${compactText(reply, 600)}」${statusNote}` : `　　秘書：（返答の記録なし）${statusNote}`);
+    exchanges.unshift(lines.join("\n"));
   }
-  return lines;
+  return exchanges;
 }
 
 /**
