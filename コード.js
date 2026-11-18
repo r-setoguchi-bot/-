@@ -361,6 +361,310 @@ ${taskText}
 }
 
 /**
+ * ====================================================================
+ * 管理部のスプレッドシート連携
+ * 朝のご報告に「管理部シートの追いかけ案件」と「保証金返金の状況」を載せる
+ * （どちらも読むだけで、シートには何も書き込まない）
+ * ====================================================================
+ */
+
+// 【クリメン】管理部シート（スクリプトプロパティ ADMIN_SHEET_ID で差し替え可能）
+const DEFAULT_ADMIN_SHEET_ID = "1PtG_fx5TpxyYh6kt_Gi6FxSnt0W3rGkzeY1tu08WTPM";
+// 保証金返金対応シート（2026.9~）（スクリプトプロパティ DEPOSIT_SHEET_ID で差し替え可能）
+const DEFAULT_DEPOSIT_SHEET_ID = "187NIXrBvRpLXm7a1mKCbfGFveJrZeyoh_keUSPZo77k";
+
+// 管理部シートのうち、追いかけ表として読むタブ
+const ADMIN_FOLLOWUP_TABS = ["保証金返金", "入金名義相違", "粗大ゴミ追いかけ", "管理部業務(その他)"];
+// 「対応状況」「対応済み」列がこの言葉なら、終わった案件として扱う
+const ADMIN_DONE_WORDS = ["対応済", "対応済み", "完了"];
+
+/**
+ * 文字列の空白・改行をまとめ、指定の長さで切り詰める（チャットで1行に収めるため）
+ */
+function compactText(value, maxLength) {
+  const text = String(value || "").replace(/[\s　]+/g, " ").trim();
+  return text.length > maxLength ? text.substring(0, maxLength) + "…" : text;
+}
+
+/**
+ * 複数行のセルから、空でない最初の数行を取り出して1行にまとめる
+ */
+function firstLines(value, lineCount, maxLength) {
+  const lines = String(value || "").split(/\r?\n/).map(line => line.trim()).filter(line => line);
+  return compactText(lines.slice(0, lineCount).join(" "), maxLength);
+}
+
+/**
+ * 年・月・日から日付を作る。存在しない日付（2/30など）は null を返す
+ */
+function makeValidDate(year, month, day) {
+  const result = new Date(year, month - 1, day);
+  if (result.getFullYear() !== year || result.getMonth() !== month - 1 || result.getDate() !== day) return null;
+  return result;
+}
+
+/**
+ * シートのセルの値（日付型、「2026/10/21」「10/21」「10月21日」などの文字列）を日付に変換する。
+ * 年が書かれていない場合は今年とみなし、それが90日以上先になる場合は去年とみなす。
+ * 読み取れない場合は null を返す。
+ */
+function parseSheetDate(value, now) {
+  if (Object.prototype.toString.call(value) === "[object Date]") {
+    return isNaN(value.getTime()) ? null : startOfDay(value);
+  }
+  const text = String(value || "").trim();
+  if (!text) return null;
+
+  let match = text.match(/^(\d{4})\s*(?:\/|-|年)\s*(\d{1,2})\s*(?:\/|-|月)\s*(\d{1,2})/);
+  if (match) return makeValidDate(Number(match[1]), Number(match[2]), Number(match[3]));
+
+  match = text.match(/^(\d{1,2})\s*(?:\/|月)\s*(\d{1,2})/);
+  if (!match) return null;
+
+  const month = Number(match[1]);
+  const day = Number(match[2]);
+  let result = makeValidDate(now.getFullYear(), month, day);
+  if (result && result.getTime() > addDays(startOfDay(now), 90).getTime()) {
+    result = makeValidDate(now.getFullYear() - 1, month, day);
+  }
+  return result;
+}
+
+/**
+ * 日付を「10/21」の形式にする
+ */
+function formatMonthDay(date) {
+  return `${date.getMonth() + 1}/${date.getDate()}`;
+}
+
+/**
+ * 見出し行の中から、候補の言葉で始まる列の位置を探す（見つからなければ -1）
+ */
+function findColumnIndex(headers, candidates) {
+  const normalized = headers.map(header => String(header || "").replace(/[\s　]+/g, ""));
+  for (const candidate of candidates) {
+    const index = normalized.findIndex(header => header.indexOf(candidate) === 0);
+    if (index !== -1) return index;
+  }
+  return -1;
+}
+
+/**
+ * 管理部シートの追いかけ表（1タブ分）から、まだ終わっていない案件を取り出す。
+ * 見出し行は「担当」という列がある行とみなし、列の位置は見出しの言葉で探す（列の並び替えに強くするため）。
+ */
+function readAdminFollowupTab(sheet, tabName, now) {
+  const data = sheet.getDataRange().getValues();
+  const headerIndex = data.slice(0, 8).findIndex(row => findColumnIndex(row, ["担当"]) !== -1);
+  if (headerIndex === -1) return [];
+
+  const headers = data[headerIndex];
+  const col = {
+    caseName: findColumnIndex(headers, ["案件", "店舗名"]),
+    detail: findColumnIndex(headers, ["現状", "現在ステータス", "品目"]),
+    owner: findColumnIndex(headers, ["担当"]),
+    nextAction: findColumnIndex(headers, ["次にやること"]),
+    nextCheck: findColumnIndex(headers, ["次回確認日"]),
+    status: findColumnIndex(headers, ["対応状況", "対応済"]),
+    note: findColumnIndex(headers, ["備考"])
+  };
+  const cell = (row, index) => (index === -1 ? "" : row[index]);
+
+  const items = [];
+  for (let i = headerIndex + 1; i < data.length; i++) {
+    const row = data[i];
+    const status = String(cell(row, col.status) || "").trim();
+    if (ADMIN_DONE_WORDS.indexOf(status) !== -1) continue;
+    if (String(cell(row, col.note) || "").trim().indexOf("例") === 0) continue; // 記入例の行
+
+    // 案件欄が空、または「ー」だけの場合は、現状欄の書き出しを案件名の代わりに使う
+    const caseName = firstLines(cell(row, col.caseName), 2, 40);
+    const isPlaceholder = /^[ー\-－―─]*$/.test(caseName);
+    const label = (isPlaceholder ? "" : caseName) || firstLines(cell(row, col.detail), 2, 40);
+    const owner = compactText(cell(row, col.owner), 10);
+    if (!label && !owner) continue; // 空行
+
+    items.push({
+      tabName: tabName,
+      label: label || "（案件名なし）",
+      owner: owner,
+      nextAction: firstLines(cell(row, col.nextAction), 1, 30),
+      nextCheck: parseSheetDate(cell(row, col.nextCheck), now),
+      hasNextCheckColumn: col.nextCheck !== -1
+    });
+  }
+  return items;
+}
+
+/**
+ * 朝のご報告の「管理部シートの追いかけ」欄を組み立てる。
+ * 次回確認日が今日以前の案件を一覧にし、確認日が未設定の案件はタブごとの件数だけ示す。
+ */
+function buildAdminFollowupSection(now) {
+  const sheetId = PropertiesService.getScriptProperties().getProperty("ADMIN_SHEET_ID") || DEFAULT_ADMIN_SHEET_ID;
+  const spreadsheet = SpreadsheetApp.openById(sheetId);
+  const today = startOfDay(now);
+
+  let openItems = [];
+  ADMIN_FOLLOWUP_TABS.forEach(tabName => {
+    const sheet = spreadsheet.getSheetByName(tabName);
+    if (!sheet) {
+      console.log(`管理部シートにタブ「${tabName}」が見つからないため、読み飛ばしました。`);
+      return;
+    }
+    openItems = openItems.concat(readAdminFollowupTab(sheet, tabName, now));
+  });
+
+  if (openItems.length === 0) {
+    return "■ 管理部シートの追いかけ\n・対応中の案件はありません";
+  }
+
+  const dueItems = openItems
+    .filter(item => item.nextCheck && item.nextCheck.getTime() <= today.getTime())
+    .sort((a, b) => a.nextCheck.getTime() - b.nextCheck.getTime());
+
+  const lines = [`■ 管理部シートの追いかけ（対応中 ${openItems.length}件）`];
+
+  if (dueItems.length > 0) {
+    lines.push("確認日が今日・過ぎているもの：");
+    dueItems.slice(0, 10).forEach(item => {
+      const isToday = item.nextCheck.getTime() === today.getTime();
+      const datePart = isToday ? "今日" : `${formatMonthDay(item.nextCheck)}予定`;
+      const ownerPart = item.owner ? `担当 ${item.owner}／` : "";
+      const actionPart = item.nextAction ? ` → ${item.nextAction}` : "";
+      lines.push(`・［${item.tabName}］${item.label}（${ownerPart}${datePart}）${actionPart}`);
+    });
+    if (dueItems.length > 10) lines.push(`　ほか${dueItems.length - 10}件`);
+  } else {
+    lines.push("・確認日が今日・過ぎている案件はありません");
+  }
+
+  // 確認日が入っていない案件は、タブごとの件数だけ知らせる（日付を入れてもらうきっかけにする）
+  const undatedCounts = {};
+  openItems
+    .filter(item => !item.nextCheck)
+    .forEach(item => { undatedCounts[item.tabName] = (undatedCounts[item.tabName] || 0) + 1; });
+  const undatedParts = Object.keys(undatedCounts).map(tabName => `${tabName} ${undatedCounts[tabName]}件`);
+  if (undatedParts.length > 0) {
+    lines.push(`確認日が未記入の対応中案件：${undatedParts.join("、")}`);
+  }
+
+  return lines.join("\n");
+}
+
+/**
+ * 解約日から「最終支払日」（解約日の翌月末日）を求める
+ */
+function getFinalPaymentDate(cancelDate) {
+  return new Date(cancelDate.getFullYear(), cancelDate.getMonth() + 2, 0);
+}
+
+/**
+ * 朝のご報告の「保証金返金」欄を組み立てる。
+ * 保証金返金対応シートのシート1から、非表示にしていない行のうち、
+ * 分類が①②③⑥の契約を「最終支払日を過ぎたもの」「今月末が最終支払日のもの」に分けて数える。
+ */
+function buildDepositSection(now) {
+  const sheetId = PropertiesService.getScriptProperties().getProperty("DEPOSIT_SHEET_ID") || DEFAULT_DEPOSIT_SHEET_ID;
+  const sheet = SpreadsheetApp.openById(sheetId).getSheetByName("シート1");
+  if (!sheet) throw new Error("保証金返金対応シートに「シート1」が見つかりません。");
+
+  const data = sheet.getDataRange().getValues();
+  const headerIndex = data.slice(0, 10).findIndex(row => findColumnIndex(row, ["契約番号"]) !== -1);
+  if (headerIndex === -1) throw new Error("保証金返金対応シートの見出し行が見つかりません。");
+
+  const headers = data[headerIndex];
+  const col = {
+    contractNo: findColumnIndex(headers, ["契約番号"]),
+    storeName: findColumnIndex(headers, ["契約店舗名称", "店舗"]),
+    category: findColumnIndex(headers, ["分類"]),
+    cancelDate: findColumnIndex(headers, ["解約日"]),
+    handler: findColumnIndex(headers, ["対応者"])
+  };
+  if (col.contractNo === -1 || col.category === -1 || col.cancelDate === -1) {
+    throw new Error("保証金返金対応シートの列（契約番号・分類・解約日）が見つかりません。");
+  }
+
+  const today = startOfDay(now);
+  const endOfThisMonth = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+  const overdueByCategory = {};
+  const unhandled = [];
+  let dueThisMonthCount = 0;
+
+  for (let i = headerIndex + 1; i < data.length; i++) {
+    const row = data[i];
+    const category = String(row[col.category] || "").trim();
+    const categoryMark = category.charAt(0);
+    if (["①", "②", "③", "⑥"].indexOf(categoryMark) === -1) continue;
+
+    // 非表示にした行は「対応の目処が立った」ものとして扱い、数えない（行番号は1始まり）
+    if (sheet.isRowHiddenByUser(i + 1)) continue;
+
+    const cancelDate = parseSheetDate(row[col.cancelDate], now);
+    const finalPaymentDate = cancelDate ? getFinalPaymentDate(cancelDate) : null;
+
+    // ⑥（契約管理が未解約）は解約日がないため、常に要対応とする
+    const isOverdue = categoryMark === "⑥" || (finalPaymentDate && finalPaymentDate.getTime() < today.getTime());
+    if (!isOverdue) {
+      if (finalPaymentDate && finalPaymentDate.getTime() <= endOfThisMonth.getTime()) dueThisMonthCount++;
+      continue;
+    }
+
+    overdueByCategory[category] = (overdueByCategory[category] || 0) + 1;
+
+    const handler = col.handler === -1 ? "" : String(row[col.handler] || "").trim();
+    if (!handler) {
+      const storeName = col.storeName === -1 ? "" : compactText(row[col.storeName], 20);
+      const cancelPart = cancelDate ? `／解約 ${formatMonthDay(cancelDate)}` : "";
+      unhandled.push(`・${row[col.contractNo]} ${storeName}（${categoryMark}${cancelPart}）`);
+    }
+  }
+
+  const overdueTotal = Object.keys(overdueByCategory).reduce((sum, key) => sum + overdueByCategory[key], 0);
+  const lines = ["■ 保証金返金（非表示の行を除く）"];
+
+  if (overdueTotal === 0) {
+    lines.push("・最終支払日を過ぎて対応中の契約はありません");
+  } else {
+    lines.push(`最終支払日を過ぎて対応中：${overdueTotal}件`);
+    Object.keys(overdueByCategory).sort().forEach(category => {
+      lines.push(`・${category}：${overdueByCategory[category]}件`);
+    });
+  }
+  if (dueThisMonthCount > 0) {
+    lines.push(`今月末に最終支払日を迎える契約：${dueThisMonthCount}件`);
+  }
+  if (unhandled.length > 0) {
+    lines.push("対応者が未記入のもの：");
+    unhandled.slice(0, 5).forEach(line => lines.push(line));
+    if (unhandled.length > 5) lines.push(`　ほか${unhandled.length - 5}件`);
+  }
+
+  return lines.join("\n");
+}
+
+/**
+ * 朝のご報告のうち、管理部のシートに関する欄をまとめて組み立てる。
+ * 片方の読み取りに失敗しても、もう片方とご報告全体は送れるようにする。
+ */
+function buildAdminBriefingSections(now) {
+  const sections = [];
+  try {
+    sections.push(buildAdminFollowupSection(now));
+  } catch (e) {
+    console.error("管理部シートの読み取りに失敗しました: " + e.toString());
+    sections.push("■ 管理部シートの追いかけ\n⚠️ シートを読み取れませんでした。");
+  }
+  try {
+    sections.push(buildDepositSection(now));
+  } catch (e) {
+    console.error("保証金返金対応シートの読み取りに失敗しました: " + e.toString());
+    sections.push("■ 保証金返金\n⚠️ シートを読み取れませんでした。");
+  }
+  return sections;
+}
+
+/**
  * 朝のご報告のうち、カレンダーに関する部分（今日の予定／今週・来週の予定／準備の助言）を組み立てる
  */
 function buildCalendarBriefing(now, openTaskLines) {
@@ -462,7 +766,11 @@ function sendMorningBriefing() {
   // カレンダーの内容を送るスペースを決め、カレンダー部分を組み立てる
   const calendarSpaceName = getDefaultSpaceName(spreadsheet);
   let calendarBriefing = null;
+  let adminSections = [];
   if (calendarSpaceName) {
+    // 管理部シートの追いかけ案件と、保証金返金の状況（瀬戸口さんとの会話にのみ送る）
+    adminSections = buildAdminBriefingSections(now);
+
     try {
       calendarBriefing = buildCalendarBriefing(now, openTaskLines);
     } catch (e) {
@@ -488,6 +796,7 @@ function sendMorningBriefing() {
       const sections = [
         calendarBriefing.todaySection,
         "■ 期限が近いタスク\n" + (items.length > 0 ? taskLines : "・期限が近いタスクはありません"),
+        ...adminSections,
         calendarBriefing.upcomingSection,
         calendarBriefing.adviceSection
       ].filter(section => section);
@@ -496,13 +805,9 @@ function sendMorningBriefing() {
       message = "🤖 秘書より、本日のタスクリマインドです。\n\n" + taskLines;
     }
 
-    // Chatの1メッセージあたりの文字数上限に収まるよう、長すぎる場合は末尾を切り詰める
-    if (message.length > 3900) {
-      message = message.substring(0, 3900) + "\n…（長いため以降は省略しました）";
-    }
-
     try {
-      sendPushReply(spaceName, message);
+      // Chatの1メッセージあたりの文字数上限に収まるよう、長い場合は欄の区切りで複数通に分けて送る
+      splitMessageForChat(message, 3800).forEach(part => sendPushReply(spaceName, part));
       // 送信に成功したタスクのみ、最終リマインド日時を更新する
       const timestamp = Utilities.formatDate(now, "Asia/Tokyo", "yyyy/MM/dd HH:mm:ss");
       items.forEach(item => taskSheet.getRange(item.rowNum, 7).setValue(timestamp));
@@ -510,6 +815,47 @@ function sendMorningBriefing() {
       console.error("朝のご報告の送信に失敗しました（" + spaceName + "）: " + e.message);
     }
   }
+}
+
+/**
+ * 長いメッセージを、Chatの文字数上限に収まるよう複数に分ける。
+ * なるべく空行（欄の区切り）で分け、1つの欄が長すぎる場合は行の区切り、それでも長ければ文字数で分ける。
+ */
+function splitMessageForChat(message, maxLength) {
+  if (message.length <= maxLength) return [message];
+
+  const parts = [];
+  let current = "";
+  const pushCurrent = () => {
+    if (current) parts.push(current);
+    current = "";
+  };
+  const appendPiece = (piece, separator) => {
+    if (!current) {
+      current = piece;
+    } else if (current.length + separator.length + piece.length <= maxLength) {
+      current += separator + piece;
+    } else {
+      pushCurrent();
+      current = piece;
+    }
+  };
+
+  message.split("\n\n").forEach(block => {
+    if (block.length <= maxLength) {
+      appendPiece(block, "\n\n");
+      return;
+    }
+    pushCurrent(); // 長い欄は、新しい1通の先頭から始める
+    block.split("\n").forEach(line => {
+      for (let start = 0; start < line.length; start += maxLength) {
+        appendPiece(line.substring(start, start + maxLength), "\n");
+      }
+    });
+    pushCurrent();
+  });
+  pushCurrent();
+  return parts;
 }
 
 /**
