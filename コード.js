@@ -14,6 +14,11 @@ function onMessage(event) {
     return createChatResponse("");
   }
 
+  // 運用停止中：メッセージを処理キューに預けず（＝AIを呼ばず）、停止中である旨だけを返す
+  if (BOT_PAUSED) {
+    return createChatResponse("🤖 秘書ボットは現在停止しています。ご指示は処理されません。");
+  }
+
   // 1. ユーザー名を取得（アドオン形式の深い階層から確実に抽出）
   const userName = event.chat?.messagePayload?.message?.sender?.displayName ||
                    event.chat?.user?.displayName ||
@@ -56,6 +61,25 @@ function onMessage(event) {
 
   // 5. チャット画面には「1秒」で受付完了を返し、30秒タイムアウトを完全に回避する
   return createChatResponse("🤖 瀬戸口さん、ご指示を承りました。ただいま秘書が内容を確認し、手帳の整理と解析を行っております。少々お待ちくださいませ…");
+}
+
+/**
+ * 運用停止のスイッチ。true の間は、チャットに「停止中」と返すだけで、AI（Gemini）を一切呼ばない。
+ * 再開するときは false に戻して公開し直し、setupReminderTrigger と processQueue のトリガーを設定し直す。
+ */
+const BOT_PAUSED = true;
+
+/**
+ * 運用停止用：このプロジェクトの自動実行（トリガー）をすべて削除する。
+ * GASエディタでこの関数を1回だけ手動実行する。
+ */
+function stopAllTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(trigger => {
+    console.log("トリガーを削除します: " + trigger.getHandlerFunction());
+    ScriptApp.deleteTrigger(trigger);
+  });
+  console.log(`自動実行を${triggers.length}件削除しました。`);
 }
 
 /**
